@@ -380,7 +380,7 @@ Status markers:
 
 ### Milestone 2: Read-Only Mount
 
-- [ ] Add CLI parsing for `dbfs mount <db> <mountpoint>`.
+- [x] Add CLI parsing for `dbfs mount <db> <mountpoint>`.
 - [ ] Implement FUSE `init`, `lookup`, `getattr`, `readdir`, and `statfs`.
 - [x] Map DB inode metadata to FUSE file attributes.
 - [ ] Verify mounting an empty root directory works.
