@@ -376,7 +376,7 @@ Status markers:
 - [x] Cover DB behavior with unit tests.
 - [x] Add file-backed `Db::open(path)` for real database files.
 - [x] Apply on-disk SQLite pragmas: WAL, synchronous mode, busy timeout, and foreign keys.
-- [ ] Split storage code into focused modules once behavior stabilizes.
+- [x] Split storage code into focused modules once behavior stabilizes.
 
 ### Milestone 2: Read-Only Mount
 
@@ -452,4 +452,4 @@ The v1 target is reliability for thousands of files and small-to-medium regular 
 
 ## Next Step
 
-Continue storage foundation cleanup by splitting storage code into focused modules, then start the read-only FUSE mount.
+Start the read-only FUSE mount by adding CLI parsing and mapping database inode metadata to FUSE attributes.
