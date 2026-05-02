@@ -176,3 +176,45 @@ fn setattr_helper_updates_metadata_and_size() {
     assert_eq!(attr.gid, 3000);
     assert_eq!(attr.size, 5);
 }
+
+#[test]
+fn opens_regular_file_with_inode_file_handle() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    let handle = fs.open(file.ino).expect("open file");
+
+    assert_eq!(handle, file.ino);
+}
+
+#[test]
+fn reads_regular_file_through_fuse_helper() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    db.write_file(file.ino, 0, b"hello dbfs")
+        .expect("write file");
+    let fs = Dbfs::new(db);
+
+    let data = fs.read(file.ino, 6, 4).expect("read file");
+
+    assert_eq!(data, b"dbfs");
+}
+
+#[test]
+fn writes_regular_file_through_fuse_helper() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    let written = fs.write(file.ino, 0, b"hello").expect("write file");
+
+    assert_eq!(written, 5);
+    assert_eq!(fs.read(file.ino, 0, 5).expect("read file"), b"hello");
+}

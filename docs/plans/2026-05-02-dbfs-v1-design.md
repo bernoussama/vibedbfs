@@ -399,8 +399,8 @@ Status markers:
 - [x] Implement storage-layer `write_file` and size updates.
 - [x] Add cross-chunk read/write tests.
 - [x] Implement storage-layer truncation.
-- [ ] Wire FUSE `open`, `read`, `write`, and `setattr(size)` to storage.
-- [ ] Verify persistence after unmount/remount.
+- [x] Wire FUSE `open`, `read`, `write`, and `setattr(size)` to storage.
+- [x] Verify persistence after unmount/remount.
 
 ### Milestone 5: Mutation Semantics
 

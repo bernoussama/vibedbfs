@@ -3,8 +3,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEntry,
-    ReplyStatfs, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEntry,
+    ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate};
@@ -122,6 +122,25 @@ impl Dbfs {
                 },
             )
             .map(|inode| file_attr_from_inode(&inode))
+            .map_err(errno_from_db_error)
+    }
+
+    pub fn open(&self, ino: u64) -> Result<u64, i32> {
+        self.db
+            .get_inode(ino)
+            .map(|_| ino)
+            .map_err(errno_from_db_error)
+    }
+
+    pub fn read(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+        self.db
+            .read_file(ino, offset, size)
+            .map_err(errno_from_db_error)
+    }
+
+    pub fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
+        self.db
+            .write_file(ino, offset, data)
             .map_err(errno_from_db_error)
     }
 
@@ -253,6 +272,58 @@ impl Filesystem for Dbfs {
             time_or_now_secs(mtime),
         ) {
             Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        match Dbfs::open(self, ino) {
+            Ok(handle) => reply.opened(handle, flags as u32),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        match Dbfs::read(self, ino, offset as u64, size) {
+            Ok(data) => reply.data(&data),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        match Dbfs::write(self, ino, offset as u64, data) {
+            Ok(written) => reply.written(written),
             Err(errno) => reply.error(errno),
         }
     }
