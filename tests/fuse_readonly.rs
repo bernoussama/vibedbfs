@@ -148,3 +148,31 @@ fn creation_helpers_apply_umask() {
 
     assert_eq!(attr.perm, 0o640);
 }
+
+#[test]
+fn setattr_helper_updates_metadata_and_size() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    db.write_file(file.ino, 0, b"hello world")
+        .expect("write file");
+    let fs = Dbfs::new(db);
+
+    let attr = fs
+        .setattr(
+            file.ino,
+            Some(0o600),
+            Some(2000),
+            Some(3000),
+            Some(5),
+            Some(123),
+            Some(456),
+        )
+        .expect("set attrs");
+
+    assert_eq!(attr.perm, 0o600);
+    assert_eq!(attr.uid, 2000);
+    assert_eq!(attr.gid, 3000);
+    assert_eq!(attr.size, 5);
+}

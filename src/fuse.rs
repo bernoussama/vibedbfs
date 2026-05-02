@@ -1,13 +1,13 @@
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEntry,
-    ReplyStatfs, Request,
+    ReplyStatfs, Request, TimeOrNow,
 };
 
-use crate::{Db, DbError, FileKind, Inode};
+use crate::{Db, DbError, FileKind, Inode, MetadataUpdate};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
 
@@ -89,6 +89,38 @@ impl Dbfs {
     ) -> Result<FileAttr, i32> {
         self.db
             .create_file(parent_ino, name, mode & !umask, uid, gid)
+            .map(|inode| file_attr_from_inode(&inode))
+            .map_err(errno_from_db_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn setattr(
+        &self,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+    ) -> Result<FileAttr, i32> {
+        if let Some(size) = size {
+            self.db
+                .truncate_file(ino, size)
+                .map_err(errno_from_db_error)?;
+        }
+
+        self.db
+            .update_metadata(
+                ino,
+                MetadataUpdate {
+                    mode,
+                    uid,
+                    gid,
+                    atime,
+                    mtime,
+                },
+            )
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)
     }
@@ -190,6 +222,40 @@ impl Filesystem for Dbfs {
             Err(errno) => reply.error(errno),
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        match Dbfs::setattr(
+            self,
+            ino,
+            mode,
+            uid,
+            gid,
+            size,
+            time_or_now_secs(atime),
+            time_or_now_secs(mtime),
+        ) {
+            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+            Err(errno) => reply.error(errno),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,5 +311,19 @@ fn unix_time(secs: i64) -> std::time::SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs as u64)
     } else {
         UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+    }
+}
+
+fn time_or_now_secs(time: Option<TimeOrNow>) -> Option<i64> {
+    match time? {
+        TimeOrNow::SpecificTime(time) => system_time_secs(time),
+        TimeOrNow::Now => system_time_secs(SystemTime::now()),
+    }
+}
+
+fn system_time_secs(time: SystemTime) -> Option<i64> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => Some(duration.as_secs() as i64),
+        Err(error) => Some(-(error.duration().as_secs() as i64)),
     }
 }

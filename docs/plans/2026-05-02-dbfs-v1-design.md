@@ -391,7 +391,7 @@ Status markers:
 - [x] Implement storage-layer file creation.
 - [x] Wire FUSE `mkdir` to storage.
 - [x] Wire FUSE `create` to storage.
-- [ ] Verify created files/directories appear through normal shell commands.
+- [x] Verify created files/directories appear through normal shell commands.
 
 ### Milestone 4: File I/O
 
@@ -409,7 +409,7 @@ Status markers:
 - [x] Implement storage-layer `rename`.
 - [~] Add tests for edge cases and errno behavior.
 - [x] Implement storage-layer metadata updates for mode, uid, gid, atime, and mtime.
-- [ ] Wire FUSE `unlink`, `rmdir`, `rename`, and `setattr` to storage.
+- [~] Wire FUSE `unlink`, `rmdir`, `rename`, and `setattr` to storage. `setattr` is done; unlink, rmdir, and rename are pending.
 
 ### Milestone 6: Hardening
 
