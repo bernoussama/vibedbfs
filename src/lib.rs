@@ -1,5 +1,7 @@
 mod db;
+mod fuse;
 mod model;
 
 pub use db::Db;
+pub use fuse::file_attr_from_inode;
 pub use model::{DbError, DirEntry, FileKind, Inode, MetadataUpdate};

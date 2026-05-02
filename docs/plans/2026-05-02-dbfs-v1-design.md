@@ -382,7 +382,7 @@ Status markers:
 
 - [ ] Add CLI parsing for `dbfs mount <db> <mountpoint>`.
 - [ ] Implement FUSE `init`, `lookup`, `getattr`, `readdir`, and `statfs`.
-- [ ] Map DB inode metadata to FUSE file attributes.
+- [x] Map DB inode metadata to FUSE file attributes.
 - [ ] Verify mounting an empty root directory works.
 
 ### Milestone 3: Directory And File Creation

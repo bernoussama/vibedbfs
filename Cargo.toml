@@ -4,4 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+fuser = "0.16.0"
 rusqlite = "0.39.0"
