@@ -4,6 +4,7 @@ use rusqlite::{Error as SqlError, ErrorCode};
 pub enum FileKind {
     RegularFile,
     Directory,
+    Symlink,
 }
 
 impl FileKind {
@@ -11,6 +12,7 @@ impl FileKind {
         match self {
             Self::RegularFile => 1,
             Self::Directory => 2,
+            Self::Symlink => 3,
         }
     }
 
@@ -18,6 +20,7 @@ impl FileKind {
         match value {
             1 => Ok(Self::RegularFile),
             2 => Ok(Self::Directory),
+            3 => Ok(Self::Symlink),
             _ => Err(DbError::Corrupt),
         }
     }

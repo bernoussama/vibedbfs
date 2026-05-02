@@ -93,6 +93,36 @@ impl Dbfs {
             .map_err(errno_from_db_error)
     }
 
+    pub fn symlink(
+        &self,
+        parent_ino: u64,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, i32> {
+        self.db
+            .create_symlink(parent_ino, name, target, uid, gid)
+            .map(|inode| file_attr_from_inode(&inode))
+            .map_err(errno_from_db_error)
+    }
+
+    pub fn readlink(&self, ino: u64) -> Result<Vec<u8>, i32> {
+        self.db.read_symlink(ino).map_err(errno_from_db_error)
+    }
+
+    pub fn link(
+        &self,
+        ino: u64,
+        new_parent_ino: u64,
+        new_name: &[u8],
+    ) -> Result<FileAttr, i32> {
+        self.db
+            .link(ino, new_parent_ino, new_name)
+            .map(|inode| file_attr_from_inode(&inode))
+            .map_err(errno_from_db_error)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn setattr(
         &self,
@@ -249,7 +279,7 @@ impl Filesystem for Dbfs {
         name: &OsStr,
         mode: u32,
         umask: u32,
-        flags: i32,
+        _flags: i32,
         reply: ReplyCreate,
     ) {
         match Dbfs::create(
@@ -261,7 +291,55 @@ impl Filesystem for Dbfs {
             req.uid(),
             req.gid(),
         ) {
-            Ok(attr) => reply.created(&ATTR_TTL, &attr, 0, attr.ino, flags as u32),
+            // FIX: Pass 0 for FOPEN flags (not syscall open flags).
+            // The kernel validates these against known FOPEN_* constants
+            // and rejects the reply with EIO for invalid values.
+            Ok(attr) => {
+                self.db.open_file(attr.ino);
+                reply.created(&ATTR_TTL, &attr, 0, attr.ino, 0);
+            }
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn symlink(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        match Dbfs::symlink(
+            self,
+            parent,
+            link_name.as_bytes(),
+            target.as_os_str().as_bytes(),
+            req.uid(),
+            req.gid(),
+        ) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        match Dbfs::readlink(self, ino) {
+            Ok(target) => reply.data(&target),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        match Dbfs::link(self, ino, newparent, newname.as_bytes()) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
             Err(errno) => reply.error(errno),
         }
     }
@@ -300,11 +378,28 @@ impl Filesystem for Dbfs {
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         match Dbfs::open(self, ino) {
-            Ok(handle) => reply.opened(handle, flags as u32),
+            Ok(handle) => {
+                self.db.open_file(ino);
+                reply.opened(handle, 0);
+            }
             Err(errno) => reply.error(errno),
         }
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.db.release_file(ino);
+        reply.ok();
     }
 
     fn read(
@@ -366,6 +461,39 @@ impl Filesystem for Dbfs {
         }
     }
 
+    fn mknod(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let file_type = mode & libc::S_IFMT as u32;
+        const S_IFREG: u32 = libc::S_IFREG as u32;
+        match file_type {
+            // Regular file: delegate to create
+            0 | S_IFREG => {
+                match Dbfs::create(
+                    self,
+                    parent,
+                    name.as_bytes(),
+                    mode & !(libc::S_IFMT as u32),
+                    umask,
+                    req.uid(),
+                    req.gid(),
+                ) {
+                    Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+                    Err(errno) => reply.error(errno),
+                }
+            }
+            // FIFOs, devices, sockets — not supported
+            _ => reply.error(libc::EPERM),
+        }
+    }
+
     fn rename(
         &mut self,
         _req: &Request<'_>,
@@ -400,6 +528,7 @@ impl DbfsDirEntry {
         match kind {
             FileKind::RegularFile => FileType::RegularFile,
             FileKind::Directory => FileType::Directory,
+            FileKind::Symlink => FileType::Symlink,
         }
     }
 }

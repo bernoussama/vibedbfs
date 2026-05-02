@@ -443,34 +443,21 @@ def tst_truncate_fd(mnt_dir):
 
 
 def tst_open_unlink(mnt_dir):
-    """Test open-unlink pattern.
-
-    NOTE: Unlike passthrough filesystems, dbfs deletes the inode immediately
-    on unlink. This means writes after unlink will fail with ENOENT because
-    the backing data no longer exists. This is a known limitation.
-    The test verifies that unlink itself works and the file disappears
-    from the directory listing.
-    """
+    """Test open-unlink-write pattern — file should remain writable after unlink."""
     name = name_generator()
     data1 = b"foo"
+    data2 = b"bar"
     fullname = pjoin(mnt_dir, name)
-    with open(fullname, "wb", buffering=0) as fh:
+    with open(fullname, "wb+", buffering=0) as fh:
         fh.write(data1)
-
-    # Open file, then unlink it — file should disappear from dir listing
-    with open(fullname, "rb", buffering=0) as fh:
         os.unlink(fullname)
         with pytest.raises(OSError) as exc_info:
             os.stat(fullname)
         assert exc_info.value.errno == errno.ENOENT
         assert name not in os.listdir(mnt_dir)
-        # Reading should still work if kernel cached the data
-        # (for dbfs this may fail since inode is deleted)
-        try:
-            content = fh.read()
-            assert content == data1
-        except OSError:
-            pass  # expected: inode deleted in dbfs
+        fh.write(data2)
+        fh.seek(0)
+        assert fh.read() == data1 + data2
 
 
 def tst_append(mnt_dir):
@@ -649,6 +636,44 @@ def tst_nested_dirs(mnt_dir):
     os.rmdir(level1)
 
 
+def tst_symlink(mnt_dir):
+    """Create a symlink and read it back."""
+    linkname = name_generator()
+    fullname = pjoin(mnt_dir, linkname)
+    os.symlink("/imaginary/dest", fullname)
+    fstat = os.lstat(fullname)
+    assert stat.S_ISLNK(fstat.st_mode)
+    assert os.readlink(fullname) == "/imaginary/dest"
+    assert fstat.st_nlink == 1
+    assert linkname in os.listdir(mnt_dir)
+    os.unlink(fullname)
+
+
+def tst_hardlink(mnt_dir):
+    """Create a hardlink and verify nlink tracking."""
+    name1 = pjoin(mnt_dir, name_generator())
+    name2 = pjoin(mnt_dir, name_generator())
+    with open(name1, "w") as fh:
+        fh.write("hardlink test")
+
+    fstat1 = os.lstat(name1)
+    assert fstat1.st_nlink == 1
+
+    os.link(name1, name2)
+
+    fstat1 = os.lstat(name1)
+    fstat2 = os.lstat(name2)
+    assert fstat1.st_ino == fstat2.st_ino
+    assert fstat1.st_nlink == 2
+    assert fstat2.st_nlink == 2
+    assert os.path.basename(name2) in os.listdir(mnt_dir)
+    assert filecmp.cmp(name1, name2, False)
+
+    os.unlink(name2)
+    assert os.lstat(name1).st_nlink == 1
+    os.unlink(name1)
+
+
 # ---------------------------------------------------------------------------
 # Test classes
 # ---------------------------------------------------------------------------
@@ -711,6 +736,12 @@ class TestBasicFileOps:
     def test_nested_dirs(self, dbfs_mount):
         tst_nested_dirs(dbfs_mount)
 
+    def test_symlink(self, dbfs_mount):
+        tst_symlink(dbfs_mount)
+
+    def test_hardlink(self, dbfs_mount):
+        tst_hardlink(dbfs_mount)
+
 
 class TestSyscalls:
     """Run libfuse's compiled C syscall test suite against dbfs."""
@@ -718,34 +749,15 @@ class TestSyscalls:
     # Tests that are expected to fail because dbfs does not implement
     # the underlying filesystem feature.
     UNSUPPORTED_TESTS = {
-        3:   "symlink — dbfs has no symlink support",
-        4:   "link — dbfs has no hardlink support",
-        5:   "link-unlink-link — dbfs has no hardlink support",
-        6:   "mknod — dbfs only supports regular files and dirs",
-        7:   "mkfifo — dbfs only supports regular files and dirs",
-        13:  "socket — dbfs does not support Unix sockets",
+        7:   "mkfifo — dbfs cannot store FIFOs in SQLite",
+        13:  "socket — dbfs cannot store Unix sockets in SQLite",
     }
 
-    # Tests that fail due to known dbfs bugs.
-    KNOWN_BUGS = {
-        2:   "create+unlink — write after unlink fails (open-unlink-write pattern)",
-        45:  "O_CREAT|O_EXCL create returns EIO (wrong FOPEN flags in reply)",
-        47:  "O_CREAT|O_EXCL create returns EIO (wrong FOPEN flags in reply)",
-    }
+    # No currently known bugs.
+    KNOWN_BUGS = {}
 
-    # Tests that fail because dbfs lacks kernel-side permission enforcement.
-    # The kernel FUSE module doesn't enforce mode-based access checks
-    # unless the filesystem sets default_permissions or implements access().
-    PERMISSION_TESTS = {
-        54:  "open_acc(O_RDONLY|O_TRUNC, 0400) should fail with EACCES",
-        55:  "open_acc(O_WRONLY, 0400) should fail with EACCES",
-        56:  "open_acc(O_RDWR, 0400) should fail with EACCES",
-        57:  "open_acc(O_RDONLY, 0200) should fail with EACCES",
-        58:  "open_acc(O_RDWR, 0200) should fail with EACCES",
-        59:  "open_acc(O_RDONLY, 0000) should fail with EACCES",
-        60:  "open_acc(O_WRONLY, 0000) should fail with EACCES",
-        61:  "open_acc(O_RDWR, 0000) should fail with EACCES",
-    }
+    # No permission issues — fixed with DefaultPermissions mount option.
+    PERMISSION_TESTS = {}
 
     ALL_EXPECTED_FAILURES = UNSUPPORTED_TESTS | KNOWN_BUGS | PERMISSION_TESTS
 

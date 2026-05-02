@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,12 @@ const CHUNK_SIZE: usize = 65_536;
 
 pub struct Db {
     conn: RefCell<Connection>,
+    /// Tracks how many open file handles reference each inode.
+    /// When unlink removes the last directory entry but the inode is still
+    /// open (open_count > 0), we defer deletion until the file is released.
+    open_counts: RefCell<HashMap<u64, u64>>,
+    /// Inodes pending deletion once all handles are closed.
+    pending_delete: RefCell<Vec<u64>>,
 }
 
 impl Db {
@@ -80,6 +87,12 @@ impl Db {
               PRIMARY KEY (ino, chunk_index),
               FOREIGN KEY (ino) REFERENCES inodes(ino) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS symlink_targets (
+              ino INTEGER PRIMARY KEY,
+              target BLOB NOT NULL,
+              FOREIGN KEY (ino) REFERENCES inodes(ino) ON DELETE CASCADE
+            );
             ",
         )?;
 
@@ -87,12 +100,20 @@ impl Db {
         conn.execute(
             "INSERT OR IGNORE INTO inodes
              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
-             VALUES (1, ?1, ?2, 0, 0, 0, ?3, ?3, ?3, 1)",
-            params![FileKind::Directory.as_i64(), 0o755_i64, now],
+             VALUES (1, ?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, 1)",
+            params![
+                FileKind::Directory.as_i64(),
+                0o755_i64,
+                unsafe { libc::getuid() } as i64,
+                unsafe { libc::getgid() } as i64,
+                now
+            ],
         )?;
 
         Ok(Self {
             conn: RefCell::new(conn),
+            open_counts: RefCell::new(HashMap::new()),
+            pending_delete: RefCell::new(Vec::new()),
         })
     }
 
@@ -176,6 +197,130 @@ impl Db {
         gid: u32,
     ) -> Result<Inode, DbError> {
         self.create_node(parent_ino, name, FileKind::RegularFile, mode, uid, gid)
+    }
+
+    pub fn create_symlink(
+        &self,
+        parent_ino: u64,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode, DbError> {
+        let inode = self.create_node(
+            parent_ino,
+            name,
+            FileKind::Symlink,
+            0o777,
+            uid,
+            gid,
+        )?;
+
+        self.conn.borrow().execute(
+            "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
+            params![inode.ino as i64, target],
+        )?;
+
+        // Update size to reflect target length
+        let _now = now_secs();
+        self.conn.borrow().execute(
+            "UPDATE inodes SET size = ?1 WHERE ino = ?2",
+            params![target.len() as i64, inode.ino as i64],
+        )?;
+
+        Ok(Inode {
+            size: target.len() as u64,
+            ..inode
+        })
+    }
+
+    pub fn read_symlink(&self, ino: u64) -> Result<Vec<u8>, DbError> {
+        let inode = self.get_inode(ino)?;
+        if inode.kind != FileKind::Symlink {
+            return Err(DbError::InvalidInput);
+        }
+
+        self.conn
+            .borrow()
+            .query_row(
+                "SELECT target FROM symlink_targets WHERE ino = ?1",
+                params![ino as i64],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Track that a file handle has been opened for this inode.
+    pub fn open_file(&self, ino: u64) {
+        *self.open_counts.borrow_mut().entry(ino).or_insert(0) += 1;
+    }
+
+    /// Release a file handle. If this was the last handle and the inode
+    /// is pending deletion, delete it now.
+    pub fn release_file(&self, ino: u64) {
+        let mut open_counts = self.open_counts.borrow_mut();
+        let count = open_counts.entry(ino).or_insert(0);
+        if *count > 0 {
+            *count -= 1;
+        }
+
+        if *count == 0 {
+            open_counts.remove(&ino);
+            drop(open_counts);
+
+            // Check if this inode is pending deletion
+            let mut pending = self.pending_delete.borrow_mut();
+            if let Some(pos) = pending.iter().position(|&p| p == ino) {
+                pending.swap_remove(pos);
+                drop(pending);
+                // Safe to delete: no more open handles, already unlinked
+                let _ = self.conn.borrow().execute(
+                    "DELETE FROM inodes WHERE ino = ?1",
+                    params![ino as i64],
+                );
+            }
+        }
+    }
+
+    pub fn link(
+        &self,
+        ino: u64,
+        new_parent_ino: u64,
+        new_name: &[u8],
+    ) -> Result<Inode, DbError> {
+        let inode = self.get_inode(ino)?;
+        if inode.kind == FileKind::Directory {
+            return Err(DbError::IsDirectory);
+        }
+        if self.get_inode(new_parent_ino)?.kind != FileKind::Directory {
+            return Err(DbError::NotDirectory);
+        }
+
+        let now = now_secs();
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)",
+            params![new_parent_ino as i64, new_name, ino as i64],
+        )?;
+
+        let new_nlink = inode.nlink + 1;
+        tx.execute(
+            "UPDATE inodes SET nlink = ?1, ctime = ?2 WHERE ino = ?3",
+            params![new_nlink as i64, now, ino as i64],
+        )?;
+        tx.execute(
+            "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
+            params![now, new_parent_ino as i64],
+        )?;
+        tx.commit()?;
+
+        Ok(Inode {
+            nlink: new_nlink,
+            ctime: now,
+            ..inode
+        })
     }
 
     pub fn read_file(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, DbError> {
@@ -344,14 +489,37 @@ impl Db {
         let now = now_secs();
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
+
+        // Remove the directory entry
         tx.execute(
             "DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2",
             params![parent_ino as i64, name],
         )?;
-        tx.execute(
-            "DELETE FROM inodes WHERE ino = ?1",
-            params![target.ino as i64],
-        )?;
+
+        // Check if any file handles are open for this inode
+        let open_count = self.open_counts.borrow().get(&target.ino).copied().unwrap_or(0);
+        if open_count > 0 {
+            // File is still open — defer deletion until all handles are released.
+            // The inode stays but the directory entry is already removed,
+            // so the file is "unlinked" but still accessible via open handles.
+            // Set nlink to 0 to indicate the file has been fully unlinked.
+            tx.execute(
+                "UPDATE inodes SET nlink = 0, ctime = ?1 WHERE ino = ?2",
+                params![now, target.ino as i64],
+            )?;
+            self.pending_delete.borrow_mut().push(target.ino);
+        } else if target.nlink <= 1 {
+            tx.execute(
+                "DELETE FROM inodes WHERE ino = ?1",
+                params![target.ino as i64],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE inodes SET nlink = ?1, ctime = ?2 WHERE ino = ?3",
+                params![(target.nlink - 1) as i64, now, target.ino as i64],
+            )?;
+        }
+
         tx.execute(
             "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
             params![now, parent_ino as i64],
@@ -423,14 +591,16 @@ impl Db {
 
         if let Some(target) = &existing_target {
             match (source.kind, target.kind) {
-                (FileKind::RegularFile, FileKind::Directory) => return Err(DbError::IsDirectory),
-                (FileKind::Directory, FileKind::RegularFile) => return Err(DbError::NotDirectory),
+                (FileKind::RegularFile, FileKind::Directory)
+                | (FileKind::Symlink, FileKind::Directory) => return Err(DbError::IsDirectory),
+                (FileKind::Directory, FileKind::RegularFile)
+                | (FileKind::Directory, FileKind::Symlink) => return Err(DbError::NotDirectory),
                 (FileKind::Directory, FileKind::Directory) => {
                     if !self.list_dir(target.ino)?.is_empty() {
                         return Err(DbError::DirectoryNotEmpty);
                     }
                 }
-                (FileKind::RegularFile, FileKind::RegularFile) => {}
+                _ => {}
             }
         }
 

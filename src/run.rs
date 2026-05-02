@@ -29,7 +29,12 @@ fn mount_dbfs(fs: Dbfs, mountpoint: &Path) -> Result<(), RunError> {
 }
 
 pub fn mount_options() -> Vec<MountOption> {
-    vec![MountOption::FSName("dbfs".to_string())]
+    vec![
+        MountOption::FSName("dbfs".to_string()),
+        // Let the kernel enforce file permission checks based on inode mode/uid/gid.
+        // Without this, the kernel allows all accesses regardless of file permissions.
+        MountOption::DefaultPermissions,
+    ]
 }
 
 #[derive(Debug)]
