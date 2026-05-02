@@ -407,9 +407,9 @@ Status markers:
 - [x] Implement storage-layer `unlink`.
 - [x] Implement storage-layer `rmdir`.
 - [x] Implement storage-layer `rename`.
-- [~] Add tests for edge cases and errno behavior.
+- [x] Add tests for edge cases and errno behavior.
 - [x] Implement storage-layer metadata updates for mode, uid, gid, atime, and mtime.
-- [~] Wire FUSE `unlink`, `rmdir`, `rename`, and `setattr` to storage. `setattr` is done; unlink, rmdir, and rename are pending.
+- [x] Wire FUSE `unlink`, `rmdir`, `rename`, and `setattr` to storage.
 
 ### Milestone 6: Hardening
 

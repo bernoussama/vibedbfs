@@ -3,8 +3,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate};
@@ -141,6 +141,30 @@ impl Dbfs {
     pub fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
         self.db
             .write_file(ino, offset, data)
+            .map_err(errno_from_db_error)
+    }
+
+    pub fn unlink(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
+        self.db
+            .unlink_file(parent_ino, name)
+            .map_err(errno_from_db_error)
+    }
+
+    pub fn rmdir(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
+        self.db
+            .remove_dir(parent_ino, name)
+            .map_err(errno_from_db_error)
+    }
+
+    pub fn rename(
+        &self,
+        parent_ino: u64,
+        name: &[u8],
+        new_parent_ino: u64,
+        new_name: &[u8],
+    ) -> Result<(), i32> {
+        self.db
+            .rename(parent_ino, name, new_parent_ino, new_name)
             .map_err(errno_from_db_error)
     }
 
@@ -324,6 +348,41 @@ impl Filesystem for Dbfs {
 
         match Dbfs::write(self, ino, offset as u64, data) {
             Ok(written) => reply.written(written),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        match Dbfs::unlink(self, parent, name.as_bytes()) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        match Dbfs::rmdir(self, parent, name.as_bytes()) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        if flags != 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        match Dbfs::rename(self, parent, name.as_bytes(), newparent, newname.as_bytes()) {
+            Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
     }

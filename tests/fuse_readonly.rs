@@ -218,3 +218,42 @@ fn writes_regular_file_through_fuse_helper() {
     assert_eq!(written, 5);
     assert_eq!(fs.read(file.ino, 0, 5).expect("read file"), b"hello");
 }
+
+#[test]
+fn unlinks_file_through_fuse_helper() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    db.create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    fs.unlink(1, b"notes.txt").expect("unlink file");
+
+    assert_eq!(fs.lookup(1, b"notes.txt"), Err(libc::ENOENT));
+}
+
+#[test]
+fn removes_directory_through_fuse_helper() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    db.create_dir(1, b"docs", 0o755, 1000, 1000)
+        .expect("create directory");
+    let fs = Dbfs::new(db);
+
+    fs.rmdir(1, b"docs").expect("remove directory");
+
+    assert_eq!(fs.lookup(1, b"docs"), Err(libc::ENOENT));
+}
+
+#[test]
+fn renames_entry_through_fuse_helper() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"old.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    fs.rename(1, b"old.txt", 1, b"new.txt")
+        .expect("rename file");
+
+    assert_eq!(fs.lookup(1, b"old.txt"), Err(libc::ENOENT));
+    assert_eq!(fs.lookup(1, b"new.txt").expect("lookup new").ino, file.ino);
+}
