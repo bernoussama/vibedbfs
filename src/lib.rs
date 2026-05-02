@@ -1,7 +1,10 @@
 use std::cell::RefCell;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, Error as SqlError, ErrorCode, params};
+use rusqlite::{Connection, Error as SqlError, ErrorCode, OptionalExtension, params};
+
+const CHUNK_SIZE: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -47,9 +50,21 @@ pub struct DirEntry {
     pub kind: FileKind,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataUpdate {
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub atime: Option<i64>,
+    pub mtime: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbError {
     AlreadyExists,
+    DirectoryNotEmpty,
+    InvalidInput,
+    IsDirectory,
     NotDirectory,
     NotFound,
     Corrupt,
@@ -73,12 +88,44 @@ pub struct Db {
 }
 
 impl Db {
-    pub fn open_in_memory() -> Result<Self, DbError> {
-        let conn = Connection::open_in_memory()?;
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let conn = Connection::open(path)?;
         conn.execute_batch(
             "
             PRAGMA foreign_keys = ON;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA busy_timeout = 5000;
+            ",
+        )?;
+        Self::initialize(conn)
+    }
 
+    pub fn open_in_memory() -> Result<Self, DbError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Self::initialize(conn)
+    }
+
+    pub fn pragma_i64(&self, name: &str) -> Result<i64, DbError> {
+        let sql = pragma_query(name)?;
+        self.conn
+            .borrow()
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    pub fn pragma_string(&self, name: &str) -> Result<String, DbError> {
+        let sql = pragma_query(name)?;
+        self.conn
+            .borrow()
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    fn initialize(conn: Connection) -> Result<Self, DbError> {
+        conn.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS inodes (
               ino INTEGER PRIMARY KEY,
               kind INTEGER NOT NULL,
@@ -206,6 +253,317 @@ impl Db {
         self.create_node(parent_ino, name, FileKind::RegularFile, mode, uid, gid)
     }
 
+    pub fn read_file(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, DbError> {
+        let inode = self.get_inode(ino)?;
+        if inode.kind != FileKind::RegularFile {
+            return Err(DbError::NotFound);
+        }
+        if offset >= inode.size || size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let read_len = size.min((inode.size - offset) as u32) as usize;
+        let mut output = vec![0; read_len];
+        let conn = self.conn.borrow();
+
+        let start = offset as usize;
+        let end = start + read_len;
+        let start_chunk = start / CHUNK_SIZE;
+        let end_chunk = (end - 1) / CHUNK_SIZE;
+
+        for chunk_index in start_chunk..=end_chunk {
+            let chunk = conn
+                .query_row(
+                    "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+                    params![ino as i64, chunk_index as i64],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+
+            let Some(chunk) = chunk else {
+                continue;
+            };
+
+            let chunk_start = chunk_index * CHUNK_SIZE;
+            let copy_start = start.max(chunk_start);
+            let copy_end = end.min(chunk_start + chunk.len());
+            if copy_start >= copy_end {
+                continue;
+            }
+
+            let output_start = copy_start - start;
+            let chunk_copy_start = copy_start - chunk_start;
+            let copy_len = copy_end - copy_start;
+            output[output_start..output_start + copy_len]
+                .copy_from_slice(&chunk[chunk_copy_start..chunk_copy_start + copy_len]);
+        }
+
+        Ok(output)
+    }
+
+    pub fn write_file(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32, DbError> {
+        let inode = self.get_inode(ino)?;
+        if inode.kind != FileKind::RegularFile {
+            return Err(DbError::NotFound);
+        }
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let now = now_secs();
+        let start = offset as usize;
+        let end = start + data.len();
+        let start_chunk = start / CHUNK_SIZE;
+        let end_chunk = (end - 1) / CHUNK_SIZE;
+
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+
+        for chunk_index in start_chunk..=end_chunk {
+            let chunk_start = chunk_index * CHUNK_SIZE;
+            let write_start = start.max(chunk_start);
+            let write_end = end.min(chunk_start + CHUNK_SIZE);
+            let chunk_write_start = write_start - chunk_start;
+            let input_start = write_start - start;
+            let input_end = write_end - start;
+
+            let mut chunk = tx
+                .query_row(
+                    "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+                    params![ino as i64, chunk_index as i64],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .unwrap_or_default();
+
+            let required_len = chunk_write_start + (input_end - input_start);
+            if chunk.len() < required_len {
+                chunk.resize(required_len, 0);
+            }
+
+            chunk[chunk_write_start..required_len].copy_from_slice(&data[input_start..input_end]);
+
+            tx.execute(
+                "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
+                params![ino as i64, chunk_index as i64, chunk],
+            )?;
+        }
+
+        let new_size = inode.size.max(offset + data.len() as u64);
+        tx.execute(
+            "UPDATE inodes SET size = ?1, mtime = ?2, ctime = ?2 WHERE ino = ?3",
+            params![new_size as i64, now, ino as i64],
+        )?;
+        tx.commit()?;
+
+        Ok(data.len() as u32)
+    }
+
+    pub fn truncate_file(&self, ino: u64, size: u64) -> Result<(), DbError> {
+        let inode = self.get_inode(ino)?;
+        if inode.kind != FileKind::RegularFile {
+            return Err(DbError::NotFound);
+        }
+
+        let now = now_secs();
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+
+        if size == 0 {
+            tx.execute(
+                "DELETE FROM file_chunks WHERE ino = ?1",
+                params![ino as i64],
+            )?;
+        } else {
+            let final_chunk_index = ((size - 1) as usize) / CHUNK_SIZE;
+            let final_chunk_len = ((size - 1) as usize % CHUNK_SIZE) + 1;
+
+            tx.execute(
+                "DELETE FROM file_chunks WHERE ino = ?1 AND chunk_index > ?2",
+                params![ino as i64, final_chunk_index as i64],
+            )?;
+
+            let final_chunk = tx
+                .query_row(
+                    "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+                    params![ino as i64, final_chunk_index as i64],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+
+            if let Some(mut final_chunk) = final_chunk {
+                final_chunk.truncate(final_chunk_len);
+                tx.execute(
+                    "UPDATE file_chunks SET data = ?1 WHERE ino = ?2 AND chunk_index = ?3",
+                    params![final_chunk, ino as i64, final_chunk_index as i64],
+                )?;
+            }
+        }
+
+        tx.execute(
+            "UPDATE inodes SET size = ?1, mtime = ?2, ctime = ?2 WHERE ino = ?3",
+            params![size as i64, now, ino as i64],
+        )?;
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    pub fn unlink_file(&self, parent_ino: u64, name: &[u8]) -> Result<(), DbError> {
+        let target = self.lookup(parent_ino, name)?;
+        if target.kind == FileKind::Directory {
+            return Err(DbError::IsDirectory);
+        }
+
+        let now = now_secs();
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2",
+            params![parent_ino as i64, name],
+        )?;
+        tx.execute(
+            "DELETE FROM inodes WHERE ino = ?1",
+            params![target.ino as i64],
+        )?;
+        tx.execute(
+            "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
+            params![now, parent_ino as i64],
+        )?;
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    pub fn remove_dir(&self, parent_ino: u64, name: &[u8]) -> Result<(), DbError> {
+        let target = self.lookup(parent_ino, name)?;
+        if target.kind != FileKind::Directory {
+            return Err(DbError::NotDirectory);
+        }
+
+        let now = now_secs();
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        let child_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM dirents WHERE parent_ino = ?1",
+            params![target.ino as i64],
+            |row| row.get(0),
+        )?;
+        if child_count != 0 {
+            return Err(DbError::DirectoryNotEmpty);
+        }
+
+        tx.execute(
+            "DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2",
+            params![parent_ino as i64, name],
+        )?;
+        tx.execute(
+            "DELETE FROM inodes WHERE ino = ?1",
+            params![target.ino as i64],
+        )?;
+        tx.execute(
+            "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
+            params![now, parent_ino as i64],
+        )?;
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    pub fn rename(
+        &self,
+        parent_ino: u64,
+        name: &[u8],
+        new_parent_ino: u64,
+        new_name: &[u8],
+    ) -> Result<(), DbError> {
+        let source = self.lookup(parent_ino, name)?;
+        if self.get_inode(new_parent_ino)?.kind != FileKind::Directory {
+            return Err(DbError::NotDirectory);
+        }
+        if source.kind == FileKind::Directory && self.is_descendant(new_parent_ino, source.ino)? {
+            return Err(DbError::InvalidInput);
+        }
+
+        if parent_ino == new_parent_ino && name == new_name {
+            return Ok(());
+        }
+
+        let existing_target = match self.lookup(new_parent_ino, new_name) {
+            Ok(target) => Some(target),
+            Err(DbError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+
+        if let Some(target) = &existing_target {
+            match (source.kind, target.kind) {
+                (FileKind::RegularFile, FileKind::Directory) => return Err(DbError::IsDirectory),
+                (FileKind::Directory, FileKind::RegularFile) => return Err(DbError::NotDirectory),
+                (FileKind::Directory, FileKind::Directory) => {
+                    if !self.list_dir(target.ino)?.is_empty() {
+                        return Err(DbError::DirectoryNotEmpty);
+                    }
+                }
+                (FileKind::RegularFile, FileKind::RegularFile) => {}
+            }
+        }
+
+        let now = now_secs();
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+
+        if let Some(target) = existing_target {
+            tx.execute(
+                "DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2",
+                params![new_parent_ino as i64, new_name],
+            )?;
+            tx.execute(
+                "DELETE FROM inodes WHERE ino = ?1",
+                params![target.ino as i64],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE dirents SET parent_ino = ?1, name = ?2 WHERE parent_ino = ?3 AND name = ?4",
+            params![new_parent_ino as i64, new_name, parent_ino as i64, name],
+        )?;
+        tx.execute(
+            "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2 OR ino = ?3",
+            params![now, parent_ino as i64, new_parent_ino as i64],
+        )?;
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    pub fn update_metadata(&self, ino: u64, update: MetadataUpdate) -> Result<Inode, DbError> {
+        let inode = self.get_inode(ino)?;
+        let now = now_secs();
+        let mode = update.mode.unwrap_or(inode.mode);
+        let uid = update.uid.unwrap_or(inode.uid);
+        let gid = update.gid.unwrap_or(inode.gid);
+        let atime = update.atime.unwrap_or(inode.atime);
+        let mtime = update.mtime.unwrap_or(inode.mtime);
+
+        self.conn.borrow().execute(
+            "UPDATE inodes
+             SET mode = ?1, uid = ?2, gid = ?3, atime = ?4, mtime = ?5, ctime = ?6
+             WHERE ino = ?7",
+            params![
+                mode as i64,
+                uid as i64,
+                gid as i64,
+                atime,
+                mtime,
+                now,
+                ino as i64
+            ],
+        )?;
+
+        self.get_inode(ino)
+    }
+
     fn create_node(
         &self,
         parent_ino: u64,
@@ -255,6 +613,45 @@ impl Db {
             ctime: now,
             nlink: 1,
         })
+    }
+
+    fn is_descendant(&self, ino: u64, possible_ancestor: u64) -> Result<bool, DbError> {
+        if ino == possible_ancestor {
+            return Ok(true);
+        }
+
+        let conn = self.conn.borrow();
+        let mut current = ino;
+        while current != 1 {
+            let parent = conn
+                .query_row(
+                    "SELECT parent_ino FROM dirents WHERE child_ino = ?1",
+                    params![current as i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+
+            let Some(parent) = parent else {
+                return Ok(false);
+            };
+
+            let parent = parent as u64;
+            if parent == possible_ancestor {
+                return Ok(true);
+            }
+            current = parent;
+        }
+
+        Ok(false)
+    }
+}
+
+fn pragma_query(name: &str) -> Result<String, DbError> {
+    match name {
+        "busy_timeout" | "foreign_keys" | "journal_mode" | "synchronous" => {
+            Ok(format!("PRAGMA {name}"))
+        }
+        _ => Err(DbError::InvalidInput),
     }
 }
 

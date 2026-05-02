@@ -361,42 +361,62 @@ These tests may need to be skipped automatically when FUSE is unavailable in CI 
 
 ## Milestones
 
+Status markers:
+
+- `[x]` Done
+- `[~]` Partially done
+- `[ ]` Not started
+
 ### Milestone 1: Storage Foundation
 
-- Add DB schema initialization.
-- Create root inode.
-- Add typed DB operations for inode lookup, dirent lookup, listing, create, delete, and rename.
-- Add chunk read/write/truncate helpers.
-- Cover DB behavior with unit tests.
+- [x] Add DB schema initialization.
+- [x] Create root inode.
+- [x] Add typed DB operations for inode lookup, dirent lookup, listing, create, delete, and rename.
+- [x] Add chunk read/write/truncate helpers.
+- [x] Cover DB behavior with unit tests.
+- [x] Add file-backed `Db::open(path)` for real database files.
+- [x] Apply on-disk SQLite pragmas: WAL, synchronous mode, busy timeout, and foreign keys.
+- [ ] Split storage code into focused modules once behavior stabilizes.
 
 ### Milestone 2: Read-Only Mount
 
-- Add CLI parsing for `dbfs mount <db> <mountpoint>`.
-- Implement FUSE `init`, `lookup`, `getattr`, `readdir`, and `statfs`.
-- Verify mounting an empty root directory works.
+- [ ] Add CLI parsing for `dbfs mount <db> <mountpoint>`.
+- [ ] Implement FUSE `init`, `lookup`, `getattr`, `readdir`, and `statfs`.
+- [ ] Map DB inode metadata to FUSE file attributes.
+- [ ] Verify mounting an empty root directory works.
 
 ### Milestone 3: Directory And File Creation
 
-- Implement `mkdir` and `create`.
-- Verify created files/directories appear through normal shell commands.
+- [x] Implement storage-layer directory creation.
+- [x] Implement storage-layer file creation.
+- [ ] Wire FUSE `mkdir` to storage.
+- [ ] Wire FUSE `create` to storage.
+- [ ] Verify created files/directories appear through normal shell commands.
 
 ### Milestone 4: File I/O
 
-- Implement `open`, `read`, `write`, and size updates.
-- Add cross-chunk read/write tests.
-- Verify persistence after unmount/remount.
+- [x] Implement storage-layer `read_file`.
+- [x] Implement storage-layer `write_file` and size updates.
+- [x] Add cross-chunk read/write tests.
+- [x] Implement storage-layer truncation.
+- [ ] Wire FUSE `open`, `read`, `write`, and `setattr(size)` to storage.
+- [ ] Verify persistence after unmount/remount.
 
 ### Milestone 5: Mutation Semantics
 
-- Implement `unlink`, `rmdir`, `rename`, and `setattr`.
-- Add tests for edge cases and errno behavior.
+- [x] Implement storage-layer `unlink`.
+- [x] Implement storage-layer `rmdir`.
+- [x] Implement storage-layer `rename`.
+- [~] Add tests for edge cases and errno behavior.
+- [x] Implement storage-layer metadata updates for mode, uid, gid, atime, and mtime.
+- [ ] Wire FUSE `unlink`, `rmdir`, `rename`, and `setattr` to storage.
 
 ### Milestone 6: Hardening
 
-- Review crash consistency boundaries.
-- Improve errno mapping.
-- Add mount integration test gating.
-- Run formatting, clippy, and tests.
+- [ ] Review crash consistency boundaries.
+- [~] Improve errno mapping.
+- [ ] Add mount integration test gating.
+- [x] Run formatting, clippy, and tests for completed storage slices.
 
 ## Performance Position
 
@@ -432,4 +452,4 @@ The v1 target is reliability for thousands of files and small-to-medium regular 
 
 ## Next Step
 
-Start with the storage foundation. The DB layer should be implemented and tested before wiring FUSE callbacks to it.
+Continue storage foundation cleanup by splitting storage code into focused modules, then start the read-only FUSE mount.
