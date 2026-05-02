@@ -413,10 +413,27 @@ Status markers:
 
 ### Milestone 6: Hardening
 
-- [ ] Review crash consistency boundaries.
-- [~] Improve errno mapping.
-- [ ] Add mount integration test gating.
+- [x] Review crash consistency boundaries.
+- [x] Improve errno mapping.
+- [x] Add mount integration test gating.
 - [x] Run formatting, clippy, and tests for completed storage slices.
+
+## Crash Consistency Review
+
+SQLite transactions are the crash-consistency boundary for DBFS metadata and file content. Each mutating storage operation that changes more than one table should run in one transaction, so a crash leaves either the old state or the new state, not a partial mix.
+
+Current transactional boundaries:
+
+- File and directory creation insert the inode, insert the directory entry, and update the parent timestamps in one transaction.
+- Writes update all affected chunks and the inode size/timestamps in one transaction.
+- Truncation deletes or trims chunks and updates inode size/timestamps in one transaction.
+- Unlink, rmdir, and rename update directory entries, inodes, and parent timestamps in one transaction.
+
+Known remaining risks:
+
+- The FUSE layer does not implement explicit `fsync` semantics yet; durability relies on SQLite's configured WAL and synchronous behavior.
+- The current file handle strategy uses inode numbers directly, which is sufficient for v1 but will need revisiting before hard links or delayed-delete semantics.
+- Parent lookup for `..` is only precise for root in the helper path. Kernel directory traversal still uses lookup/readdir results, but richer parent tracking should be added before supporting advanced directory behavior.
 
 ## Performance Position
 

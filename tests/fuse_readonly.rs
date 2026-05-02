@@ -83,6 +83,50 @@ fn maps_storage_errors_to_errno() {
 }
 
 #[test]
+fn maps_duplicate_name_to_eexist() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    db.create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    let error = fs
+        .create(1, b"notes.txt", 0o644, 0, 1000, 1000)
+        .expect_err("duplicate create should fail");
+
+    assert_eq!(error, libc::EEXIST);
+}
+
+#[test]
+fn maps_non_empty_directory_removal_to_enotempty() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let docs = db
+        .create_dir(1, b"docs", 0o755, 1000, 1000)
+        .expect("create directory");
+    db.create_file(docs.ino, b"readme.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    let error = fs.rmdir(1, b"docs").expect_err("rmdir should fail");
+
+    assert_eq!(error, libc::ENOTEMPTY);
+}
+
+#[test]
+fn maps_create_under_file_to_enotdir() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    let error = fs
+        .create(file.ino, b"child.txt", 0o644, 0, 1000, 1000)
+        .expect_err("create under file should fail");
+
+    assert_eq!(error, libc::ENOTDIR);
+}
+
+#[test]
 fn converts_storage_file_kind_to_fuse_file_type() {
     assert_eq!(
         DbfsDirEntry::file_type(FileKind::RegularFile),
