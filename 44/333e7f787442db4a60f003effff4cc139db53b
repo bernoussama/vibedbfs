@@ -1,0 +1,29 @@
+src/lib.rs
+  320c7c43f6279ecc 1-290
+Cargo.toml
+  320c7c43f6279ecc 7
+tests/storage.rs
+  320c7c43f6279ecc 1-86
+docs/plans/2026-05-02-dbfs-v1-design.md
+  320c7c43f6279ecc 1-435
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "44333e7f787442db4a60f003effff4cc139db53b",
+  "prompts": {
+    "320c7c43f6279ecc": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_21700908effeoq9WvSUezYYHhX",
+        "model": "openai/gpt-5.5"
+      },
+      "human_author": "bernoussama",
+      "messages": [],
+      "total_additions": 817,
+      "total_deletions": 5,
+      "accepted_lines": 812,
+      "overriden_lines": 0
+    }
+  }
+}
