@@ -103,3 +103,48 @@ fn mount_options_do_not_require_allow_other() {
     assert!(!options.contains(&MountOption::AllowOther));
     assert!(!options.contains(&MountOption::AllowRoot));
 }
+
+#[test]
+fn creates_directory_through_fuse_helper() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let fs = Dbfs::new(db);
+
+    let attr = fs.mkdir(1, b"docs", 0o755, 0, 1000, 1001).expect("mkdir");
+
+    assert_eq!(attr.kind, FileType::Directory);
+    assert_eq!(attr.perm, 0o755);
+    assert_eq!(attr.uid, 1000);
+    assert_eq!(attr.gid, 1001);
+    assert_eq!(fs.lookup(1, b"docs").expect("lookup docs").ino, attr.ino);
+}
+
+#[test]
+fn creates_file_through_fuse_helper() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let fs = Dbfs::new(db);
+
+    let attr = fs
+        .create(1, b"notes.txt", 0o644, 0, 1000, 1001)
+        .expect("create file");
+
+    assert_eq!(attr.kind, FileType::RegularFile);
+    assert_eq!(attr.perm, 0o644);
+    assert_eq!(attr.uid, 1000);
+    assert_eq!(attr.gid, 1001);
+    assert_eq!(
+        fs.lookup(1, b"notes.txt").expect("lookup file").ino,
+        attr.ino
+    );
+}
+
+#[test]
+fn creation_helpers_apply_umask() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let fs = Dbfs::new(db);
+
+    let attr = fs
+        .create(1, b"private.txt", 0o666, 0o027, 1000, 1000)
+        .expect("create file");
+
+    assert_eq!(attr.perm, 0o640);
+}

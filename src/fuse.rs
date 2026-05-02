@@ -3,7 +3,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyDirectory, ReplyEntry, ReplyStatfs, Request,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEntry,
+    ReplyStatfs, Request,
 };
 
 use crate::{Db, DbError, FileKind, Inode};
@@ -62,6 +63,36 @@ impl Dbfs {
         Ok(entries)
     }
 
+    pub fn mkdir(
+        &self,
+        parent_ino: u64,
+        name: &[u8],
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, i32> {
+        self.db
+            .create_dir(parent_ino, name, mode & !umask, uid, gid)
+            .map(|inode| file_attr_from_inode(&inode))
+            .map_err(errno_from_db_error)
+    }
+
+    pub fn create(
+        &self,
+        parent_ino: u64,
+        name: &[u8],
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, i32> {
+        self.db
+            .create_file(parent_ino, name, mode & !umask, uid, gid)
+            .map(|inode| file_attr_from_inode(&inode))
+            .map_err(errno_from_db_error)
+    }
+
     fn parent_ino(&self, ino: u64) -> Option<u64> {
         if ino == 1 { Some(1) } else { None }
     }
@@ -111,6 +142,53 @@ impl Filesystem for Dbfs {
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 65_536);
+    }
+
+    fn mkdir(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        match Dbfs::mkdir(
+            self,
+            parent,
+            name.as_bytes(),
+            mode,
+            umask,
+            req.uid(),
+            req.gid(),
+        ) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn create(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        match Dbfs::create(
+            self,
+            parent,
+            name.as_bytes(),
+            mode,
+            umask,
+            req.uid(),
+            req.gid(),
+        ) {
+            Ok(attr) => reply.created(&ATTR_TTL, &attr, 0, attr.ino, flags as u32),
+            Err(errno) => reply.error(errno),
+        }
     }
 }
 

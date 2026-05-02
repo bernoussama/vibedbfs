@@ -389,8 +389,8 @@ Status markers:
 
 - [x] Implement storage-layer directory creation.
 - [x] Implement storage-layer file creation.
-- [ ] Wire FUSE `mkdir` to storage.
-- [ ] Wire FUSE `create` to storage.
+- [x] Wire FUSE `mkdir` to storage.
+- [x] Wire FUSE `create` to storage.
 - [ ] Verify created files/directories appear through normal shell commands.
 
 ### Milestone 4: File I/O
