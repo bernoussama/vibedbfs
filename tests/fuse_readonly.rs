@@ -1,5 +1,5 @@
-use dbfs::{Db, Dbfs, DbfsDirEntry, FileKind};
-use fuser::FileType;
+use dbfs::{Db, Dbfs, DbfsDirEntry, FileKind, mount_options};
+use fuser::{FileType, MountOption};
 
 #[test]
 fn gets_fuse_attributes_by_inode() {
@@ -92,4 +92,14 @@ fn converts_storage_file_kind_to_fuse_file_type() {
         DbfsDirEntry::file_type(FileKind::Directory),
         FileType::Directory
     );
+}
+
+#[test]
+fn mount_options_do_not_require_allow_other() {
+    let options = mount_options();
+
+    assert!(options.contains(&MountOption::FSName("dbfs".to_string())));
+    assert!(!options.contains(&MountOption::AutoUnmount));
+    assert!(!options.contains(&MountOption::AllowOther));
+    assert!(!options.contains(&MountOption::AllowRoot));
 }
