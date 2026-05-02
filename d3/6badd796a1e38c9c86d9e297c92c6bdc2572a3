@@ -1,0 +1,31 @@
+src/fuse.rs
+  3ae800d66c644746 96-125,282,294-342,381,383-386,391-404,464-496,531
+src/model.rs
+  3ae800d66c644746 7,15,23
+src/db.rs
+  3ae800d66c644746 2,14-19,90-95,103-110,115-116,202-325,492-493,498-522,594-597,603
+src/run.rs
+  3ae800d66c644746 32-37
+tests/test_with_libfuse.py
+  3ae800d66c644746 446,449,451,458-460,639-676,739-744,752-753,756-757,759-760
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d36badd796a1e38c9c86d9e297c92c6bdc2572a3",
+  "prompts": {
+    "3ae800d66c644746": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019dea6c-5623-7403-b542-40cc8d312adf",
+        "model": "glm-5.1"
+      },
+      "human_author": "bernoussama",
+      "messages": [],
+      "total_additions": 386,
+      "total_deletions": 67,
+      "accepted_lines": 378,
+      "overriden_lines": 0
+    }
+  }
+}
