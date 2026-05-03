@@ -1,0 +1,23 @@
+scripts/bench-fio.sh
+  1881f3924a97df38 1-230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "8c4a728894500c93d88a40faf1a0d33275bf8ff2",
+  "prompts": {
+    "1881f3924a97df38": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019deb51-dc45-7ee1-8b3d-6840e2edd977",
+        "model": "gpt-5.5"
+      },
+      "human_author": "bernoussama",
+      "messages": [],
+      "total_additions": 234,
+      "total_deletions": 4,
+      "accepted_lines": 230,
+      "overriden_lines": 0
+    }
+  }
+}
