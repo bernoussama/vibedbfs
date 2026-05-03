@@ -122,6 +122,7 @@ dbfs beats FUSE passthrough in 5 of 6 workloads. On fsync-heavy writes, dbfs is 
 
 Full benchmark notes:
 
+- [Disk-backed dbfs vs FUSE passthrough benchmark](docs/2026-05-03-disk-backed-fuse-passthrough-benchmark.md)
 - [Optimization results and methodology](docs/2026-05-03-optimization-results.md)
 - [Buffered-write fio results](docs/2026-05-03-fio-buffered-write-results.md)
 - [FUSE passthrough comparison (pre-optimization)](docs/2026-05-03-fio-fuse-passthrough-comparison.md)

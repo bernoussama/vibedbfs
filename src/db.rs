@@ -865,39 +865,53 @@ fn coalesce_writes(writes: &[(u64, Vec<u8>)]) -> Vec<(u64, Vec<u8>)> {
         return writes.to_vec();
     }
 
-    let mut indexed: Vec<(usize, u64, &[u8])> = writes
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, d))| !d.is_empty())
-        .map(|(i, (off, d))| (i, *off, d.as_slice()))
-        .collect();
-
-    if indexed.is_empty() {
-        return Vec::new();
-    }
-
-    indexed.sort_by_key(|&(_, off, _)| off);
-
     let mut result: Vec<(u64, Vec<u8>)> = Vec::new();
 
-    for (order, offset, data) in &indexed {
-        let end = *offset + data.len() as u64;
+    for (offset, data) in writes {
+        if data.is_empty() {
+            continue;
+        }
 
-        if let Some((last_off, last_buf)) = result.last_mut() {
-            let last_end = *last_off + last_buf.len() as u64;
-            if *offset <= last_end {
-                if end > last_end {
-                    last_buf.resize((end - *last_off) as usize, 0);
-                }
-                let dst_start = (*offset - *last_off) as usize;
-                last_buf[dst_start..dst_start + data.len()].copy_from_slice(data);
+        let end = *offset + data.len() as u64;
+        let mut next = Vec::with_capacity(result.len() + 1);
+
+        for (span_offset, span_data) in result {
+            let span_end = span_offset + span_data.len() as u64;
+
+            if span_end <= *offset || span_offset >= end {
+                next.push((span_offset, span_data));
+                continue;
+            }
+
+            if span_offset < *offset {
+                let left_len = (*offset - span_offset) as usize;
+                next.push((span_offset, span_data[..left_len].to_vec()));
+            }
+
+            if span_end > end {
+                let right_start = (end - span_offset) as usize;
+                next.push((end, span_data[right_start..].to_vec()));
+            }
+        }
+
+        next.push((*offset, data.to_vec()));
+        result = next;
+    }
+
+    result.sort_by_key(|(offset, _)| *offset);
+
+    let mut merged: Vec<(u64, Vec<u8>)> = Vec::with_capacity(result.len());
+    for (offset, data) in result {
+        if let Some((last_offset, last_data)) = merged.last_mut() {
+            let last_end = *last_offset + last_data.len() as u64;
+            if offset == last_end {
+                last_data.extend_from_slice(&data);
                 continue;
             }
         }
 
-        let _ = order;
-        result.push((*offset, data.to_vec()));
+        merged.push((offset, data));
     }
 
-    result
+    merged
 }
