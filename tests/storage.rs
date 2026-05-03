@@ -77,6 +77,44 @@ fn file_backed_database_enables_wal_and_foreign_keys() {
 }
 
 #[test]
+fn opening_legacy_database_migrates_root_owner_to_mount_user() {
+    let path = temp_db_path("legacy-root-owner");
+    {
+        let conn = Connection::open(&path).expect("open raw sqlite connection");
+        conn.execute_batch(
+            "
+            CREATE TABLE inodes (
+              ino INTEGER PRIMARY KEY,
+              kind INTEGER NOT NULL,
+              mode INTEGER NOT NULL,
+              uid INTEGER NOT NULL,
+              gid INTEGER NOT NULL,
+              size INTEGER NOT NULL,
+              atime INTEGER NOT NULL,
+              mtime INTEGER NOT NULL,
+              ctime INTEGER NOT NULL,
+              nlink INTEGER NOT NULL
+            );
+            INSERT INTO inodes
+              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              VALUES (1, 2, 493, 0, 0, 0, 1, 1, 1, 1);
+            ",
+        )
+        .expect("create legacy root inode");
+    }
+
+    let db = Db::open(&path).expect("open legacy database");
+    let root = db.get_inode(1).expect("load root inode");
+
+    assert_eq!(root.uid, unsafe { libc::getuid() });
+    assert_eq!(root.gid, unsafe { libc::getgid() });
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
 fn creates_file_and_directory_entries_under_parent() {
     let db = Db::open_in_memory().expect("open in-memory database");
 
@@ -274,6 +312,27 @@ fn unlinks_file_and_removes_its_contents() {
 }
 
 #[test]
+fn unlinking_open_hardlink_preserves_remaining_names() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"a.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    db.write_file(file.ino, 0, b"hello").expect("write file");
+    db.link(file.ino, 1, b"b.txt").expect("create hardlink");
+
+    db.open_file(file.ino);
+    db.unlink_file(1, b"a.txt")
+        .expect("unlink one hardlink while open");
+    db.release_file(file.ino);
+
+    assert_eq!(db.lookup(1, b"a.txt"), Err(DbError::NotFound));
+    let remaining = db.lookup(1, b"b.txt").expect("lookup remaining hardlink");
+    assert_eq!(remaining.ino, file.ino);
+    assert_eq!(remaining.nlink, 1);
+    assert_eq!(db.read_file(file.ino, 0, 5).expect("read file"), b"hello");
+}
+
+#[test]
 fn rejects_unlinking_directory_as_file() {
     let db = Db::open_in_memory().expect("open in-memory database");
     db.create_dir(1, b"docs", 0o755, 1000, 1000)
@@ -378,6 +437,39 @@ fn rename_replaces_existing_file() {
         source.ino
     );
     assert_eq!(db.get_inode(replaced.ino), Err(DbError::NotFound));
+}
+
+#[test]
+fn rename_over_hardlink_only_removes_destination_name() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let source = db
+        .create_file(1, b"source.txt", 0o644, 1000, 1000)
+        .expect("create source file");
+    let target = db
+        .create_file(1, b"target.txt", 0o644, 1000, 1000)
+        .expect("create target file");
+    db.write_file(target.ino, 0, b"target")
+        .expect("write target file");
+    db.link(target.ino, 1, b"survivor.txt")
+        .expect("create hardlink to target");
+
+    db.rename(1, b"source.txt", 1, b"target.txt")
+        .expect("replace target file");
+
+    assert_eq!(db.lookup(1, b"source.txt"), Err(DbError::NotFound));
+    assert_eq!(
+        db.lookup(1, b"target.txt").expect("lookup target name").ino,
+        source.ino
+    );
+    let survivor = db
+        .lookup(1, b"survivor.txt")
+        .expect("lookup survivor hardlink");
+    assert_eq!(survivor.ino, target.ino);
+    assert_eq!(survivor.nlink, 1);
+    assert_eq!(
+        db.read_file(target.ino, 0, 6).expect("read survivor"),
+        b"target"
+    );
 }
 
 #[test]

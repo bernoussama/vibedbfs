@@ -111,12 +111,7 @@ impl Dbfs {
         self.db.read_symlink(ino).map_err(errno_from_db_error)
     }
 
-    pub fn link(
-        &self,
-        ino: u64,
-        new_parent_ino: u64,
-        new_name: &[u8],
-    ) -> Result<FileAttr, i32> {
+    pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &[u8]) -> Result<FileAttr, i32> {
         self.db
             .link(ino, new_parent_ino, new_name)
             .map(|inode| file_attr_from_inode(&inode))

@@ -97,6 +97,8 @@ impl Db {
         )?;
 
         let now = now_secs();
+        let mount_uid = unsafe { libc::getuid() } as i64;
+        let mount_gid = unsafe { libc::getgid() } as i64;
         conn.execute(
             "INSERT OR IGNORE INTO inodes
              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
@@ -104,10 +106,16 @@ impl Db {
             params![
                 FileKind::Directory.as_i64(),
                 0o755_i64,
-                unsafe { libc::getuid() } as i64,
-                unsafe { libc::getgid() } as i64,
+                mount_uid,
+                mount_gid,
                 now
             ],
+        )?;
+        conn.execute(
+            "UPDATE inodes
+             SET uid = ?1, gid = ?2, ctime = ?3
+             WHERE ino = 1 AND uid = 0 AND gid = 0",
+            params![mount_uid, mount_gid, now],
         )?;
 
         Ok(Self {
@@ -207,14 +215,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        let inode = self.create_node(
-            parent_ino,
-            name,
-            FileKind::Symlink,
-            0o777,
-            uid,
-            gid,
-        )?;
+        let inode = self.create_node(parent_ino, name, FileKind::Symlink, 0o777, uid, gid)?;
 
         self.conn.borrow().execute(
             "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
@@ -274,20 +275,15 @@ impl Db {
                 pending.swap_remove(pos);
                 drop(pending);
                 // Safe to delete: no more open handles, already unlinked
-                let _ = self.conn.borrow().execute(
-                    "DELETE FROM inodes WHERE ino = ?1",
-                    params![ino as i64],
-                );
+                let _ = self
+                    .conn
+                    .borrow()
+                    .execute("DELETE FROM inodes WHERE ino = ?1", params![ino as i64]);
             }
         }
     }
 
-    pub fn link(
-        &self,
-        ino: u64,
-        new_parent_ino: u64,
-        new_name: &[u8],
-    ) -> Result<Inode, DbError> {
+    pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &[u8]) -> Result<Inode, DbError> {
         let inode = self.get_inode(ino)?;
         if inode.kind == FileKind::Directory {
             return Err(DbError::IsDirectory);
@@ -496,29 +492,7 @@ impl Db {
             params![parent_ino as i64, name],
         )?;
 
-        // Check if any file handles are open for this inode
-        let open_count = self.open_counts.borrow().get(&target.ino).copied().unwrap_or(0);
-        if open_count > 0 {
-            // File is still open — defer deletion until all handles are released.
-            // The inode stays but the directory entry is already removed,
-            // so the file is "unlinked" but still accessible via open handles.
-            // Set nlink to 0 to indicate the file has been fully unlinked.
-            tx.execute(
-                "UPDATE inodes SET nlink = 0, ctime = ?1 WHERE ino = ?2",
-                params![now, target.ino as i64],
-            )?;
-            self.pending_delete.borrow_mut().push(target.ino);
-        } else if target.nlink <= 1 {
-            tx.execute(
-                "DELETE FROM inodes WHERE ino = ?1",
-                params![target.ino as i64],
-            )?;
-        } else {
-            tx.execute(
-                "UPDATE inodes SET nlink = ?1, ctime = ?2 WHERE ino = ?3",
-                params![(target.nlink - 1) as i64, now, target.ino as i64],
-            )?;
-        }
+        self.drop_unlinked_inode(&tx, &target, now)?;
 
         tx.execute(
             "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
@@ -613,10 +587,7 @@ impl Db {
                 "DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2",
                 params![new_parent_ino as i64, new_name],
             )?;
-            tx.execute(
-                "DELETE FROM inodes WHERE ino = ?1",
-                params![target.ino as i64],
-            )?;
+            self.drop_unlinked_inode(&tx, &target, now)?;
         }
 
         tx.execute(
@@ -628,6 +599,52 @@ impl Db {
             params![now, parent_ino as i64, new_parent_ino as i64],
         )?;
         tx.commit()?;
+
+        Ok(())
+    }
+
+    fn drop_unlinked_inode(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        target: &Inode,
+        now: i64,
+    ) -> Result<(), DbError> {
+        if target.kind == FileKind::Directory {
+            tx.execute(
+                "DELETE FROM inodes WHERE ino = ?1",
+                params![target.ino as i64],
+            )?;
+            return Ok(());
+        }
+
+        if target.nlink > 1 {
+            tx.execute(
+                "UPDATE inodes SET nlink = ?1, ctime = ?2 WHERE ino = ?3",
+                params![(target.nlink - 1) as i64, now, target.ino as i64],
+            )?;
+            return Ok(());
+        }
+
+        let open_count = self
+            .open_counts
+            .borrow()
+            .get(&target.ino)
+            .copied()
+            .unwrap_or(0);
+        if open_count > 0 {
+            tx.execute(
+                "UPDATE inodes SET nlink = 0, ctime = ?1 WHERE ino = ?2",
+                params![now, target.ino as i64],
+            )?;
+            if !self.pending_delete.borrow().contains(&target.ino) {
+                self.pending_delete.borrow_mut().push(target.ino);
+            }
+        } else {
+            tx.execute(
+                "DELETE FROM inodes WHERE ino = ?1",
+                params![target.ino as i64],
+            )?;
+        }
 
         Ok(())
     }
