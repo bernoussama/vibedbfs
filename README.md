@@ -100,6 +100,23 @@ Pass extra fio arguments after `--`:
 scripts/bench-fio.sh --job randwrite --fsync 0 -- --group_reporting --output-format=json
 ```
 
+## Profiling / Flamegraphs
+
+On Linux, you can generate a CPU flamegraph for `dbfs` using `perf` + `flamegraph`.
+
+Prereqs:
+
+- `perf` (Linux perf tooling)
+- `cargo install flamegraph rustfilt`
+
+Then run:
+
+```bash
+scripts/profile-perf.sh -- <dbfs args>
+```
+
+This writes `/tmp/dbfs-prof/dbfs.svg`.
+
 ## Current fio Results
 
 Buffered dbfs writes on disk-backed btrfs:
