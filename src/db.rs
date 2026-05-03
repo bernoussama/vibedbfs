@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,6 +8,12 @@ use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
 use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate};
 
 const CHUNK_SIZE: usize = 65_536;
+
+#[derive(Clone, Copy)]
+struct ChunkPatch<'a> {
+    offset: usize,
+    data: &'a [u8],
+}
 
 pub struct Db {
     conn: RefCell<Connection>,
@@ -28,6 +34,7 @@ impl Db {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA busy_timeout = 5000;
+            PRAGMA wal_autocheckpoint = 10000;
             ",
         )?;
         Self::initialize(conn)
@@ -331,6 +338,9 @@ impl Db {
         let read_len = size.min((inode.size - offset) as u32) as usize;
         let mut output = vec![0; read_len];
         let conn = self.conn.borrow();
+        let mut stmt = conn.prepare_cached(
+            "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+        )?;
 
         let start = offset as usize;
         let end = start + read_len;
@@ -338,9 +348,8 @@ impl Db {
         let end_chunk = (end - 1) / CHUNK_SIZE;
 
         for chunk_index in start_chunk..=end_chunk {
-            let chunk = conn
+            let chunk = stmt
                 .query_row(
-                    "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
                     params![ino as i64, chunk_index as i64],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
@@ -383,6 +392,7 @@ impl Db {
         let now = now_secs();
         let mut new_size = inode.size;
         let mut written = 0usize;
+        let mut chunk_patches: BTreeMap<usize, Vec<ChunkPatch<'_>>> = BTreeMap::new();
 
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
@@ -404,34 +414,68 @@ impl Db {
                 let chunk_write_start = write_start - chunk_start;
                 let input_start = write_start - start;
                 let input_end = write_end - start;
-
-                let mut chunk = tx
-                    .query_row(
-                        "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
-                        params![ino as i64, chunk_index as i64],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .optional()?
-                    .unwrap_or_default();
-
-                let required_len = chunk_write_start + (input_end - input_start);
-                if chunk.len() < required_len {
-                    chunk.resize(required_len, 0);
-                }
-
-                chunk[chunk_write_start..required_len]
-                    .copy_from_slice(&data[input_start..input_end]);
-
-                tx.execute(
-                    "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
-                     ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
-                    params![ino as i64, chunk_index as i64, chunk],
-                )?;
+                chunk_patches
+                    .entry(chunk_index)
+                    .or_default()
+                    .push(ChunkPatch {
+                        offset: chunk_write_start,
+                        data: &data[input_start..input_end],
+                    });
             }
 
             new_size = new_size.max(*offset + data.len() as u64);
             written += data.len();
         }
+
+        let mut select_stmt = tx.prepare_cached(
+            "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+        )?;
+        let mut upsert_stmt = tx.prepare_cached(
+            "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
+        )?;
+
+        for (chunk_index, patches) in chunk_patches {
+            let existing_len = chunk_len_for_size(inode.size, chunk_index);
+            let required_len = patches
+                .iter()
+                .map(|patch| patch.offset + patch.data.len())
+                .max()
+                .unwrap_or(0);
+            if required_len == 0 {
+                continue;
+            }
+            let cover_len = existing_len.max(required_len);
+
+            let mut chunk = if existing_len == 0 || patches_cover_range(&patches, cover_len) {
+                vec![0; cover_len]
+            } else {
+                select_stmt
+                    .query_row(
+                        params![ino as i64, chunk_index as i64],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_default()
+            };
+
+            if chunk.len() < cover_len {
+                chunk.resize(cover_len, 0);
+            }
+
+            for patch in patches {
+                let end = patch.offset + patch.data.len();
+                if chunk.len() < end {
+                    chunk.resize(end, 0);
+                }
+                chunk[patch.offset..end].copy_from_slice(patch.data);
+            }
+
+            upsert_stmt.execute(params![ino as i64, chunk_index as i64, chunk])?;
+        }
+
+        drop(select_stmt);
+        drop(upsert_stmt);
 
         tx.execute(
             "UPDATE inodes SET size = ?1, mtime = ?2, ctime = ?2 WHERE ino = ?3",
@@ -812,4 +856,43 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_secs() as i64
+}
+
+fn chunk_len_for_size(size: u64, chunk_index: usize) -> usize {
+    if size == 0 {
+        return 0;
+    }
+    let last_chunk_index = ((size - 1) as usize) / CHUNK_SIZE;
+    if chunk_index < last_chunk_index {
+        CHUNK_SIZE
+    } else if chunk_index == last_chunk_index {
+        ((size - 1) as usize % CHUNK_SIZE) + 1
+    } else {
+        0
+    }
+}
+
+fn patches_cover_range(patches: &[ChunkPatch<'_>], cover_len: usize) -> bool {
+    if cover_len == 0 {
+        return true;
+    }
+    let mut spans: Vec<(usize, usize)> = patches
+        .iter()
+        .map(|patch| (patch.offset, patch.offset + patch.data.len()))
+        .collect();
+    spans.sort_by_key(|(start, _)| *start);
+
+    let mut covered_end = 0usize;
+    for (start, end) in spans {
+        if start > covered_end {
+            return false;
+        }
+        if end > covered_end {
+            covered_end = end;
+        }
+        if covered_end >= cover_len {
+            return true;
+        }
+    }
+    covered_end >= cover_len
 }

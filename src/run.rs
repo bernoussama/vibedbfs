@@ -34,6 +34,7 @@ pub fn mount_options() -> Vec<MountOption> {
         // Let the kernel enforce file permission checks based on inode mode/uid/gid.
         // Without this, the kernel allows all accesses regardless of file permissions.
         MountOption::DefaultPermissions,
+        MountOption::CUSTOM("max_write=1048576".to_string()),
     ]
 }
 
