@@ -1,0 +1,25 @@
+tests/storage.rs
+  1881f3924a97df38 210-227
+tests/fuse_readonly.rs
+  1881f3924a97df38 3-18,282-337
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "8d26fb6855b2fcd51a5295de7fbbfdbf8e0b8f3d",
+  "prompts": {
+    "1881f3924a97df38": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019deb51-dc45-7ee1-8b3d-6840e2edd977",
+        "model": "gpt-5.5"
+      },
+      "human_author": "bernoussama",
+      "messages": [],
+      "total_additions": 95,
+      "total_deletions": 2,
+      "accepted_lines": 93,
+      "overriden_lines": 0
+    }
+  }
+}
