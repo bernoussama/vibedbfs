@@ -58,23 +58,29 @@ impl Dbfs {
         Ok(attr)
     }
 
-    pub fn readdir(&self, ino: u64) -> Result<Vec<DbfsDirEntry>, i32> {
-        let mut entries = vec![
-            DbfsDirEntry {
+    pub fn readdir(&self, ino: u64, offset: i64) -> Result<Vec<DbfsDirEntry>, i32> {
+        let mut entries = Vec::new();
+        let dot_count: i64 = 2;
+
+        if offset < 1 {
+            entries.push(DbfsDirEntry {
                 name: b".".to_vec(),
                 ino,
                 kind: FileType::Directory,
-            },
-            DbfsDirEntry {
+            });
+        }
+        if offset < 2 {
+            entries.push(DbfsDirEntry {
                 name: b"..".to_vec(),
                 ino: self.parent_ino(ino).unwrap_or(ino),
                 kind: FileType::Directory,
-            },
-        ];
+            });
+        }
 
+        let db_offset = (offset - dot_count).max(0) as u64;
         entries.extend(
             self.db
-                .list_dir(ino)
+                .list_dir_offset(ino, db_offset)
                 .map_err(errno_from_db_error)?
                 .into_iter()
                 .map(|entry| DbfsDirEntry {
@@ -226,18 +232,25 @@ impl Dbfs {
     }
 
     pub fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
-        let inode = self.db.get_inode(ino).map_err(errno_from_db_error)?;
-        if inode.kind != FileKind::RegularFile {
-            return Err(libc::ENOENT);
-        }
         if data.is_empty() {
             return Ok(0);
         }
 
+        let kind = match self.db.inode_kind(ino) {
+            Some(k) => k,
+            None => self.db.get_inode(ino).map_err(errno_from_db_error)?.kind,
+        };
+        if kind != FileKind::RegularFile {
+            return Err(libc::ENOENT);
+        }
+
         let mut dirty_files = self.dirty_files.borrow_mut();
-        let dirty = dirty_files.entry(ino).or_insert_with(|| DirtyFile {
-            size: inode.size,
-            writes: Vec::new(),
+        let dirty = dirty_files.entry(ino).or_insert_with(|| {
+            let size = self.db.get_inode(ino).map(|i| i.size).unwrap_or(0);
+            DirtyFile {
+                size,
+                writes: Vec::new(),
+            }
         });
         dirty.size = dirty.size.max(offset + data.len() as u64);
         dirty.writes.push((offset, data.to_vec()));
@@ -266,11 +279,10 @@ impl Dbfs {
     }
 
     pub fn unlink(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
-        if let Ok(attr) = self.lookup(parent_ino, name) {
-            self.flush_file(attr.ino)?;
-        }
+        let inode = self.db.lookup(parent_ino, name).map_err(errno_from_db_error)?;
+        self.flush_file(inode.ino)?;
         self.db
-            .unlink_file(parent_ino, name)
+            .unlink_inode(parent_ino, name, &inode)
             .map_err(errno_from_db_error)
     }
 
@@ -287,8 +299,8 @@ impl Dbfs {
         new_parent_ino: u64,
         new_name: &[u8],
     ) -> Result<(), i32> {
-        if let Ok(attr) = self.lookup(parent_ino, name) {
-            self.flush_file(attr.ino)?;
+        if let Ok(inode) = self.db.lookup(parent_ino, name) {
+            self.flush_file(inode.ino)?;
         }
         self.db
             .rename(parent_ino, name, new_parent_ino, new_name)
@@ -323,10 +335,10 @@ impl Filesystem for Dbfs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        match Dbfs::readdir(self, ino) {
+        match Dbfs::readdir(self, ino, offset) {
             Ok(entries) => {
-                for (index, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                    let next_offset = (index + 1) as i64;
+                for (i, entry) in entries.into_iter().enumerate() {
+                    let next_offset = offset + (i as i64) + 1;
                     if reply.add(
                         entry.ino,
                         next_offset,
@@ -392,7 +404,7 @@ impl Filesystem for Dbfs {
             // The kernel validates these against known FOPEN_* constants
             // and rejects the reply with EIO for invalid values.
             Ok(attr) => {
-                self.db.open_file(attr.ino);
+                self.db.open_file(attr.ino, FileKind::RegularFile);
                 reply.created(&ATTR_TTL, &attr, 0, attr.ino, 0);
             }
             Err(errno) => reply.error(errno),
@@ -476,12 +488,12 @@ impl Filesystem for Dbfs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        match Dbfs::open(self, ino) {
-            Ok(handle) => {
-                self.db.open_file(ino);
-                reply.opened(handle, 0);
+        match self.db.get_inode(ino) {
+            Ok(inode) => {
+                self.db.open_file(ino, inode.kind);
+                reply.opened(ino, 0);
             }
-            Err(errno) => reply.error(errno),
+            Err(e) => reply.error(errno_from_db_error(e)),
         }
     }
 

@@ -59,7 +59,7 @@ fn reads_directory_entries_with_dot_entries_first() {
         .expect("create file");
     let fs = Dbfs::new(db);
 
-    let entries = fs.readdir(1).expect("read root directory");
+    let entries = fs.readdir(1, 0).expect("read root directory");
 
     assert_eq!(
         entries,

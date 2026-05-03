@@ -17,6 +17,9 @@ pub struct Db {
     open_counts: RefCell<HashMap<u64, u64>>,
     /// Inodes pending deletion once all handles are closed.
     pending_delete: RefCell<Vec<u64>>,
+    /// Cached inode kinds for open files (set on open, cleared on release).
+    /// Avoids redundant get_inode calls on every write/read.
+    inode_kinds: RefCell<HashMap<u64, FileKind>>,
 }
 
 impl Db {
@@ -28,6 +31,7 @@ impl Db {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA busy_timeout = 5000;
+            PRAGMA wal_autocheckpoint = 10000;
             ",
         )?;
         Self::initialize(conn)
@@ -122,32 +126,31 @@ impl Db {
             conn: RefCell::new(conn),
             open_counts: RefCell::new(HashMap::new()),
             pending_delete: RefCell::new(Vec::new()),
+            inode_kinds: RefCell::new(HashMap::new()),
         })
     }
 
     pub fn get_inode(&self, ino: u64) -> Result<Inode, DbError> {
         let conn = self.conn.borrow();
-        conn.query_row(
+        let mut stmt = conn.prepare_cached(
             "SELECT ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink
              FROM inodes
              WHERE ino = ?1",
-            params![ino as i64],
-            inode_from_row,
-        )
-        .map_err(Into::into)
+        )?;
+        stmt.query_row(params![ino as i64], inode_from_row)
+            .map_err(Into::into)
     }
 
     pub fn lookup(&self, parent_ino: u64, name: &[u8]) -> Result<Inode, DbError> {
         let conn = self.conn.borrow();
-        conn.query_row(
+        let mut stmt = conn.prepare_cached(
             "SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.nlink
              FROM dirents d
              JOIN inodes i ON i.ino = d.child_ino
              WHERE d.parent_ino = ?1 AND d.name = ?2",
-            params![parent_ino as i64, name],
-            inode_from_row,
-        )
-        .map_err(Into::into)
+        )?;
+        stmt.query_row(params![parent_ino as i64, name], inode_from_row)
+            .map_err(Into::into)
     }
 
     pub fn list_dir(&self, ino: u64) -> Result<Vec<DirEntry>, DbError> {
@@ -156,7 +159,7 @@ impl Db {
         }
 
         let conn = self.conn.borrow();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT d.name, i.ino, i.kind
              FROM dirents d
              JOIN inodes i ON i.ino = d.child_ino
@@ -166,6 +169,43 @@ impl Db {
 
         let entries = stmt
             .query_map(params![ino as i64], |row| {
+                let kind = FileKind::from_i64(row.get(2)?).map_err(|err| {
+                    SqlError::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::new(std::io::Error::other(format!("{err:?}"))),
+                    )
+                })?;
+
+                Ok(DirEntry {
+                    name: row.get(0)?,
+                    ino: row.get::<_, i64>(1)? as u64,
+                    kind,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    /// Like `list_dir` but skips the first `offset` rows in SQL.
+    pub fn list_dir_offset(&self, ino: u64, offset: u64) -> Result<Vec<DirEntry>, DbError> {
+        if self.get_inode(ino)?.kind != FileKind::Directory {
+            return Err(DbError::NotDirectory);
+        }
+
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare_cached(
+            "SELECT d.name, i.ino, i.kind
+             FROM dirents d
+             JOIN inodes i ON i.ino = d.child_ino
+             WHERE d.parent_ino = ?1
+             ORDER BY d.name
+             LIMIT -1 OFFSET ?2",
+        )?;
+
+        let entries = stmt
+            .query_map(params![ino as i64, offset as i64], |row| {
                 let kind = FileKind::from_i64(row.get(2)?).map_err(|err| {
                     SqlError::FromSqlConversionFailure(
                         2,
@@ -217,17 +257,14 @@ impl Db {
     ) -> Result<Inode, DbError> {
         let inode = self.create_node(parent_ino, name, FileKind::Symlink, 0o777, uid, gid)?;
 
-        self.conn.borrow().execute(
+        let conn = self.conn.borrow();
+        conn.prepare_cached(
             "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
-            params![inode.ino as i64, target],
-        )?;
+        )?.execute(params![inode.ino as i64, target])?;
 
-        // Update size to reflect target length
-        let _now = now_secs();
-        self.conn.borrow().execute(
+        conn.prepare_cached(
             "UPDATE inodes SET size = ?1 WHERE ino = ?2",
-            params![target.len() as i64, inode.ino as i64],
-        )?;
+        )?.execute(params![target.len() as i64, inode.ino as i64])?;
 
         Ok(Inode {
             size: target.len() as u64,
@@ -241,19 +278,22 @@ impl Db {
             return Err(DbError::InvalidInput);
         }
 
-        self.conn
-            .borrow()
-            .query_row(
-                "SELECT target FROM symlink_targets WHERE ino = ?1",
-                params![ino as i64],
-                |row| row.get(0),
-            )
+        let conn = self.conn.borrow();
+        conn.prepare_cached(
+            "SELECT target FROM symlink_targets WHERE ino = ?1",
+        )?.query_row(params![ino as i64], |row| row.get(0))
             .map_err(Into::into)
     }
 
     /// Track that a file handle has been opened for this inode.
-    pub fn open_file(&self, ino: u64) {
+    pub fn open_file(&self, ino: u64, kind: FileKind) {
         *self.open_counts.borrow_mut().entry(ino).or_insert(0) += 1;
+        self.inode_kinds.borrow_mut().insert(ino, kind);
+    }
+
+    /// Return the cached inode kind for an open file, if available.
+    pub fn inode_kind(&self, ino: u64) -> Option<FileKind> {
+        self.inode_kinds.borrow().get(&ino).copied()
     }
 
     /// Release a file handle. If this was the last handle and the inode
@@ -267,18 +307,18 @@ impl Db {
 
         if *count == 0 {
             open_counts.remove(&ino);
+            self.inode_kinds.borrow_mut().remove(&ino);
             drop(open_counts);
 
-            // Check if this inode is pending deletion
             let mut pending = self.pending_delete.borrow_mut();
             if let Some(pos) = pending.iter().position(|&p| p == ino) {
                 pending.swap_remove(pos);
                 drop(pending);
-                // Safe to delete: no more open handles, already unlinked
                 let _ = self
                     .conn
                     .borrow()
-                    .execute("DELETE FROM inodes WHERE ino = ?1", params![ino as i64]);
+                    .prepare_cached("DELETE FROM inodes WHERE ino = ?1")
+                    .and_then(|mut s| s.execute(params![ino as i64]));
             }
         }
     }
@@ -296,20 +336,17 @@ impl Db {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
 
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)",
-            params![new_parent_ino as i64, new_name, ino as i64],
-        )?;
+        )?.execute(params![new_parent_ino as i64, new_name, ino as i64])?;
 
         let new_nlink = inode.nlink + 1;
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE inodes SET nlink = ?1, ctime = ?2 WHERE ino = ?3",
-            params![new_nlink as i64, now, ino as i64],
-        )?;
-        tx.execute(
+        )?.execute(params![new_nlink as i64, now, ino as i64])?;
+        tx.prepare_cached(
             "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
-            params![now, new_parent_ino as i64],
-        )?;
+        )?.execute(params![now, new_parent_ino as i64])?;
         tx.commit()?;
 
         Ok(Inode {
@@ -337,10 +374,13 @@ impl Db {
         let start_chunk = start / CHUNK_SIZE;
         let end_chunk = (end - 1) / CHUNK_SIZE;
 
+        let mut stmt = conn.prepare_cached(
+            "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+        )?;
+
         for chunk_index in start_chunk..=end_chunk {
-            let chunk = conn
+            let chunk = stmt
                 .query_row(
-                    "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
                     params![ino as i64, chunk_index as i64],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
@@ -380,6 +420,8 @@ impl Db {
             return Ok(0);
         }
 
+        let coalesced = coalesce_writes(writes);
+
         let now = now_secs();
         let mut new_size = inode.size;
         let mut written = 0usize;
@@ -387,56 +429,70 @@ impl Db {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
 
-        for (offset, data) in writes {
-            if data.is_empty() {
-                continue;
-            }
+        {
+            let mut read_stmt = tx.prepare_cached(
+                "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+            )?;
+            let mut write_stmt = tx.prepare_cached(
+                "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
+            )?;
 
-            let start = *offset as usize;
-            let end = start + data.len();
-            let start_chunk = start / CHUNK_SIZE;
-            let end_chunk = (end - 1) / CHUNK_SIZE;
-
-            for chunk_index in start_chunk..=end_chunk {
-                let chunk_start = chunk_index * CHUNK_SIZE;
-                let write_start = start.max(chunk_start);
-                let write_end = end.min(chunk_start + CHUNK_SIZE);
-                let chunk_write_start = write_start - chunk_start;
-                let input_start = write_start - start;
-                let input_end = write_end - start;
-
-                let mut chunk = tx
-                    .query_row(
-                        "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
-                        params![ino as i64, chunk_index as i64],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .optional()?
-                    .unwrap_or_default();
-
-                let required_len = chunk_write_start + (input_end - input_start);
-                if chunk.len() < required_len {
-                    chunk.resize(required_len, 0);
+            for (offset, data) in &coalesced {
+                if data.is_empty() {
+                    continue;
                 }
 
-                chunk[chunk_write_start..required_len]
-                    .copy_from_slice(&data[input_start..input_end]);
+                let start = *offset as usize;
+                let end = start + data.len();
+                let start_chunk = start / CHUNK_SIZE;
+                let end_chunk = (end - 1) / CHUNK_SIZE;
 
-                tx.execute(
-                    "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
-                     ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
-                    params![ino as i64, chunk_index as i64, chunk],
-                )?;
+                for chunk_index in start_chunk..=end_chunk {
+                    let chunk_start = chunk_index * CHUNK_SIZE;
+                    let write_start = start.max(chunk_start);
+                    let write_end = end.min(chunk_start + CHUNK_SIZE);
+                    let chunk_write_start = write_start - chunk_start;
+                    let input_start = write_start - start;
+                    let input_end = write_end - start;
+                    let write_len = input_end - input_start;
+
+                    let is_full_chunk = chunk_write_start == 0 && write_len == CHUNK_SIZE;
+
+                    let chunk_data: Vec<u8> = if is_full_chunk {
+                        data[input_start..input_end].to_vec()
+                    } else {
+                        let mut chunk = read_stmt
+                            .query_row(
+                                params![ino as i64, chunk_index as i64],
+                                |row| row.get::<_, Vec<u8>>(0),
+                            )
+                            .optional()?
+                            .unwrap_or_default();
+
+                        let required_len = chunk_write_start + write_len;
+                        if chunk.len() < required_len {
+                            chunk.resize(required_len, 0);
+                        }
+
+                        chunk[chunk_write_start..required_len]
+                            .copy_from_slice(&data[input_start..input_end]);
+                        chunk
+                    };
+
+                    write_stmt.execute(
+                        params![ino as i64, chunk_index as i64, chunk_data],
+                    )?;
+                }
+
+                new_size = new_size.max(*offset + data.len() as u64);
+                written += data.len();
             }
-
-            new_size = new_size.max(*offset + data.len() as u64);
-            written += data.len();
         }
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE inodes SET size = ?1, mtime = ?2, ctime = ?2 WHERE ino = ?3",
-            params![new_size as i64, now, ino as i64],
-        )?;
+        )?.execute(params![new_size as i64, now, ino as i64])?;
         tx.commit()?;
 
         Ok(written as u32)
@@ -453,40 +509,35 @@ impl Db {
         let tx = conn.transaction()?;
 
         if size == 0 {
-            tx.execute(
+            tx.prepare_cached(
                 "DELETE FROM file_chunks WHERE ino = ?1",
-                params![ino as i64],
-            )?;
+            )?.execute(params![ino as i64])?;
         } else {
             let final_chunk_index = ((size - 1) as usize) / CHUNK_SIZE;
             let final_chunk_len = ((size - 1) as usize % CHUNK_SIZE) + 1;
 
-            tx.execute(
+            tx.prepare_cached(
                 "DELETE FROM file_chunks WHERE ino = ?1 AND chunk_index > ?2",
-                params![ino as i64, final_chunk_index as i64],
-            )?;
+            )?.execute(params![ino as i64, final_chunk_index as i64])?;
 
-            let final_chunk = tx
-                .query_row(
-                    "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
-                    params![ino as i64, final_chunk_index as i64],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()?;
+            let final_chunk = tx.prepare_cached(
+                "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+            )?.query_row(
+                params![ino as i64, final_chunk_index as i64],
+                |row| row.get::<_, Vec<u8>>(0),
+            ).optional()?;
 
             if let Some(mut final_chunk) = final_chunk {
                 final_chunk.truncate(final_chunk_len);
-                tx.execute(
+                tx.prepare_cached(
                     "UPDATE file_chunks SET data = ?1 WHERE ino = ?2 AND chunk_index = ?3",
-                    params![final_chunk, ino as i64, final_chunk_index as i64],
-                )?;
+                )?.execute(params![final_chunk, ino as i64, final_chunk_index as i64])?;
             }
         }
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE inodes SET size = ?1, mtime = ?2, ctime = ?2 WHERE ino = ?3",
-            params![size as i64, now, ino as i64],
-        )?;
+        )?.execute(params![size as i64, now, ino as i64])?;
         tx.commit()?;
 
         Ok(())
@@ -494,6 +545,11 @@ impl Db {
 
     pub fn unlink_file(&self, parent_ino: u64, name: &[u8]) -> Result<(), DbError> {
         let target = self.lookup(parent_ino, name)?;
+        self.unlink_inode(parent_ino, name, &target)
+    }
+
+    /// Unlink a file whose inode has already been resolved (avoids redundant lookup).
+    pub fn unlink_inode(&self, parent_ino: u64, name: &[u8], target: &Inode) -> Result<(), DbError> {
         if target.kind == FileKind::Directory {
             return Err(DbError::IsDirectory);
         }
@@ -502,18 +558,15 @@ impl Db {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
 
-        // Remove the directory entry
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2",
-            params![parent_ino as i64, name],
-        )?;
+        )?.execute(params![parent_ino as i64, name])?;
 
-        self.drop_unlinked_inode(&tx, &target, now)?;
+        self.drop_unlinked_inode(&tx, target, now)?;
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
-            params![now, parent_ino as i64],
-        )?;
+        )?.execute(params![now, parent_ino as i64])?;
         tx.commit()?;
 
         Ok(())
@@ -528,27 +581,22 @@ impl Db {
         let now = now_secs();
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
-        let child_count: i64 = tx.query_row(
+        let child_count: i64 = tx.prepare_cached(
             "SELECT COUNT(*) FROM dirents WHERE parent_ino = ?1",
-            params![target.ino as i64],
-            |row| row.get(0),
-        )?;
+        )?.query_row(params![target.ino as i64], |row| row.get(0))?;
         if child_count != 0 {
             return Err(DbError::DirectoryNotEmpty);
         }
 
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2",
-            params![parent_ino as i64, name],
-        )?;
-        tx.execute(
+        )?.execute(params![parent_ino as i64, name])?;
+        tx.prepare_cached(
             "DELETE FROM inodes WHERE ino = ?1",
-            params![target.ino as i64],
-        )?;
-        tx.execute(
+        )?.execute(params![target.ino as i64])?;
+        tx.prepare_cached(
             "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
-            params![now, parent_ino as i64],
-        )?;
+        )?.execute(params![now, parent_ino as i64])?;
         tx.commit()?;
 
         Ok(())
@@ -599,21 +647,18 @@ impl Db {
         let tx = conn.transaction()?;
 
         if let Some(target) = existing_target {
-            tx.execute(
+            tx.prepare_cached(
                 "DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2",
-                params![new_parent_ino as i64, new_name],
-            )?;
+            )?.execute(params![new_parent_ino as i64, new_name])?;
             self.drop_unlinked_inode(&tx, &target, now)?;
         }
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE dirents SET parent_ino = ?1, name = ?2 WHERE parent_ino = ?3 AND name = ?4",
-            params![new_parent_ino as i64, new_name, parent_ino as i64, name],
-        )?;
-        tx.execute(
+        )?.execute(params![new_parent_ino as i64, new_name, parent_ino as i64, name])?;
+        tx.prepare_cached(
             "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2 OR ino = ?3",
-            params![now, parent_ino as i64, new_parent_ino as i64],
-        )?;
+        )?.execute(params![now, parent_ino as i64, new_parent_ino as i64])?;
         tx.commit()?;
 
         Ok(())
@@ -626,18 +671,16 @@ impl Db {
         now: i64,
     ) -> Result<(), DbError> {
         if target.kind == FileKind::Directory {
-            tx.execute(
+            tx.prepare_cached(
                 "DELETE FROM inodes WHERE ino = ?1",
-                params![target.ino as i64],
-            )?;
+            )?.execute(params![target.ino as i64])?;
             return Ok(());
         }
 
         if target.nlink > 1 {
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE inodes SET nlink = ?1, ctime = ?2 WHERE ino = ?3",
-                params![(target.nlink - 1) as i64, now, target.ino as i64],
-            )?;
+            )?.execute(params![(target.nlink - 1) as i64, now, target.ino as i64])?;
             return Ok(());
         }
 
@@ -648,18 +691,16 @@ impl Db {
             .copied()
             .unwrap_or(0);
         if open_count > 0 {
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE inodes SET nlink = 0, ctime = ?1 WHERE ino = ?2",
-                params![now, target.ino as i64],
-            )?;
+            )?.execute(params![now, target.ino as i64])?;
             if !self.pending_delete.borrow().contains(&target.ino) {
                 self.pending_delete.borrow_mut().push(target.ino);
             }
         } else {
-            tx.execute(
+            tx.prepare_cached(
                 "DELETE FROM inodes WHERE ino = ?1",
-                params![target.ino as i64],
-            )?;
+            )?.execute(params![target.ino as i64])?;
         }
 
         Ok(())
@@ -674,20 +715,21 @@ impl Db {
         let atime = update.atime.unwrap_or(inode.atime);
         let mtime = update.mtime.unwrap_or(inode.mtime);
 
-        self.conn.borrow().execute(
+        let conn = self.conn.borrow();
+        conn.prepare_cached(
             "UPDATE inodes
              SET mode = ?1, uid = ?2, gid = ?3, atime = ?4, mtime = ?5, ctime = ?6
              WHERE ino = ?7",
-            params![
-                mode as i64,
-                uid as i64,
-                gid as i64,
-                atime,
-                mtime,
-                now,
-                ino as i64
-            ],
-        )?;
+        )?.execute(params![
+            mode as i64,
+            uid as i64,
+            gid as i64,
+            atime,
+            mtime,
+            now,
+            ino as i64
+        ])?;
+        drop(conn);
 
         self.get_inode(ino)
     }
@@ -709,24 +751,21 @@ impl Db {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
 
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO inodes (kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
              VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, 1)",
-            params![kind.as_i64(), mode, uid, gid, now],
-        )?;
+        )?.execute(params![kind.as_i64(), mode, uid, gid, now])?;
         let ino = tx.last_insert_rowid() as u64;
 
-        if let Err(error) = tx.execute(
+        if let Err(error) = tx.prepare_cached(
             "INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)",
-            params![parent_ino as i64, name, ino as i64],
-        ) {
+        ).and_then(|mut s| s.execute(params![parent_ino as i64, name, ino as i64])) {
             return Err(error.into());
         }
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
-            params![now, parent_ino as i64],
-        )?;
+        )?.execute(params![now, parent_ino as i64])?;
         tx.commit()?;
 
         Ok(Inode {
@@ -749,11 +788,13 @@ impl Db {
         }
 
         let conn = self.conn.borrow();
+        let mut stmt = conn.prepare_cached(
+            "SELECT parent_ino FROM dirents WHERE child_ino = ?1",
+        )?;
         let mut current = ino;
         while current != 1 {
-            let parent = conn
+            let parent = stmt
                 .query_row(
-                    "SELECT parent_ino FROM dirents WHERE child_ino = ?1",
                     params![current as i64],
                     |row| row.get::<_, i64>(0),
                 )
@@ -812,4 +853,51 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_secs() as i64
+}
+
+/// Merge overlapping and adjacent writes into non-overlapping spans.
+///
+/// Later writes in the input overwrite earlier ones where they overlap,
+/// preserving correct write-ordering semantics. The returned vec is
+/// sorted by offset with no overlaps.
+fn coalesce_writes(writes: &[(u64, Vec<u8>)]) -> Vec<(u64, Vec<u8>)> {
+    if writes.len() <= 1 {
+        return writes.to_vec();
+    }
+
+    let mut indexed: Vec<(usize, u64, &[u8])> = writes
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, d))| !d.is_empty())
+        .map(|(i, (off, d))| (i, *off, d.as_slice()))
+        .collect();
+
+    if indexed.is_empty() {
+        return Vec::new();
+    }
+
+    indexed.sort_by_key(|&(_, off, _)| off);
+
+    let mut result: Vec<(u64, Vec<u8>)> = Vec::new();
+
+    for (order, offset, data) in &indexed {
+        let end = *offset + data.len() as u64;
+
+        if let Some((last_off, last_buf)) = result.last_mut() {
+            let last_end = *last_off + last_buf.len() as u64;
+            if *offset <= last_end {
+                if end > last_end {
+                    last_buf.resize((end - *last_off) as usize, 0);
+                }
+                let dst_start = (*offset - *last_off) as usize;
+                last_buf[dst_start..dst_start + data.len()].copy_from_slice(data);
+                continue;
+            }
+        }
+
+        let _ = order;
+        result.push((*offset, data.to_vec()));
+    }
+
+    result
 }
