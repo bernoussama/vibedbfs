@@ -368,62 +368,78 @@ impl Db {
     }
 
     pub fn write_file(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32, DbError> {
+        self.write_file_batch(ino, &[(offset, data.to_vec())])
+    }
+
+    pub fn write_file_batch(&self, ino: u64, writes: &[(u64, Vec<u8>)]) -> Result<u32, DbError> {
         let inode = self.get_inode(ino)?;
         if inode.kind != FileKind::RegularFile {
             return Err(DbError::NotFound);
         }
-        if data.is_empty() {
+        if writes.iter().all(|(_, data)| data.is_empty()) {
             return Ok(0);
         }
 
         let now = now_secs();
-        let start = offset as usize;
-        let end = start + data.len();
-        let start_chunk = start / CHUNK_SIZE;
-        let end_chunk = (end - 1) / CHUNK_SIZE;
+        let mut new_size = inode.size;
+        let mut written = 0usize;
 
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
 
-        for chunk_index in start_chunk..=end_chunk {
-            let chunk_start = chunk_index * CHUNK_SIZE;
-            let write_start = start.max(chunk_start);
-            let write_end = end.min(chunk_start + CHUNK_SIZE);
-            let chunk_write_start = write_start - chunk_start;
-            let input_start = write_start - start;
-            let input_end = write_end - start;
-
-            let mut chunk = tx
-                .query_row(
-                    "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
-                    params![ino as i64, chunk_index as i64],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()?
-                .unwrap_or_default();
-
-            let required_len = chunk_write_start + (input_end - input_start);
-            if chunk.len() < required_len {
-                chunk.resize(required_len, 0);
+        for (offset, data) in writes {
+            if data.is_empty() {
+                continue;
             }
 
-            chunk[chunk_write_start..required_len].copy_from_slice(&data[input_start..input_end]);
+            let start = *offset as usize;
+            let end = start + data.len();
+            let start_chunk = start / CHUNK_SIZE;
+            let end_chunk = (end - 1) / CHUNK_SIZE;
 
-            tx.execute(
-                "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
-                params![ino as i64, chunk_index as i64, chunk],
-            )?;
+            for chunk_index in start_chunk..=end_chunk {
+                let chunk_start = chunk_index * CHUNK_SIZE;
+                let write_start = start.max(chunk_start);
+                let write_end = end.min(chunk_start + CHUNK_SIZE);
+                let chunk_write_start = write_start - chunk_start;
+                let input_start = write_start - start;
+                let input_end = write_end - start;
+
+                let mut chunk = tx
+                    .query_row(
+                        "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+                        params![ino as i64, chunk_index as i64],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_default();
+
+                let required_len = chunk_write_start + (input_end - input_start);
+                if chunk.len() < required_len {
+                    chunk.resize(required_len, 0);
+                }
+
+                chunk[chunk_write_start..required_len]
+                    .copy_from_slice(&data[input_start..input_end]);
+
+                tx.execute(
+                    "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
+                    params![ino as i64, chunk_index as i64, chunk],
+                )?;
+            }
+
+            new_size = new_size.max(*offset + data.len() as u64);
+            written += data.len();
         }
 
-        let new_size = inode.size.max(offset + data.len() as u64);
         tx.execute(
             "UPDATE inodes SET size = ?1, mtime = ?2, ctime = ?2 WHERE ino = ?3",
             params![new_size as i64, now, ino as i64],
         )?;
         tx.commit()?;
 
-        Ok(data.len() as u32)
+        Ok(written as u32)
     }
 
     pub fn truncate_file(&self, ino: u64, size: u64) -> Result<(), DbError> {

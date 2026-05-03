@@ -1,5 +1,21 @@
 use dbfs::{Db, Dbfs, DbfsDirEntry, FileKind, mount_options};
 use fuser::{FileType, MountOption};
+use rusqlite::{Connection, params};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn temp_db_path(name: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    path.push(format!(
+        "dbfs-fuse-{name}-{}-{nanos}.sqlite",
+        std::process::id()
+    ));
+    path
+}
 
 #[test]
 fn gets_fuse_attributes_by_inode() {
@@ -261,6 +277,64 @@ fn writes_regular_file_through_fuse_helper() {
 
     assert_eq!(written, 5);
     assert_eq!(fs.read(file.ino, 0, 5).expect("read file"), b"hello");
+}
+
+#[test]
+fn buffers_fuse_writes_until_flush() {
+    let path = temp_db_path("buffered-write");
+    let db = Db::open(&path).expect("open file-backed database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    fs.write(file.ino, 0, b"hello").expect("write file");
+
+    assert_eq!(
+        fs.read(file.ino, 0, 5).expect("read buffered file"),
+        b"hello"
+    );
+    assert_eq!(fs.getattr(file.ino).expect("dirty attr").size, 5);
+    assert_eq!(raw_inode_size(&path, file.ino), 0);
+
+    fs.flush_file(file.ino).expect("flush file");
+
+    assert_eq!(raw_inode_size(&path, file.ino), 5);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
+fn release_flushes_buffered_fuse_writes() {
+    let path = temp_db_path("release-buffered-write");
+    let db = Db::open(&path).expect("open file-backed database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    fs.open(file.ino).expect("open file");
+    fs.write(file.ino, 0, b"hello").expect("write file");
+    fs.release_file(file.ino).expect("release file");
+
+    assert_eq!(raw_inode_size(&path, file.ino), 5);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+fn raw_inode_size(path: &std::path::Path, ino: u64) -> i64 {
+    Connection::open(path)
+        .expect("open raw sqlite connection")
+        .query_row(
+            "SELECT size FROM inodes WHERE ino = ?1",
+            params![ino as i64],
+            |row| row.get(0),
+        )
+        .expect("read raw inode size")
 }
 
 #[test]

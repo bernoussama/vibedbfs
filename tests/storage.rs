@@ -207,6 +207,25 @@ fn writes_and_reads_file_contents() {
 }
 
 #[test]
+fn batches_multiple_file_writes_in_one_call() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+
+    let written = db
+        .write_file_batch(file.ino, &[(0, b"hello".to_vec()), (6, b"dbfs".to_vec())])
+        .expect("write batch");
+
+    assert_eq!(written, 9);
+    assert_eq!(
+        db.read_file(file.ino, 0, 10).expect("read file"),
+        b"hello\0dbfs"
+    );
+    assert_eq!(db.get_inode(file.ino).expect("load inode").size, 10);
+}
+
+#[test]
 fn offset_write_zero_fills_gap_on_read() {
     let db = Db::open_in_memory().expect("open in-memory database");
     let file = db
