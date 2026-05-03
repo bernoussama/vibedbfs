@@ -1,0 +1,27 @@
+tests/storage.rs
+  5f6dd815d546c0c1 80-116,314-334,442-472
+src/db.rs
+  5f6dd815d546c0c1 100-101,109-110,114-119,218,278-281,286,495,590,606-647
+src/fuse.rs
+  5f6dd815d546c0c1 114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "22be8fadd850ed49500ee2369769cb6ab11467c1",
+  "prompts": {
+    "5f6dd815d546c0c1": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019deb37-bdbc-71a3-bafb-ef2bae3faece",
+        "model": "gpt-5.5"
+      },
+      "human_author": "bernoussama",
+      "messages": [],
+      "total_additions": 157,
+      "total_deletions": 53,
+      "accepted_lines": 157,
+      "overriden_lines": 0
+    }
+  }
+}
