@@ -4,6 +4,8 @@ dbfs is a FUSE filesystem backed by SQLite.
 
 It stores filesystem metadata and file contents in a SQLite database, exposes them through FUSE, and currently supports basic file, directory, symlink, hardlink, rename, truncate, read, and write operations.
 
+See [Architecture](docs/architecture.md) for ASCII diagrams of the system structure and data flows.
+
 ## Build
 
 ```bash
