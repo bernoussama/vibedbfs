@@ -1,5 +1,8 @@
 # dbfs
 
+> **Experimental:** dbfs is an experimental project and is not ready for
+> production or trusted data storage.
+
 dbfs is a FUSE filesystem backed by SQLite.
 
 It stores filesystem metadata and file contents in a SQLite database, exposes them through FUSE, and currently supports basic file, directory, symlink, hardlink, rename, truncate, read, and write operations.
