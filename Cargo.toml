@@ -5,6 +5,6 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
-fuser = "0.16.0"
+fuser = { version = "0.16.0", features = ["abi-7-23"] }
 libc = "0.2.186"
 rusqlite = "0.39.0"

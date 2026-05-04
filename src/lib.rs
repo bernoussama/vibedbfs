@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used)]
+
 mod cli;
 mod db;
 mod fuse;

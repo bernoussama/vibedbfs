@@ -1,12 +1,13 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    consts::FUSE_WRITEBACK_CACHE,
 };
 
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate};
@@ -15,7 +16,7 @@ const ATTR_TTL: Duration = Duration::from_secs(1);
 
 pub struct Dbfs {
     db: Db,
-    dirty_files: RefCell<HashMap<u64, DirtyFile>>,
+    dirty_files: Mutex<HashMap<u64, DirtyFile>>,
 }
 
 #[derive(Debug, Clone)]
@@ -28,7 +29,7 @@ impl Dbfs {
     pub fn new(db: Db) -> Self {
         Self {
             db,
-            dirty_files: RefCell::new(HashMap::new()),
+            dirty_files: Mutex::new(HashMap::new()),
         }
     }
 
@@ -38,7 +39,7 @@ impl Dbfs {
             .get_inode(ino)
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
-        if let Some(dirty) = self.dirty_files.borrow().get(&ino) {
+        if let Some(dirty) = self.dirty_files.lock().expect("dirty_files lock poisoned").get(&ino) {
             attr.size = dirty.size;
             attr.blocks = dirty.size.div_ceil(512);
         }
@@ -51,7 +52,7 @@ impl Dbfs {
             .lookup(parent_ino, name)
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
-        if let Some(dirty) = self.dirty_files.borrow().get(&attr.ino) {
+        if let Some(dirty) = self.dirty_files.lock().expect("dirty_files lock poisoned").get(&attr.ino) {
             attr.size = dirty.size;
             attr.blocks = dirty.size.div_ceil(512);
         }
@@ -189,8 +190,34 @@ impl Dbfs {
     }
 
     pub fn read(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        let dirty_files = self.dirty_files.borrow();
-        let Some(dirty) = dirty_files.get(&ino) else {
+        // Extract dirty state (size + overlapping spans) under a short lock,
+        // then release before touching the DB to avoid lock-ordering issues.
+        let dirty_snapshot = {
+            let dirty_files = self.dirty_files.lock().expect("dirty_files lock poisoned");
+            dirty_files.get(&ino).map(|dirty| {
+                let dirty_size = dirty.size;
+                let read_end = offset + size as u64;
+                let overlapping: Vec<(u64, Vec<u8>)> = dirty
+                    .writes
+                    .iter()
+                    .filter_map(|(wo, data)| {
+                        let we = *wo + data.len() as u64;
+                        let start = offset.max(*wo);
+                        let end = read_end.min(we);
+                        if start < end {
+                            let data_start = (start - *wo) as usize;
+                            let data_end = (end - *wo) as usize;
+                            Some((start, data[data_start..data_end].to_vec()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                (dirty_size, overlapping)
+            })
+        };
+
+        let Some((dirty_size, overlapping)) = dirty_snapshot else {
             return self
                 .db
                 .read_file(ino, offset, size)
@@ -198,12 +225,13 @@ impl Dbfs {
         };
 
         self.db.get_inode(ino).map_err(errno_from_db_error)?;
-        if offset >= dirty.size || size == 0 {
+        if offset >= dirty_size || size == 0 {
             return Ok(Vec::new());
         }
 
-        let read_len = size.min((dirty.size - offset) as u32) as usize;
+        let read_len = size.min((dirty_size - offset) as u32) as usize;
         let mut output = vec![0; read_len];
+
         let persisted = self
             .db
             .read_file(ino, offset, read_len as u32)
@@ -211,21 +239,11 @@ impl Dbfs {
         output[..persisted.len()].copy_from_slice(&persisted);
 
         let read_start = offset;
-        let read_end = offset + read_len as u64;
-        for (write_offset, data) in &dirty.writes {
-            let write_start = *write_offset;
-            let write_end = write_start + data.len() as u64;
-            let copy_start = read_start.max(write_start);
-            let copy_end = read_end.min(write_end);
-            if copy_start >= copy_end {
-                continue;
-            }
-
-            let output_start = (copy_start - read_start) as usize;
-            let data_start = (copy_start - write_start) as usize;
-            let copy_len = (copy_end - copy_start) as usize;
+        for (span_start, span_data) in &overlapping {
+            let output_start = (*span_start - read_start) as usize;
+            let copy_len = span_data.len().min(read_len - output_start);
             output[output_start..output_start + copy_len]
-                .copy_from_slice(&data[data_start..data_start + copy_len]);
+                .copy_from_slice(&span_data[..copy_len]);
         }
 
         Ok(output)
@@ -236,6 +254,8 @@ impl Dbfs {
             return Ok(0);
         }
 
+        // Resolve kind and current size BEFORE locking dirty_files to maintain
+        // consistent lock ordering (inode_cache/conn always before dirty_files).
         let kind = match self.db.inode_kind(ino) {
             Some(k) => k,
             None => self.db.get_inode(ino).map_err(errno_from_db_error)?.kind,
@@ -243,14 +263,12 @@ impl Dbfs {
         if kind != FileKind::RegularFile {
             return Err(libc::ENOENT);
         }
+        let current_size = self.db.get_inode(ino).map(|i| i.size).unwrap_or(0);
 
-        let mut dirty_files = self.dirty_files.borrow_mut();
-        let dirty = dirty_files.entry(ino).or_insert_with(|| {
-            let size = self.db.get_inode(ino).map(|i| i.size).unwrap_or(0);
-            DirtyFile {
-                size,
-                writes: Vec::new(),
-            }
+        let mut dirty_files = self.dirty_files.lock().expect("dirty_files lock poisoned");
+        let dirty = dirty_files.entry(ino).or_insert_with(|| DirtyFile {
+            size: current_size,
+            writes: Vec::new(),
         });
         dirty.size = dirty.size.max(offset + data.len() as u64);
         dirty.writes.push((offset, data.to_vec()));
@@ -259,14 +277,14 @@ impl Dbfs {
     }
 
     pub fn flush_file(&self, ino: u64) -> Result<(), i32> {
-        let Some(dirty) = self.dirty_files.borrow_mut().remove(&ino) else {
+        let Some(dirty) = self.dirty_files.lock().expect("dirty_files lock poisoned").remove(&ino) else {
             return Ok(());
         };
 
         match self.db.write_file_batch(ino, &dirty.writes) {
             Ok(_) => Ok(()),
             Err(error) => {
-                self.dirty_files.borrow_mut().insert(ino, dirty);
+                self.dirty_files.lock().expect("dirty_files lock poisoned").insert(ino, dirty);
                 Err(errno_from_db_error(error))
             }
         }
@@ -279,7 +297,10 @@ impl Dbfs {
     }
 
     pub fn unlink(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
-        let inode = self.db.lookup(parent_ino, name).map_err(errno_from_db_error)?;
+        let inode = self
+            .db
+            .lookup(parent_ino, name)
+            .map_err(errno_from_db_error)?;
         self.flush_file(inode.ino)?;
         self.db
             .unlink_inode(parent_ino, name, &inode)
@@ -313,6 +334,19 @@ impl Dbfs {
 }
 
 impl Filesystem for Dbfs {
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        config: &mut KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        // Writeback caching lets the kernel's page cache coalesce small writes and
+        // serve read-after-write from cache, avoiding userspace round-trips.
+        let _ = config.add_capabilities(FUSE_WRITEBACK_CACHE);
+        let _ = config.set_max_readahead(1 << 17); // 128 KiB
+        let _ = config.set_max_write(1 << 20); // 1 MiB
+        Ok(())
+    }
+
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match Dbfs::lookup(self, parent, name.as_bytes()) {
             Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
@@ -610,16 +644,14 @@ impl Filesystem for Dbfs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        let file_type = mode & libc::S_IFMT as u32;
-        const S_IFREG: u32 = libc::S_IFREG as u32;
+        let file_type = mode & libc::S_IFMT;
         match file_type {
-            // Regular file: delegate to create
-            0 | S_IFREG => {
+            0 | libc::S_IFREG => {
                 match Dbfs::create(
                     self,
                     parent,
                     name.as_bytes(),
-                    mode & !(libc::S_IFMT as u32),
+                    mode & !libc::S_IFMT,
                     umask,
                     req.uid(),
                     req.gid(),
@@ -628,7 +660,6 @@ impl Filesystem for Dbfs {
                     Err(errno) => reply.error(errno),
                 }
             }
-            // FIFOs, devices, sockets — not supported
             _ => reply.error(libc::EPERM),
         }
     }
