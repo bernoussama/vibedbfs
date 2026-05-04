@@ -35,9 +35,22 @@ impl InodeCache {
 
     fn put(&mut self, inode: Inode) {
         if self.entries.len() >= INODE_CACHE_MAX && !self.entries.contains_key(&inode.ino) {
-            self.entries.clear();
+            self.evict();
         }
         self.entries.insert(inode.ino, (Instant::now(), inode));
+    }
+
+    fn evict(&mut self) {
+        let evict_count = self.entries.len() / 4;
+        let mut by_age: Vec<(u64, Instant)> = self
+            .entries
+            .iter()
+            .map(|(&ino, &(ts, _))| (ino, ts))
+            .collect();
+        by_age.sort_unstable_by_key(|&(_, ts)| ts);
+        for &(ino, _) in by_age.iter().take(evict_count.max(1)) {
+            self.entries.remove(&ino);
+        }
     }
 
     fn invalidate(&mut self, ino: u64) {
@@ -70,14 +83,37 @@ impl LookupCache {
 
     fn put(&mut self, parent_ino: u64, name: &[u8], ino: u64) {
         if self.total >= LOOKUP_CACHE_MAX {
-            self.entries.clear();
-            self.total = 0;
+            self.evict();
         }
         let parent = self.entries.entry(parent_ino).or_default();
         if !parent.contains_key(name) {
             self.total += 1;
         }
         parent.insert(name.to_vec(), (Instant::now(), ino));
+    }
+
+    fn evict(&mut self) {
+        let evict_count = (self.total / 4).max(1);
+        let mut by_age: Vec<(u64, Vec<u8>, Instant)> = self
+            .entries
+            .iter()
+            .flat_map(|(&pino, children)| {
+                children
+                    .iter()
+                    .map(move |(name, &(ts, _))| (pino, name.clone(), ts))
+            })
+            .collect();
+        by_age.sort_unstable_by_key(|&(_, _, ts)| ts);
+        for (pino, name, _) in by_age.into_iter().take(evict_count) {
+            if let Some(parent) = self.entries.get_mut(&pino) {
+                if parent.remove(&name).is_some() {
+                    self.total = self.total.saturating_sub(1);
+                }
+                if parent.is_empty() {
+                    self.entries.remove(&pino);
+                }
+            }
+        }
     }
 
     fn invalidate_parent(&mut self, parent_ino: u64) {
