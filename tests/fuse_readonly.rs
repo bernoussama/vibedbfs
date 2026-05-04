@@ -286,6 +286,7 @@ fn buffers_fuse_writes_until_flush() {
     let file = db
         .create_file(1, b"notes.txt", 0o644, 1000, 1000)
         .expect("create file");
+    db.commit_batch().expect("commit batch");
     let fs = Dbfs::new(db);
 
     fs.write(file.ino, 0, b"hello").expect("write file");
@@ -313,6 +314,7 @@ fn release_flushes_buffered_fuse_writes() {
     let file = db
         .create_file(1, b"notes.txt", 0o644, 1000, 1000)
         .expect("create file");
+    db.commit_batch().expect("commit batch");
     let fs = Dbfs::new(db);
 
     fs.open(file.ino).expect("open file");
