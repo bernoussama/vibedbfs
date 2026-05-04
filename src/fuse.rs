@@ -5,8 +5,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    consts,
 };
 
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate};
@@ -279,7 +280,10 @@ impl Dbfs {
     }
 
     pub fn unlink(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
-        let inode = self.db.lookup(parent_ino, name).map_err(errno_from_db_error)?;
+        let inode = self
+            .db
+            .lookup(parent_ino, name)
+            .map_err(errno_from_db_error)?;
         self.flush_file(inode.ino)?;
         self.db
             .unlink_inode(parent_ino, name, &inode)
@@ -313,6 +317,11 @@ impl Dbfs {
 }
 
 impl Filesystem for Dbfs {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+        let _ = config.add_capabilities(consts::FUSE_WRITEBACK_CACHE);
+        Ok(())
+    }
+
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match Dbfs::lookup(self, parent, name.as_bytes()) {
             Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),

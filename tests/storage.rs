@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dbfs::{Db, DbError, FileKind, MetadataUpdate};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 fn temp_db_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -53,6 +53,69 @@ fn file_backed_database_persists_entries_after_reopen() {
 }
 
 #[test]
+fn file_backed_database_batches_create_metadata_until_flush() {
+    let path = temp_db_path("batched-create");
+    let db = Db::open(&path).expect("open file-backed database");
+
+    db.create_file(1, b"one.txt", 0o644, 1000, 1000)
+        .expect("create first file");
+    db.create_file(1, b"two.txt", 0o644, 1000, 1000)
+        .expect("create second file");
+    assert_eq!(raw_dirent_count(&path), 0);
+
+    db.flush_metadata_batch().expect("flush metadata batch");
+
+    assert_eq!(raw_dirent_count(&path), 2);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
+fn file_backed_database_batches_unlink_metadata_until_flush() {
+    let path = temp_db_path("batched-unlink");
+    let db = Db::open(&path).expect("open file-backed database");
+    db.create_file(1, b"one.txt", 0o644, 1000, 1000)
+        .expect("create first file");
+    db.create_file(1, b"two.txt", 0o644, 1000, 1000)
+        .expect("create second file");
+    db.flush_metadata_batch().expect("flush creates");
+
+    db.unlink_file(1, b"one.txt").expect("unlink first file");
+    db.unlink_file(1, b"two.txt").expect("unlink second file");
+    assert_eq!(raw_dirent_count(&path), 2);
+
+    db.flush_metadata_batch().expect("flush unlinks");
+
+    assert_eq!(raw_dirent_count(&path), 0);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
+fn duplicate_create_rolls_back_only_the_failed_metadata_operation() {
+    let path = temp_db_path("batched-create-conflict");
+    let db = Db::open(&path).expect("open file-backed database");
+
+    db.create_file(1, b"kept.txt", 0o644, 1000, 1000)
+        .expect("create first file");
+    assert_eq!(
+        db.create_file(1, b"kept.txt", 0o644, 1000, 1000),
+        Err(DbError::AlreadyExists)
+    );
+    db.flush_metadata_batch().expect("flush metadata batch");
+
+    assert_eq!(raw_dirent_count(&path), 1);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
 fn file_backed_database_enables_wal_and_foreign_keys() {
     let path = temp_db_path("pragmas");
     let db = Db::open(&path).expect("open file-backed database");
@@ -74,6 +137,13 @@ fn file_backed_database_enables_wal_and_foreign_keys() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+fn raw_dirent_count(path: &std::path::Path) -> i64 {
+    Connection::open(path)
+        .expect("open raw sqlite connection")
+        .query_row("SELECT COUNT(*) FROM dirents", [], |row| row.get(0))
+        .expect("read raw dirent count")
 }
 
 #[test]
@@ -285,6 +355,41 @@ fn writes_and_reads_across_chunk_boundary() {
         db.get_inode(file.ino).expect("load inode").size,
         65_536 - 8 + payload.len() as u64
     );
+}
+
+#[test]
+fn sequential_reads_use_prefetched_next_chunk() {
+    let path = temp_db_path("read-prefetch");
+    let db = Db::open(&path).expect("open file-backed database");
+    let file = db
+        .create_file(1, b"large.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let mut payload = vec![b'a'; 65_536];
+    payload.extend(vec![b'b'; 65_536]);
+    db.write_file(file.ino, 0, &payload).expect("write file");
+
+    assert_eq!(
+        db.read_file(file.ino, 0, 4).expect("read first chunk"),
+        b"aaaa"
+    );
+
+    Connection::open(&path)
+        .expect("open raw sqlite connection")
+        .execute(
+            "UPDATE file_chunks SET data = ?1 WHERE ino = ?2 AND chunk_index = 1",
+            params![vec![b'z'; 65_536], file.ino as i64],
+        )
+        .expect("rewrite second chunk behind db handle");
+
+    assert_eq!(
+        db.read_file(file.ino, 65_536, 4)
+            .expect("read prefetched second chunk"),
+        b"bbbb"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }
 
 #[test]

@@ -159,6 +159,7 @@ fn mount_options_do_not_require_allow_other() {
     let options = mount_options();
 
     assert!(options.contains(&MountOption::FSName("dbfs".to_string())));
+    assert!(!options.contains(&MountOption::CUSTOM("writeback_cache".to_string())));
     assert!(!options.contains(&MountOption::AutoUnmount));
     assert!(!options.contains(&MountOption::AllowOther));
     assert!(!options.contains(&MountOption::AllowRoot));
@@ -286,6 +287,7 @@ fn buffers_fuse_writes_until_flush() {
     let file = db
         .create_file(1, b"notes.txt", 0o644, 1000, 1000)
         .expect("create file");
+    db.flush_metadata_batch().expect("flush create metadata");
     let fs = Dbfs::new(db);
 
     fs.write(file.ino, 0, b"hello").expect("write file");
