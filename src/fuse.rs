@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, c_int};
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate};
@@ -30,6 +30,10 @@ impl Dbfs {
             db,
             dirty_files: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub fn db(&self) -> &Db {
+        &self.db
     }
 
     pub fn getattr(&self, ino: u64) -> Result<FileAttr, i32> {
@@ -260,6 +264,7 @@ impl Dbfs {
 
     pub fn flush_file(&self, ino: u64) -> Result<(), i32> {
         let Some(dirty) = self.dirty_files.borrow_mut().remove(&ino) else {
+            self.db.commit_batch().map_err(errno_from_db_error)?;
             return Ok(());
         };
 
@@ -313,6 +318,16 @@ impl Dbfs {
 }
 
 impl Filesystem for Dbfs {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
+        const FUSE_WRITEBACK_CACHE: u64 = 1 << 16;
+        let _ = config.add_capabilities(FUSE_WRITEBACK_CACHE);
+        Ok(())
+    }
+
+    fn destroy(&mut self) {
+        let _ = self.db.commit_batch();
+    }
+
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match Dbfs::lookup(self, parent, name.as_bytes()) {
             Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),

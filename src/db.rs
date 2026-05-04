@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,6 +8,8 @@ use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
 use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate};
 
 const CHUNK_SIZE: usize = 65_536;
+const PREFETCH_CHUNKS: usize = 4;
+const BATCH_THRESHOLD: u32 = 64;
 
 pub struct Db {
     conn: RefCell<Connection>,
@@ -20,6 +22,13 @@ pub struct Db {
     /// Cached inode kinds for open files (set on open, cleared on release).
     /// Avoids redundant get_inode calls on every write/read.
     inode_kinds: RefCell<HashMap<u64, FileKind>>,
+    /// Read-ahead cache: maps (ino, chunk_index) → chunk data.
+    /// Populated when sequential reads are detected.
+    prefetch_cache: RefCell<HashMap<(u64, usize), Vec<u8>>>,
+    /// Whether a batch transaction is currently active.
+    batch_active: Cell<bool>,
+    /// Number of operations in the current batch.
+    batch_ops: Cell<u32>,
 }
 
 impl Db {
@@ -127,6 +136,9 @@ impl Db {
             open_counts: RefCell::new(HashMap::new()),
             pending_delete: RefCell::new(Vec::new()),
             inode_kinds: RefCell::new(HashMap::new()),
+            prefetch_cache: RefCell::new(HashMap::new()),
+            batch_active: Cell::new(false),
+            batch_ops: Cell::new(0),
         })
     }
 
@@ -308,6 +320,7 @@ impl Db {
         if *count == 0 {
             open_counts.remove(&ino);
             self.inode_kinds.borrow_mut().remove(&ino);
+            self.invalidate_prefetch(ino);
             drop(open_counts);
 
             let mut pending = self.pending_delete.borrow_mut();
@@ -324,6 +337,7 @@ impl Db {
     }
 
     pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &[u8]) -> Result<Inode, DbError> {
+        self.flush_batch()?;
         let inode = self.get_inode(ino)?;
         if inode.kind == FileKind::Directory {
             return Err(DbError::IsDirectory);
@@ -367,26 +381,46 @@ impl Db {
 
         let read_len = size.min((inode.size - offset) as u32) as usize;
         let mut output = vec![0; read_len];
-        let conn = self.conn.borrow();
 
         let start = offset as usize;
         let end = start + read_len;
         let start_chunk = start / CHUNK_SIZE;
         let end_chunk = (end - 1) / CHUNK_SIZE;
 
-        let mut stmt = conn.prepare_cached(
-            "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
-        )?;
+        let max_chunk = if inode.size == 0 {
+            0
+        } else {
+            ((inode.size - 1) as usize) / CHUNK_SIZE
+        };
+        let prefetch_end = (end_chunk + PREFETCH_CHUNKS).min(max_chunk);
+
+        let mut cache = self.prefetch_cache.borrow_mut();
+
+        let all_cached = (start_chunk..=end_chunk)
+            .all(|ci| cache.contains_key(&(ino, ci)));
+
+        if !all_cached {
+            let conn = self.conn.borrow();
+            let mut stmt = conn.prepare_cached(
+                "SELECT chunk_index, data FROM file_chunks
+                 WHERE ino = ?1 AND chunk_index BETWEEN ?2 AND ?3",
+            )?;
+
+            let rows = stmt.query_map(
+                params![ino as i64, start_chunk as i64, prefetch_end as i64],
+                |row| {
+                    Ok((row.get::<_, i64>(0)? as usize, row.get::<_, Vec<u8>>(1)?))
+                },
+            )?;
+
+            for row in rows {
+                let (chunk_index, chunk) = row?;
+                cache.insert((ino, chunk_index), chunk);
+            }
+        }
 
         for chunk_index in start_chunk..=end_chunk {
-            let chunk = stmt
-                .query_row(
-                    params![ino as i64, chunk_index as i64],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()?;
-
-            let Some(chunk) = chunk else {
+            let Some(chunk) = cache.get(&(ino, chunk_index)) else {
                 continue;
             };
 
@@ -404,6 +438,10 @@ impl Db {
                 .copy_from_slice(&chunk[chunk_copy_start..chunk_copy_start + copy_len]);
         }
 
+        for ci in start_chunk..=end_chunk {
+            cache.remove(&(ino, ci));
+        }
+
         Ok(output)
     }
 
@@ -412,6 +450,7 @@ impl Db {
     }
 
     pub fn write_file_batch(&self, ino: u64, writes: &[(u64, Vec<u8>)]) -> Result<u32, DbError> {
+        self.flush_batch()?;
         let inode = self.get_inode(ino)?;
         if inode.kind != FileKind::RegularFile {
             return Err(DbError::NotFound);
@@ -420,6 +459,7 @@ impl Db {
             return Ok(0);
         }
 
+        self.invalidate_prefetch(ino);
         let coalesced = coalesce_writes(writes);
 
         let now = now_secs();
@@ -430,9 +470,6 @@ impl Db {
         let tx = conn.transaction()?;
 
         {
-            let mut read_stmt = tx.prepare_cached(
-                "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
-            )?;
             let mut write_stmt = tx.prepare_cached(
                 "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
                  ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
@@ -448,6 +485,10 @@ impl Db {
                 let start_chunk = start / CHUNK_SIZE;
                 let end_chunk = (end - 1) / CHUNK_SIZE;
 
+                let partial_chunks = Self::load_partial_chunks(
+                    &tx, ino, start, end, start_chunk, end_chunk,
+                )?;
+
                 for chunk_index in start_chunk..=end_chunk {
                     let chunk_start = chunk_index * CHUNK_SIZE;
                     let write_start = start.max(chunk_start);
@@ -462,12 +503,9 @@ impl Db {
                     let chunk_data: Vec<u8> = if is_full_chunk {
                         data[input_start..input_end].to_vec()
                     } else {
-                        let mut chunk = read_stmt
-                            .query_row(
-                                params![ino as i64, chunk_index as i64],
-                                |row| row.get::<_, Vec<u8>>(0),
-                            )
-                            .optional()?
+                        let mut chunk = partial_chunks
+                            .get(&chunk_index)
+                            .cloned()
                             .unwrap_or_default();
 
                         let required_len = chunk_write_start + write_len;
@@ -498,12 +536,58 @@ impl Db {
         Ok(written as u32)
     }
 
+    /// Bulk-load only the partial (non-full) chunks needed for a write span.
+    fn load_partial_chunks(
+        tx: &rusqlite::Transaction<'_>,
+        ino: u64,
+        start: usize,
+        end: usize,
+        start_chunk: usize,
+        end_chunk: usize,
+    ) -> Result<HashMap<usize, Vec<u8>>, DbError> {
+        let mut partial_indices = Vec::new();
+        for chunk_index in start_chunk..=end_chunk {
+            let chunk_start = chunk_index * CHUNK_SIZE;
+            let write_start = start.max(chunk_start);
+            let write_end = end.min(chunk_start + CHUNK_SIZE);
+            let chunk_write_start = write_start - chunk_start;
+            let write_len = write_end - write_start;
+            if chunk_write_start != 0 || write_len != CHUNK_SIZE {
+                partial_indices.push(chunk_index);
+            }
+        }
+
+        let mut result = HashMap::new();
+        if partial_indices.is_empty() {
+            return Ok(result);
+        }
+
+        let first = *partial_indices.first().unwrap();
+        let last = *partial_indices.last().unwrap();
+        let mut stmt = tx.prepare_cached(
+            "SELECT chunk_index, data FROM file_chunks
+             WHERE ino = ?1 AND chunk_index BETWEEN ?2 AND ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![ino as i64, first as i64, last as i64],
+            |row| Ok((row.get::<_, i64>(0)? as usize, row.get::<_, Vec<u8>>(1)?)),
+        )?;
+        for row in rows {
+            let (idx, d) = row?;
+            result.insert(idx, d);
+        }
+
+        Ok(result)
+    }
+
     pub fn truncate_file(&self, ino: u64, size: u64) -> Result<(), DbError> {
+        self.flush_batch()?;
         let inode = self.get_inode(ino)?;
         if inode.kind != FileKind::RegularFile {
             return Err(DbError::NotFound);
         }
 
+        self.invalidate_prefetch(ino);
         let now = now_secs();
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
@@ -554,20 +638,21 @@ impl Db {
             return Err(DbError::IsDirectory);
         }
 
+        self.begin_batch()?;
         let now = now_secs();
-        let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        let conn = self.conn.borrow();
 
-        tx.prepare_cached(
+        conn.prepare_cached(
             "DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2",
         )?.execute(params![parent_ino as i64, name])?;
 
-        self.drop_unlinked_inode(&tx, target, now)?;
+        self.drop_unlinked_inode_conn(&conn, target, now)?;
 
-        tx.prepare_cached(
+        conn.prepare_cached(
             "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
         )?.execute(params![now, parent_ino as i64])?;
-        tx.commit()?;
+        drop(conn);
+        self.batch_tick()?;
 
         Ok(())
     }
@@ -578,26 +663,27 @@ impl Db {
             return Err(DbError::NotDirectory);
         }
 
+        self.begin_batch()?;
         let now = now_secs();
-        let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
-        let child_count: i64 = tx.prepare_cached(
+        let conn = self.conn.borrow();
+        let child_count: i64 = conn.prepare_cached(
             "SELECT COUNT(*) FROM dirents WHERE parent_ino = ?1",
         )?.query_row(params![target.ino as i64], |row| row.get(0))?;
         if child_count != 0 {
             return Err(DbError::DirectoryNotEmpty);
         }
 
-        tx.prepare_cached(
+        conn.prepare_cached(
             "DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2",
         )?.execute(params![parent_ino as i64, name])?;
-        tx.prepare_cached(
+        conn.prepare_cached(
             "DELETE FROM inodes WHERE ino = ?1",
         )?.execute(params![target.ino as i64])?;
-        tx.prepare_cached(
+        conn.prepare_cached(
             "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
         )?.execute(params![now, parent_ino as i64])?;
-        tx.commit()?;
+        drop(conn);
+        self.batch_tick()?;
 
         Ok(())
     }
@@ -609,6 +695,7 @@ impl Db {
         new_parent_ino: u64,
         new_name: &[u8],
     ) -> Result<(), DbError> {
+        self.flush_batch()?;
         let source = self.lookup(parent_ino, name)?;
         if self.get_inode(new_parent_ino)?.kind != FileKind::Directory {
             return Err(DbError::NotDirectory);
@@ -670,15 +757,33 @@ impl Db {
         target: &Inode,
         now: i64,
     ) -> Result<(), DbError> {
+        self.drop_unlinked_inode_impl(tx, target, now)
+    }
+
+    fn drop_unlinked_inode_conn(
+        &self,
+        conn: &Connection,
+        target: &Inode,
+        now: i64,
+    ) -> Result<(), DbError> {
+        self.drop_unlinked_inode_impl(conn, target, now)
+    }
+
+    fn drop_unlinked_inode_impl(
+        &self,
+        conn: &Connection,
+        target: &Inode,
+        now: i64,
+    ) -> Result<(), DbError> {
         if target.kind == FileKind::Directory {
-            tx.prepare_cached(
+            conn.prepare_cached(
                 "DELETE FROM inodes WHERE ino = ?1",
             )?.execute(params![target.ino as i64])?;
             return Ok(());
         }
 
         if target.nlink > 1 {
-            tx.prepare_cached(
+            conn.prepare_cached(
                 "UPDATE inodes SET nlink = ?1, ctime = ?2 WHERE ino = ?3",
             )?.execute(params![(target.nlink - 1) as i64, now, target.ino as i64])?;
             return Ok(());
@@ -691,14 +796,14 @@ impl Db {
             .copied()
             .unwrap_or(0);
         if open_count > 0 {
-            tx.prepare_cached(
+            conn.prepare_cached(
                 "UPDATE inodes SET nlink = 0, ctime = ?1 WHERE ino = ?2",
             )?.execute(params![now, target.ino as i64])?;
             if !self.pending_delete.borrow().contains(&target.ino) {
                 self.pending_delete.borrow_mut().push(target.ino);
             }
         } else {
-            tx.prepare_cached(
+            conn.prepare_cached(
                 "DELETE FROM inodes WHERE ino = ?1",
             )?.execute(params![target.ino as i64])?;
         }
@@ -747,26 +852,27 @@ impl Db {
             return Err(DbError::NotDirectory);
         }
 
+        self.begin_batch()?;
         let now = now_secs();
-        let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        let conn = self.conn.borrow();
 
-        tx.prepare_cached(
+        conn.prepare_cached(
             "INSERT INTO inodes (kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
              VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, 1)",
         )?.execute(params![kind.as_i64(), mode, uid, gid, now])?;
-        let ino = tx.last_insert_rowid() as u64;
+        let ino = conn.last_insert_rowid() as u64;
 
-        if let Err(error) = tx.prepare_cached(
+        if let Err(error) = conn.prepare_cached(
             "INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)",
         ).and_then(|mut s| s.execute(params![parent_ino as i64, name, ino as i64])) {
             return Err(error.into());
         }
 
-        tx.prepare_cached(
+        conn.prepare_cached(
             "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE ino = ?2",
         )?.execute(params![now, parent_ino as i64])?;
-        tx.commit()?;
+        drop(conn);
+        self.batch_tick()?;
 
         Ok(Inode {
             ino,
@@ -812,6 +918,52 @@ impl Db {
         }
 
         Ok(false)
+    }
+
+    fn invalidate_prefetch(&self, ino: u64) {
+        self.prefetch_cache.borrow_mut().retain(|&(cached_ino, _), _| cached_ino != ino);
+    }
+
+    /// Ensure a batch transaction is active. Called before metadata ops.
+    fn begin_batch(&self) -> Result<(), DbError> {
+        if !self.batch_active.get() {
+            self.conn.borrow().execute_batch("BEGIN IMMEDIATE")?;
+            self.batch_active.set(true);
+            self.batch_ops.set(0);
+        }
+        Ok(())
+    }
+
+    /// Increment batch counter and commit if threshold is reached.
+    fn batch_tick(&self) -> Result<(), DbError> {
+        let ops = self.batch_ops.get() + 1;
+        self.batch_ops.set(ops);
+        if ops >= BATCH_THRESHOLD {
+            self.commit_batch()?;
+        }
+        Ok(())
+    }
+
+    /// Commit and close the current batch transaction if active.
+    pub fn commit_batch(&self) -> Result<(), DbError> {
+        if self.batch_active.get() {
+            self.conn.borrow().execute_batch("COMMIT")?;
+            self.batch_active.set(false);
+            self.batch_ops.set(0);
+        }
+        Ok(())
+    }
+
+    /// Ensure no batch is active. Called before operations that
+    /// need their own transaction (write_file_batch, truncate, rename).
+    fn flush_batch(&self) -> Result<(), DbError> {
+        self.commit_batch()
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        let _ = self.commit_batch();
     }
 }
 
