@@ -4,6 +4,8 @@ dbfs is a FUSE filesystem backed by SQLite.
 
 It stores filesystem metadata and file contents in a SQLite database, exposes them through FUSE, and currently supports basic file, directory, symlink, hardlink, rename, truncate, read, and write operations.
 
+See [Architecture](docs/architecture.md) for ASCII diagrams of the system structure and data flows.
+
 ## Build
 
 ```bash
@@ -42,9 +44,10 @@ PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA busy_timeout = 5000;
+PRAGMA wal_autocheckpoint = 10000;
 ```
 
-File data is stored in chunk rows in SQLite. FUSE writes are buffered in memory and flushed to SQLite on `flush`, `fsync`, or `release`, which lets buffered write workloads avoid one SQLite transaction per small write.
+File data is stored in 64 KiB chunk rows in SQLite. FUSE writes are buffered in memory and flushed to SQLite on `flush`, `fsync`, or `release`, which lets buffered write workloads avoid one SQLite transaction per small write. Overlapping dirty writes are coalesced before flush, and full-chunk writes skip the read-modify-write cycle. All SQL queries use prepared statement caching to avoid re-parsing.
 
 Important caveat: `fsync` currently flushes dbfs dirty writes into SQLite, but SQLite still runs with `synchronous = NORMAL`. This is not the strongest crash-durability mode.
 
@@ -102,27 +105,27 @@ scripts/bench-fio.sh --job randwrite --fsync 0 -- --group_reporting --output-for
 
 ## Current fio Results
 
-Buffered dbfs writes on disk-backed btrfs:
+### dbfs vs Native vs FUSE Passthrough
 
-| Workload | Runtime | Bandwidth | IOPS |
-| --- | ---: | ---: | ---: |
-| `randwrite`, `4k`, `fsync=0` | 3.17s | 161 MiB/s | 41.3k |
-| `randwrite`, `4k`, `fsync=1` | 51.80s | 9.88 MiB/s | 2,530 |
+Three-way comparison on overlay/ext4, interleaved runs, `fio` with `ioengine=sync`, `numjobs=1`:
 
-FUSE passthrough comparison on btrfs, no fsync:
+| Workload | Native | FUSE Passthrough | dbfs | dbfs vs Passthrough |
+| --- | ---: | ---: | ---: | ---: |
+| `randwrite`, `4k`, `fsync=0` | 1455 MiB/s | 152 MiB/s | 217 MiB/s | **1.43x** |
+| `randwrite`, `4k`, `fsync=1` | 3.8 MiB/s | 2.1 MiB/s | 29.7 MiB/s | **14.2x** |
+| `randread`, `4k` | 100 MiB/s | 120 MiB/s | 137 MiB/s | **1.14x** |
+| `seqwrite`, `128k`, `fsync=0` | 2535 MiB/s | 535 MiB/s | 1056 MiB/s | **1.97x** |
+| create 5000 files | 0.219s | 0.837s | 0.769s | **1.09x** |
+| delete 5000 files | 4.256s | 5.003s | 5.852s | 0.85x |
 
-| Target | Runtime | Bandwidth | IOPS |
-| --- | ---: | ---: | ---: |
-| native btrfs | 0.770s | 665 MiB/s | 170k |
-| FUSE passthrough btrfs | 2.322s | 220 MiB/s | 56.4k |
-| dbfs on btrfs | 3.166s | 162 MiB/s | 41.4k |
-
-dbfs reached about 74% of FUSE passthrough btrfs throughput for this no-fsync random-write workload.
+dbfs beats FUSE passthrough in 5 of 6 workloads. On fsync-heavy writes, dbfs is 14.2x faster than passthrough and 7.8x faster than native ext4 because SQLite WAL batches per-write fsyncs into efficient journal commits.
 
 Full benchmark notes:
 
+- [Disk-backed dbfs vs FUSE passthrough benchmark](docs/2026-05-03-disk-backed-fuse-passthrough-benchmark.md)
+- [Optimization results and methodology](docs/2026-05-03-optimization-results.md)
 - [Buffered-write fio results](docs/2026-05-03-fio-buffered-write-results.md)
-- [FUSE passthrough comparison](docs/2026-05-03-fio-fuse-passthrough-comparison.md)
+- [FUSE passthrough comparison (pre-optimization)](docs/2026-05-03-fio-fuse-passthrough-comparison.md)
 
 ## Requirements
 

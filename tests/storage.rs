@@ -226,6 +226,28 @@ fn batches_multiple_file_writes_in_one_call() {
 }
 
 #[test]
+fn batched_overlapping_writes_preserve_write_order() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"overlap.txt", 0o644, 1000, 1000)
+        .expect("create file");
+
+    db.write_file_batch(
+        file.ino,
+        &[
+            (10, b"BBBB".to_vec()),
+            (0, b"abcdefghijklmnopqrst".to_vec()),
+        ],
+    )
+    .expect("write batch");
+
+    assert_eq!(
+        db.read_file(file.ino, 0, 20).expect("read file"),
+        b"abcdefghijklmnopqrst"
+    );
+}
+
+#[test]
 fn offset_write_zero_fills_gap_on_read() {
     let db = Db::open_in_memory().expect("open in-memory database");
     let file = db
@@ -339,7 +361,7 @@ fn unlinking_open_hardlink_preserves_remaining_names() {
     db.write_file(file.ino, 0, b"hello").expect("write file");
     db.link(file.ino, 1, b"b.txt").expect("create hardlink");
 
-    db.open_file(file.ino);
+    db.open_file(file.ino, dbfs::FileKind::RegularFile);
     db.unlink_file(1, b"a.txt")
         .expect("unlink one hardlink while open");
     db.release_file(file.ino);

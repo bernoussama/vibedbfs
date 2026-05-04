@@ -34,3 +34,6 @@ See `README.md` for full details. Quick reference:
 - The pytest `TestSyscalls` class requires a libfuse source clone at `../../clones/libfuse` and `gcc`; this is optional and can be skipped with `-k "not syscall"`.
 - The release binary is required for pytest tests (it looks for `target/release/dbfs`). Run `cargo build --release` before running pytest.
 - When mounting dbfs for manual testing, remember to unmount with `fusermount3 -u <mnt>` or `fusermount3 -z -u <mnt>` (lazy unmount) before cleaning up.
+- Do not use `/tmp` for filesystem benchmarks. On this machine `/tmp` is `tmpfs`
+  and measures RAM-backed storage, not disk. Use a disk-backed directory under
+  the repository, such as `.bench/`, unless the user explicitly asks for tmpfs.
