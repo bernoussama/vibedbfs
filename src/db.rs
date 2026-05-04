@@ -123,10 +123,10 @@ impl LookupCache {
     }
 
     fn invalidate_entry(&mut self, parent_ino: u64, name: &[u8]) {
-        if let Some(parent) = self.entries.get_mut(&parent_ino) {
-            if parent.remove(name).is_some() {
-                self.total = self.total.saturating_sub(1);
-            }
+        if let Some(parent) = self.entries.get_mut(&parent_ino)
+            && parent.remove(name).is_some()
+        {
+            self.total = self.total.saturating_sub(1);
         }
     }
 }
@@ -174,7 +174,7 @@ impl Db {
         let sql = pragma_query(name)?;
         self.conn
             .lock()
-            .unwrap()
+            .expect("conn lock poisoned")
             .query_row(&sql, [], |row| row.get(0))
             .map_err(Into::into)
     }
@@ -183,7 +183,7 @@ impl Db {
         let sql = pragma_query(name)?;
         self.conn
             .lock()
-            .unwrap()
+            .expect("conn lock poisoned")
             .query_row(&sql, [], |row| row.get(0))
             .map_err(Into::into)
     }
@@ -262,12 +262,12 @@ impl Db {
     }
 
     pub fn get_inode(&self, ino: u64) -> Result<Inode, DbError> {
-        if let Some(inode) = self.inode_cache.lock().unwrap().get(ino) {
+        if let Some(inode) = self.inode_cache.lock().expect("inode_cache lock poisoned").get(ino) {
             return Ok(inode);
         }
 
         let inode = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn.lock().expect("conn lock poisoned");
             let mut stmt = conn.prepare_cached(
                 "SELECT ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink
                  FROM inodes
@@ -276,19 +276,19 @@ impl Db {
             stmt.query_row(params![ino as i64], inode_from_row)?
         };
 
-        self.inode_cache.lock().unwrap().put(inode.clone());
+        self.inode_cache.lock().expect("inode_cache lock poisoned").put(inode.clone());
         Ok(inode)
     }
 
     pub fn lookup(&self, parent_ino: u64, name: &[u8]) -> Result<Inode, DbError> {
-        if let Some(ino) = self.lookup_cache.lock().unwrap().get(parent_ino, name) {
-            if let Some(inode) = self.inode_cache.lock().unwrap().get(ino) {
-                return Ok(inode);
-            }
+        if let Some(ino) = self.lookup_cache.lock().expect("lookup_cache lock poisoned").get(parent_ino, name)
+            && let Some(inode) = self.inode_cache.lock().expect("inode_cache lock poisoned").get(ino)
+        {
+            return Ok(inode);
         }
 
         let inode = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn.lock().expect("conn lock poisoned");
             let mut stmt = conn.prepare_cached(
                 "SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.nlink
                  FROM dirents d
@@ -298,10 +298,10 @@ impl Db {
             stmt.query_row(params![parent_ino as i64, name], inode_from_row)?
         };
 
-        self.inode_cache.lock().unwrap().put(inode.clone());
+        self.inode_cache.lock().expect("inode_cache lock poisoned").put(inode.clone());
         self.lookup_cache
             .lock()
-            .unwrap()
+            .expect("lookup_cache lock poisoned")
             .put(parent_ino, name, inode.ino);
         Ok(inode)
     }
@@ -311,7 +311,7 @@ impl Db {
             return Err(DbError::NotDirectory);
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("conn lock poisoned");
         let mut stmt = conn.prepare_cached(
             "SELECT d.name, i.ino, i.kind
              FROM dirents d
@@ -347,7 +347,7 @@ impl Db {
             return Err(DbError::NotDirectory);
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("conn lock poisoned");
         let mut stmt = conn.prepare_cached(
             "SELECT d.name, i.ino, i.kind
              FROM dirents d
@@ -411,7 +411,7 @@ impl Db {
         let inode = self.create_node(parent_ino, name, FileKind::Symlink, 0o777, uid, gid)?;
 
         {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn.lock().expect("conn lock poisoned");
             conn.prepare_cached(
                 "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
             )?
@@ -421,7 +421,7 @@ impl Db {
                 .execute(params![target.len() as i64, inode.ino as i64])?;
         }
 
-        self.inode_cache.lock().unwrap().invalidate(inode.ino);
+        self.inode_cache.lock().expect("inode_cache lock poisoned").invalidate(inode.ino);
 
         Ok(Inode {
             size: target.len() as u64,
@@ -435,7 +435,7 @@ impl Db {
             return Err(DbError::InvalidInput);
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("conn lock poisoned");
         conn.prepare_cached("SELECT target FROM symlink_targets WHERE ino = ?1")?
             .query_row(params![ino as i64], |row| row.get(0))
             .map_err(Into::into)
@@ -443,19 +443,19 @@ impl Db {
 
     /// Track that a file handle has been opened for this inode.
     pub fn open_file(&self, ino: u64, kind: FileKind) {
-        *self.open_counts.lock().unwrap().entry(ino).or_insert(0) += 1;
-        self.inode_kinds.lock().unwrap().insert(ino, kind);
+        *self.open_counts.lock().expect("open_counts lock poisoned").entry(ino).or_insert(0) += 1;
+        self.inode_kinds.lock().expect("inode_kinds lock poisoned").insert(ino, kind);
     }
 
     /// Return the cached inode kind for an open file, if available.
     pub fn inode_kind(&self, ino: u64) -> Option<FileKind> {
-        self.inode_kinds.lock().unwrap().get(&ino).copied()
+        self.inode_kinds.lock().expect("inode_kinds lock poisoned").get(&ino).copied()
     }
 
     /// Release a file handle. If this was the last handle and the inode
     /// is pending deletion, delete it now.
     pub fn release_file(&self, ino: u64) {
-        let mut open_counts = self.open_counts.lock().unwrap();
+        let mut open_counts = self.open_counts.lock().expect("open_counts lock poisoned");
         let count = open_counts.entry(ino).or_insert(0);
         if *count > 0 {
             *count -= 1;
@@ -463,20 +463,20 @@ impl Db {
 
         if *count == 0 {
             open_counts.remove(&ino);
-            self.inode_kinds.lock().unwrap().remove(&ino);
+            self.inode_kinds.lock().expect("inode_kinds lock poisoned").remove(&ino);
             drop(open_counts);
 
-            let mut pending = self.pending_delete.lock().unwrap();
+            let mut pending = self.pending_delete.lock().expect("pending_delete lock poisoned");
             if let Some(pos) = pending.iter().position(|&p| p == ino) {
                 pending.swap_remove(pos);
                 drop(pending);
                 let _ = self
                     .conn
                     .lock()
-                    .unwrap()
+                    .expect("conn lock poisoned")
                     .prepare_cached("DELETE FROM inodes WHERE ino = ?1")
                     .and_then(|mut s| s.execute(params![ino as i64]));
-                self.inode_cache.lock().unwrap().invalidate(ino);
+                self.inode_cache.lock().expect("inode_cache lock poisoned").invalidate(ino);
             }
         }
     }
@@ -491,7 +491,7 @@ impl Db {
         }
 
         let now = now_secs();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().expect("conn lock poisoned");
         let tx = conn.transaction()?;
 
         tx.prepare_cached(
@@ -508,7 +508,7 @@ impl Db {
         drop(conn);
 
         {
-            let mut icache = self.inode_cache.lock().unwrap();
+            let mut icache = self.inode_cache.lock().expect("inode_cache lock poisoned");
             icache.invalidate(ino);
             icache.invalidate(new_parent_ino);
         }
@@ -531,7 +531,7 @@ impl Db {
 
         let read_len = size.min((inode.size - offset) as u32) as usize;
         let mut output = vec![0; read_len];
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("conn lock poisoned");
 
         let start = offset as usize;
         let end = start + read_len;
@@ -590,7 +590,7 @@ impl Db {
         let mut new_size = inode.size;
         let mut written = 0usize;
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().expect("conn lock poisoned");
         let tx = conn.transaction()?;
 
         {
@@ -660,7 +660,7 @@ impl Db {
         tx.commit()?;
         drop(conn);
 
-        self.inode_cache.lock().unwrap().invalidate(ino);
+        self.inode_cache.lock().expect("inode_cache lock poisoned").invalidate(ino);
 
         Ok(written as u32)
     }
@@ -672,7 +672,7 @@ impl Db {
         }
 
         let now = now_secs();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().expect("conn lock poisoned");
         let tx = conn.transaction()?;
 
         if size == 0 {
@@ -717,7 +717,7 @@ impl Db {
         tx.commit()?;
         drop(conn);
 
-        self.inode_cache.lock().unwrap().invalidate(ino);
+        self.inode_cache.lock().expect("inode_cache lock poisoned").invalidate(ino);
 
         Ok(())
     }
@@ -739,7 +739,7 @@ impl Db {
         }
 
         let now = now_secs();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().expect("conn lock poisoned");
         let tx = conn.transaction()?;
 
         tx.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
@@ -753,13 +753,13 @@ impl Db {
         drop(conn);
 
         {
-            let mut icache = self.inode_cache.lock().unwrap();
+            let mut icache = self.inode_cache.lock().expect("inode_cache lock poisoned");
             icache.invalidate(target.ino);
             icache.invalidate(parent_ino);
         }
         self.lookup_cache
             .lock()
-            .unwrap()
+            .expect("lookup_cache lock poisoned")
             .invalidate_entry(parent_ino, name);
 
         Ok(())
@@ -772,7 +772,7 @@ impl Db {
         }
 
         let now = now_secs();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().expect("conn lock poisoned");
         let tx = conn.transaction()?;
         let child_count: i64 = tx
             .prepare_cached("SELECT COUNT(*) FROM dirents WHERE parent_ino = ?1")?
@@ -791,12 +791,12 @@ impl Db {
         drop(conn);
 
         {
-            let mut icache = self.inode_cache.lock().unwrap();
+            let mut icache = self.inode_cache.lock().expect("inode_cache lock poisoned");
             icache.invalidate(target.ino);
             icache.invalidate(parent_ino);
         }
         {
-            let mut lcache = self.lookup_cache.lock().unwrap();
+            let mut lcache = self.lookup_cache.lock().expect("lookup_cache lock poisoned");
             lcache.invalidate_entry(parent_ino, name);
             lcache.invalidate_parent(target.ino);
         }
@@ -835,17 +835,17 @@ impl Db {
                 | (FileKind::Symlink, FileKind::Directory) => return Err(DbError::IsDirectory),
                 (FileKind::Directory, FileKind::RegularFile)
                 | (FileKind::Directory, FileKind::Symlink) => return Err(DbError::NotDirectory),
-                (FileKind::Directory, FileKind::Directory) => {
-                    if !self.list_dir(target.ino)?.is_empty() {
-                        return Err(DbError::DirectoryNotEmpty);
-                    }
+                (FileKind::Directory, FileKind::Directory)
+                    if !self.list_dir(target.ino)?.is_empty() =>
+                {
+                    return Err(DbError::DirectoryNotEmpty);
                 }
                 _ => {}
             }
         }
 
         let now = now_secs();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().expect("conn lock poisoned");
         let tx = conn.transaction()?;
 
         if let Some(target) = &existing_target {
@@ -871,7 +871,7 @@ impl Db {
         drop(conn);
 
         {
-            let mut icache = self.inode_cache.lock().unwrap();
+            let mut icache = self.inode_cache.lock().expect("inode_cache lock poisoned");
             icache.invalidate(source.ino);
             icache.invalidate(parent_ino);
             icache.invalidate(new_parent_ino);
@@ -880,7 +880,7 @@ impl Db {
             }
         }
         {
-            let mut lcache = self.lookup_cache.lock().unwrap();
+            let mut lcache = self.lookup_cache.lock().expect("lookup_cache lock poisoned");
             lcache.invalidate_entry(parent_ino, name);
             lcache.invalidate_entry(new_parent_ino, new_name);
         }
@@ -909,14 +909,14 @@ impl Db {
         let open_count = self
             .open_counts
             .lock()
-            .unwrap()
+            .expect("open_counts lock poisoned")
             .get(&target.ino)
             .copied()
             .unwrap_or(0);
         if open_count > 0 {
             tx.prepare_cached("UPDATE inodes SET nlink = 0, ctime = ?1 WHERE ino = ?2")?
                 .execute(params![now, target.ino as i64])?;
-            let mut pending = self.pending_delete.lock().unwrap();
+            let mut pending = self.pending_delete.lock().expect("pending_delete lock poisoned");
             if !pending.contains(&target.ino) {
                 pending.push(target.ino);
             }
@@ -939,7 +939,7 @@ impl Db {
 
         self.conn
             .lock()
-            .unwrap()
+            .expect("conn lock poisoned")
             .prepare_cached(
                 "UPDATE inodes
              SET mode = ?1, uid = ?2, gid = ?3, atime = ?4, mtime = ?5, ctime = ?6
@@ -955,7 +955,7 @@ impl Db {
                 ino as i64
             ])?;
 
-        self.inode_cache.lock().unwrap().invalidate(ino);
+        self.inode_cache.lock().expect("inode_cache lock poisoned").invalidate(ino);
 
         self.get_inode(ino)
     }
@@ -974,7 +974,7 @@ impl Db {
         }
 
         let now = now_secs();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().expect("conn lock poisoned");
         let tx = conn.transaction()?;
 
         tx.prepare_cached(
@@ -998,7 +998,7 @@ impl Db {
         tx.commit()?;
         drop(conn);
 
-        self.inode_cache.lock().unwrap().invalidate(parent_ino);
+        self.inode_cache.lock().expect("inode_cache lock poisoned").invalidate(parent_ino);
 
         Ok(Inode {
             ino,
@@ -1019,7 +1019,7 @@ impl Db {
             return Ok(true);
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("conn lock poisoned");
         let mut stmt =
             conn.prepare_cached("SELECT parent_ino FROM dirents WHERE child_ino = ?1")?;
         let mut current = ino;

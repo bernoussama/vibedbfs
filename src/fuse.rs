@@ -39,7 +39,7 @@ impl Dbfs {
             .get_inode(ino)
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
-        if let Some(dirty) = self.dirty_files.lock().unwrap().get(&ino) {
+        if let Some(dirty) = self.dirty_files.lock().expect("dirty_files lock poisoned").get(&ino) {
             attr.size = dirty.size;
             attr.blocks = dirty.size.div_ceil(512);
         }
@@ -52,7 +52,7 @@ impl Dbfs {
             .lookup(parent_ino, name)
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
-        if let Some(dirty) = self.dirty_files.lock().unwrap().get(&attr.ino) {
+        if let Some(dirty) = self.dirty_files.lock().expect("dirty_files lock poisoned").get(&attr.ino) {
             attr.size = dirty.size;
             attr.blocks = dirty.size.div_ceil(512);
         }
@@ -193,7 +193,7 @@ impl Dbfs {
         // Extract dirty state (size + overlapping spans) under a short lock,
         // then release before touching the DB to avoid lock-ordering issues.
         let dirty_snapshot = {
-            let dirty_files = self.dirty_files.lock().unwrap();
+            let dirty_files = self.dirty_files.lock().expect("dirty_files lock poisoned");
             dirty_files.get(&ino).map(|dirty| {
                 let dirty_size = dirty.size;
                 let read_end = offset + size as u64;
@@ -265,7 +265,7 @@ impl Dbfs {
         }
         let current_size = self.db.get_inode(ino).map(|i| i.size).unwrap_or(0);
 
-        let mut dirty_files = self.dirty_files.lock().unwrap();
+        let mut dirty_files = self.dirty_files.lock().expect("dirty_files lock poisoned");
         let dirty = dirty_files.entry(ino).or_insert_with(|| DirtyFile {
             size: current_size,
             writes: Vec::new(),
@@ -277,14 +277,14 @@ impl Dbfs {
     }
 
     pub fn flush_file(&self, ino: u64) -> Result<(), i32> {
-        let Some(dirty) = self.dirty_files.lock().unwrap().remove(&ino) else {
+        let Some(dirty) = self.dirty_files.lock().expect("dirty_files lock poisoned").remove(&ino) else {
             return Ok(());
         };
 
         match self.db.write_file_batch(ino, &dirty.writes) {
             Ok(_) => Ok(()),
             Err(error) => {
-                self.dirty_files.lock().unwrap().insert(ino, dirty);
+                self.dirty_files.lock().expect("dirty_files lock poisoned").insert(ino, dirty);
                 Err(errno_from_db_error(error))
             }
         }
@@ -644,15 +644,14 @@ impl Filesystem for Dbfs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        let file_type = mode & libc::S_IFMT as u32;
-        const S_IFREG: u32 = libc::S_IFREG as u32;
+        let file_type = mode & libc::S_IFMT;
         match file_type {
-            0 | S_IFREG => {
+            0 | libc::S_IFREG => {
                 match Dbfs::create(
                     self,
                     parent,
                     name.as_bytes(),
-                    mode & !(libc::S_IFMT as u32),
+                    mode & !libc::S_IFMT,
                     umask,
                     req.uid(),
                     req.gid(),
