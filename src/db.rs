@@ -946,6 +946,20 @@ fn now_ts() -> Timestamp {
     Timestamp::from_system_time(SystemTime::now())
 }
 
+#[cfg(test)]
+impl Db {
+    pub(crate) fn cap_page_count_at_current(&self) -> Result<(), DbError> {
+        let pages: i64 = self
+            .conn
+            .borrow()
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        self.conn
+            .borrow()
+            .pragma_update(None, "max_page_count", pages)?;
+        Ok(())
+    }
+}
+
 /// Merge overlapping and adjacent writes into non-overlapping spans.
 ///
 /// Later writes in the input overwrite earlier ones where they overlap,

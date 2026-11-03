@@ -723,3 +723,23 @@ fn time_or_now(time: Option<TimeOrNow>) -> Option<SystemTime> {
         TimeOrNow::Now => Some(SystemTime::now()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flush_returns_enospc_when_the_database_is_full() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"big.bin", 0o644, 1, 1)
+            .expect("create file");
+        db.cap_page_count_at_current()
+            .expect("cap sqlite page count");
+        let fs = Dbfs::new(db);
+        let payload = vec![1u8; 256 * 1024];
+        fs.write(file.ino, 0, &payload).expect("buffer write");
+        let error = fs.flush_file(file.ino).expect_err("flush full database");
+        assert_eq!(error, libc::ENOSPC);
+    }
+}

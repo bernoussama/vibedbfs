@@ -128,6 +128,131 @@ fn maps_non_empty_directory_removal_to_enotempty() {
 }
 
 #[test]
+fn write_read_and_truncate_use_posix_errno_for_non_regular_files() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let fs = Dbfs::new(db);
+    let dir = fs.mkdir(1, b"docs", 0o755, 0, 1000, 1000).expect("mkdir");
+    let link = fs
+        .symlink(1, b"link", b"target", 1000, 1000)
+        .expect("symlink");
+
+    assert_eq!(
+        fs.write(dir.ino, 0, b"x").expect_err("write dir"),
+        libc::EISDIR
+    );
+    assert_eq!(fs.read(dir.ino, 0, 4).expect_err("read dir"), libc::EISDIR);
+    assert_eq!(
+        fs.setattr(dir.ino, None, None, None, Some(0), None, None)
+            .expect_err("truncate dir"),
+        libc::EISDIR
+    );
+    assert_eq!(
+        fs.write(link.ino, 0, b"x").expect_err("write symlink"),
+        libc::EINVAL
+    );
+    assert_eq!(
+        fs.read(link.ino, 0, 4).expect_err("read symlink"),
+        libc::EINVAL
+    );
+    assert_eq!(
+        fs.setattr(link.ino, None, None, None, Some(0), None, None)
+            .expect_err("truncate symlink"),
+        libc::EINVAL
+    );
+    assert_eq!(
+        fs.write(9_999, 0, b"x").expect_err("write missing"),
+        libc::ENOENT
+    );
+}
+
+#[test]
+fn names_longer_than_255_bytes_return_enametoolong() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let fs = Dbfs::new(db);
+    let too_long = vec![b'a'; 256];
+    let max_name = vec![b'b'; 255];
+
+    assert_eq!(
+        fs.create(1, &too_long, 0o644, 0, 1000, 1000)
+            .expect_err("create long name"),
+        libc::ENAMETOOLONG
+    );
+    assert_eq!(
+        fs.mkdir(1, &too_long, 0o755, 0, 1000, 1000)
+            .expect_err("mkdir long name"),
+        libc::ENAMETOOLONG
+    );
+    assert_eq!(
+        fs.symlink(1, &too_long, b"target", 1000, 1000)
+            .expect_err("symlink long name"),
+        libc::ENAMETOOLONG
+    );
+    assert_eq!(
+        fs.lookup(1, &too_long).expect_err("lookup long name"),
+        libc::ENAMETOOLONG
+    );
+    assert_eq!(
+        fs.lookup(1, &max_name)
+            .expect_err("lookup missing max name"),
+        libc::ENOENT
+    );
+
+    let created = fs
+        .create(1, &max_name, 0o644, 0, 1000, 1000)
+        .expect("create 255-byte name");
+    assert_eq!(
+        fs.rename(1, &max_name, 1, &too_long)
+            .expect_err("rename to long name"),
+        libc::ENAMETOOLONG
+    );
+    assert_eq!(
+        fs.lookup(1, &max_name).expect("original name remains").ino,
+        created.ino
+    );
+}
+
+#[test]
+fn check_constraint_is_not_reported_as_eexist() {
+    let path = temp_db_path("check-constraint");
+    {
+        let conn = Connection::open(&path).expect("open raw sqlite connection");
+        conn.execute_batch(
+            "
+            CREATE TABLE inodes (
+              ino INTEGER PRIMARY KEY,
+              kind INTEGER NOT NULL,
+              mode INTEGER NOT NULL,
+              uid INTEGER NOT NULL CHECK (uid = 1),
+              gid INTEGER NOT NULL,
+              size INTEGER NOT NULL,
+              atime INTEGER NOT NULL,
+              mtime INTEGER NOT NULL,
+              ctime INTEGER NOT NULL,
+              nlink INTEGER NOT NULL
+            );
+            INSERT INTO inodes
+              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              VALUES (1, 2, 493, 1, 1, 0, 1, 1, 1, 2);
+            ",
+        )
+        .expect("create schema with a check constraint");
+    }
+
+    let db = Db::open(&path).expect("open database");
+    let fs = Dbfs::new(db);
+    let error = fs
+        .create(1, b"notes.txt", 0o644, 0, 1000, 1000)
+        .expect_err("check constraint should fail");
+
+    assert_eq!(error, libc::EIO);
+    assert_eq!(fs.lookup(1, b"notes.txt"), Err(libc::ENOENT));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
 fn maps_create_under_file_to_enotdir() {
     let db = Db::open_in_memory().expect("open in-memory database");
     let file = db
