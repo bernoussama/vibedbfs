@@ -140,20 +140,27 @@
  │  1. Check inode_kinds cache  │◄── cached on open(), no SQL
  │     kind = RegularFile? ✓    │
  │                              │
- │  2. Get or create DirtyFile  │
+ │  2. Flush first if the file  │
+ │     buffers 64 MiB or more   │
+ │                              │
+ │  3. Get or create DirtyFile  │
  │     dirty_files[2] = {       │
  │       size: 5,               │
- │       writes: [(0, "hello")] │
+ │       chunks: {0: "hello"}   │
  │     }                        │
+ │     Partial write to a new   │
+ │     chunk: SELECT it once    │
  │                              │
- │  3. Return Ok(5)             │    ── no SQLite hit ──
+ │  4. Return Ok(5)             │    ── no SQLite write below 64 MiB ──
  └──────────────────────────────┘
 ```
 
-## Flush Data Flow (on close/fsync)
+## Flush Data Flow (on close, fsync, or 64 MiB buffered)
+
+Close flushes dirty bytes into SQLite. `fsync` does that flush and then calls `fdatasync` on the WAL file, or on the main database file when no WAL file is present.
 
 ```
- User: close(fd)  or  fsync(fd)
+ User: close(fd)  or  fsync(fd)  or  a write past 64 MiB buffered
                 │
                 ▼
  ┌──────────────────────────────────────────────────────────┐
@@ -161,32 +168,22 @@
  │                                                         │
  │  1. Remove dirty_files[2]                               │
  │     dirty = { size: 300000,                             │
- │               writes: [(0,"aaa"), (4096,"bbb"), ...] }  │
+ │               chunks: {0: <64K>, 4: <4K>, ...} }        │
  │                                                         │
- │  2. Call Db::write_file_batch(ino=2, &dirty.writes)     │
+ │  2. Call Db::replace_chunks(ino=2, size, &chunks)       │
  └────────────────────┬────────────────────────────────────┘
                       ▼
  ┌──────────────────────────────────────────────────────────┐
- │  Db::write_file_batch                                   │
+ │  Db::replace_chunks                                     │
  │                                                         │
- │  1. coalesce_writes()                                   │
- │     Merge overlapping/adjacent spans:                   │
- │     [(0,"aaa"), (2,"bbb")]  →  [(0,"abbb")]            │
+ │  1. BEGIN TRANSACTION                                   │
  │                                                         │
- │  2. BEGIN TRANSACTION                                   │
+ │  2. For each buffered chunk:                            │
+ │     INSERT OR REPLACE the whole row (no SELECT)         │
  │                                                         │
- │  3. For each coalesced span, for each 64K chunk:        │
- │     ┌──────────────────────────────────────────┐        │
- │     │ Full chunk?                              │        │
- │     │  YES → INSERT OR REPLACE (skip SELECT)   │        │
- │     │  NO  → SELECT chunk                      │        │
- │     │        merge in memory                   │        │
- │     │        INSERT OR REPLACE                 │        │
- │     └──────────────────────────────────────────┘        │
+ │  3. UPDATE inodes SET size, mtime, ctime                │
  │                                                         │
- │  4. UPDATE inodes SET size, mtime, ctime                │
- │                                                         │
- │  5. COMMIT                                              │
+ │  4. COMMIT                                              │
  │     └──► SQLite appends WAL frames                      │
  └─────────────────────────────────────────────────────────┘
 ```
@@ -207,8 +204,8 @@
  │  └── YES: (dirty overlay read)              │    │
  │       1. Db::read_file(2, 0, 4096)         │    │
  │          fill output from persisted chunks  │    │
- │       2. For each dirty write:              │    │
- │          overlay dirty bytes onto output    │    │
+ │       2. For each buffered chunk in range:  │    │
+ │          overlay its bytes onto output      │    │
  │       3. Return merged output               │    │
  └──────────────────────┬──────────────────────┘    │
                         │                           │
@@ -349,21 +346,16 @@
  │  │          │                                               │  │
  │  │          ▼                                               │  │
  │  │  ╔═══════════════╗                                       │  │
- │  │  ║  dirty_files  ║  writes buffered in RAM               │  │
- │  │  ║  (in-memory)  ║  no SQLite until flush/fsync/close    │  │
+ │  │  ║  dirty_files  ║  64K chunk buffers in RAM             │  │
+ │  │  ║  (in-memory)  ║  full-chunk write: no SELECT          │  │
+ │  │  ║               ║  partial write: SELECT chunk once     │  │
  │  │  ╚═══════╤═══════╝                                       │  │
- │  │          │ flush                                         │  │
+ │  │          │ flush past 64 MiB, on fsync, on close         │  │
  │  │          ▼                                               │  │
  │  │  ╔═══════════════╗                                       │  │
- │  │  ║  coalesce_    ║  merge overlapping writes             │  │
- │  │  ║  writes()     ║  reduce chunk round-trips             │  │
+ │  │  ║  replace_     ║  INSERT OR REPLACE whole chunks       │  │
+ │  │  ║  chunks()     ║  no SELECT, one transaction           │  │
  │  │  ╚═══════╤═══════╝                                       │  │
- │  │          │                                               │  │
- │  │          ▼                                               │  │
- │  │  ╔═══════════════╗                                       │  │
- │  │  ║ full-chunk    ║  write covers entire 64K chunk?       │  │
- │  │  ║  detection    ║  YES → INSERT (no SELECT)             │  │
- │  │  ╚═══════╤═══════╝  NO  → SELECT + merge + INSERT       │  │
  │  │          │                                               │  │
  │  └──────────┼───────────────────────────────────────────────┘  │
  │             ▼                                                  │

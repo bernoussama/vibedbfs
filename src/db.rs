@@ -1,13 +1,15 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
 
 use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
 
-const CHUNK_SIZE: usize = 65_536;
+pub(crate) const CHUNK_SIZE: usize = 65_536;
 
 pub(crate) struct VolumeUsage {
     pub page_size: u64,
@@ -29,6 +31,13 @@ pub struct Db {
     inode_kinds: RefCell<HashMap<u64, FileKind>>,
 }
 
+#[derive(Clone, Copy)]
+enum NewNode<'a> {
+    Directory { mode: u32 },
+    File { mode: u32 },
+    Symlink { target: &'a [u8] },
+}
+
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
@@ -48,6 +57,17 @@ impl Db {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         Self::initialize(conn)
+    }
+
+    pub(crate) fn sync_durable(&self) -> Result<(), DbError> {
+        let path = {
+            let conn = self.conn.borrow();
+            match conn.path() {
+                Some(path) if !path.is_empty() && path != ":memory:" => path.to_owned(),
+                _ => return Ok(()),
+            }
+        };
+        sync_database_file(Path::new(&path)).map_err(|error| DbError::Sqlite(error.to_string()))
     }
 
     pub fn pragma_i64(&self, name: &str) -> Result<i64, DbError> {
@@ -149,6 +169,7 @@ impl Db {
             params![mount_uid, mount_gid, now.secs, now.nsec as i64],
         )?;
         recompute_directory_nlink(&conn)?;
+        conn.execute("DELETE FROM inodes WHERE nlink = 0 AND ino != 1", [])?;
 
         Ok(Self {
             conn: RefCell::new(conn),
@@ -264,7 +285,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        self.create_node(parent_ino, name, FileKind::Directory, mode, uid, gid)
+        self.create_node(parent_ino, name, NewNode::Directory { mode }, uid, gid)
     }
 
     pub fn create_file(
@@ -275,7 +296,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        self.create_node(parent_ino, name, FileKind::RegularFile, mode, uid, gid)
+        self.create_node(parent_ino, name, NewNode::File { mode }, uid, gid)
     }
 
     pub fn create_symlink(
@@ -286,19 +307,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        let inode = self.create_node(parent_ino, name, FileKind::Symlink, 0o777, uid, gid)?;
-
-        let conn = self.conn.borrow();
-        conn.prepare_cached("INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)")?
-            .execute(params![inode.ino as i64, target])?;
-
-        conn.prepare_cached("UPDATE inodes SET size = ?1 WHERE ino = ?2")?
-            .execute(params![target.len() as i64, inode.ino as i64])?;
-
-        Ok(Inode {
-            size: target.len() as u64,
-            ..inode
-        })
+        self.create_node(parent_ino, name, NewNode::Symlink { target }, uid, gid)
     }
 
     pub fn read_symlink(&self, ino: u64) -> Result<Vec<u8>, DbError> {
@@ -399,7 +408,7 @@ impl Db {
             return Ok(Vec::new());
         }
 
-        let read_len = size.min((inode.size - offset) as u32) as usize;
+        let read_len = (size as u64).min(inode.size - offset) as usize;
         let mut output = vec![0; read_len];
         let conn = self.conn.borrow();
 
@@ -461,8 +470,6 @@ impl Db {
             return Ok(0);
         }
 
-        let coalesced = coalesce_writes(writes);
-
         let mut new_size = inode.size;
         let mut written = 0usize;
 
@@ -478,7 +485,7 @@ impl Db {
                  ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
             )?;
 
-            for (offset, data) in &coalesced {
+            for (offset, data) in writes {
                 if data.is_empty() {
                     continue;
                 }
@@ -540,6 +547,45 @@ impl Db {
         tx.commit()?;
 
         Ok(written as u32)
+    }
+
+    pub(crate) fn read_chunk(&self, ino: u64, chunk_index: u64) -> Result<Vec<u8>, DbError> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare_cached(
+            "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+        )?;
+        let chunk = stmt
+            .query_row(params![ino as i64, chunk_index as i64], |row| row.get(0))
+            .optional()?;
+        Ok(chunk.unwrap_or_default())
+    }
+
+    pub(crate) fn replace_chunks(
+        &self,
+        ino: u64,
+        size: u64,
+        chunks: &BTreeMap<u64, Vec<u8>>,
+        now: Timestamp,
+    ) -> Result<(), DbError> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+
+        {
+            let mut write_stmt = tx.prepare_cached(
+                "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
+            )?;
+            for (chunk_index, data) in chunks {
+                write_stmt.execute(params![ino as i64, *chunk_index as i64, data])?;
+            }
+        }
+
+        tx.prepare_cached(
+            "UPDATE inodes SET size = ?1, mtime = ?2, mtime_nsec = ?3, ctime = ?2, ctime_nsec = ?3 WHERE ino = ?4",
+        )?.execute(params![size as i64, now.secs, now.nsec as i64, ino as i64])?;
+        tx.commit()?;
+
+        Ok(())
     }
 
     pub fn truncate_file(&self, ino: u64, size: u64) -> Result<(), DbError> {
@@ -845,8 +891,7 @@ impl Db {
         &self,
         parent_ino: u64,
         name: &[u8],
-        kind: FileKind,
-        mode: u32,
+        node: NewNode<'_>,
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
@@ -856,6 +901,11 @@ impl Db {
         }
 
         let now = now_ts();
+        let (kind, mode, size) = match node {
+            NewNode::Directory { mode } => (FileKind::Directory, mode, 0),
+            NewNode::File { mode } => (FileKind::RegularFile, mode, 0),
+            NewNode::Symlink { target } => (FileKind::Symlink, 0o777, target.len() as u64),
+        };
         let nlink: i64 = if kind == FileKind::Directory { 2 } else { 1 };
         let parent_delta: i64 = if kind == FileKind::Directory { 1 } else { 0 };
         let mut conn = self.conn.borrow_mut();
@@ -864,12 +914,13 @@ impl Db {
         tx.prepare_cached(
             "INSERT INTO inodes
              (kind, mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec, nlink)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, ?6, ?6, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, ?7, ?7, ?7, ?8)",
         )?.execute(params![
             kind.as_i64(),
             mode as i64,
             uid as i64,
             gid as i64,
+            size as i64,
             now.secs,
             now.nsec as i64,
             nlink
@@ -881,6 +932,12 @@ impl Db {
             .and_then(|mut s| s.execute(params![parent_ino as i64, name, ino as i64]))
         {
             return Err(error.into());
+        }
+
+        if let NewNode::Symlink { target } = node {
+            tx.prepare_cached(
+                "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
+            )?.execute(params![ino as i64, target])?;
         }
 
         tx.prepare_cached(
@@ -902,7 +959,7 @@ impl Db {
             mode,
             uid,
             gid,
-            size: 0,
+            size,
             atime: now,
             mtime: now,
             ctime: now,
@@ -947,6 +1004,21 @@ fn check_name(name: &[u8]) -> Result<(), DbError> {
     } else {
         Ok(())
     }
+}
+
+fn sync_database_file(db_path: &Path) -> std::io::Result<()> {
+    let wal_path = path_with_suffix(db_path, "-wal");
+    match File::open(&wal_path) {
+        Ok(file) => file.sync_data(),
+        Err(error) if error.kind() == ErrorKind::NotFound => File::open(db_path)?.sync_data(),
+        Err(error) => Err(error),
+    }
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 fn pragma_query(name: &str) -> Result<String, DbError> {
@@ -1068,65 +1140,4 @@ impl Db {
             .pragma_update(None, "max_page_count", pages)?;
         Ok(())
     }
-}
-
-/// Merge overlapping and adjacent writes into non-overlapping spans.
-///
-/// Later writes in the input overwrite earlier ones where they overlap,
-/// preserving correct write-ordering semantics. The returned vec is
-/// sorted by offset with no overlaps.
-fn coalesce_writes(writes: &[(u64, Vec<u8>)]) -> Vec<(u64, Vec<u8>)> {
-    if writes.len() <= 1 {
-        return writes.to_vec();
-    }
-
-    let mut result: Vec<(u64, Vec<u8>)> = Vec::new();
-
-    for (offset, data) in writes {
-        if data.is_empty() {
-            continue;
-        }
-
-        let end = *offset + data.len() as u64;
-        let mut next = Vec::with_capacity(result.len() + 1);
-
-        for (span_offset, span_data) in result {
-            let span_end = span_offset + span_data.len() as u64;
-
-            if span_end <= *offset || span_offset >= end {
-                next.push((span_offset, span_data));
-                continue;
-            }
-
-            if span_offset < *offset {
-                let left_len = (*offset - span_offset) as usize;
-                next.push((span_offset, span_data[..left_len].to_vec()));
-            }
-
-            if span_end > end {
-                let right_start = (end - span_offset) as usize;
-                next.push((end, span_data[right_start..].to_vec()));
-            }
-        }
-
-        next.push((*offset, data.to_vec()));
-        result = next;
-    }
-
-    result.sort_by_key(|(offset, _)| *offset);
-
-    let mut merged: Vec<(u64, Vec<u8>)> = Vec::with_capacity(result.len());
-    for (offset, data) in result {
-        if let Some((last_offset, last_data)) = merged.last_mut() {
-            let last_end = *last_offset + last_data.len() as u64;
-            if offset == last_end {
-                last_data.extend_from_slice(&data);
-                continue;
-            }
-        }
-
-        merged.push((offset, data));
-    }
-
-    merged
 }

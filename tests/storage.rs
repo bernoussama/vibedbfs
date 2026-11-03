@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dbfs::{Db, DbError, FileKind, MetadataUpdate, Timestamp, file_attr_from_inode};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 fn temp_db_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -672,4 +672,192 @@ fn metadata_update_leaves_unspecified_fields_unchanged() {
     assert_eq!(updated.gid, file.gid);
     assert_eq!(updated.atime, file.atime);
     assert_eq!(updated.mtime, file.mtime);
+}
+
+#[test]
+fn read_past_4gib_returns_the_marker_near_that_offset() {
+    const FOUR_GIB: u64 = 1 << 32;
+    let marker_at = FOUR_GIB + 64;
+    let path = disk_db_path("read-past-4gib");
+    let db = Db::open(&path).expect("open file-backed database");
+    let file = db
+        .create_file(1, b"sparse.bin", 0o644, 1000, 1000)
+        .expect("create file");
+
+    db.truncate_file(file.ino, marker_at + FOUR_GIB)
+        .expect("extend sparse file");
+    db.write_file(file.ino, marker_at, b"MARK")
+        .expect("write marker");
+
+    let data = db.read_file(file.ino, marker_at, 4).expect("read marker");
+
+    assert_eq!(data, b"MARK");
+    remove_db(&path);
+}
+
+#[test]
+fn reopen_drops_inodes_left_unlinked_while_open() {
+    let path = disk_db_path("reclaim-unlinked");
+    let leaked_ino = {
+        let db = Db::open(&path).expect("open file-backed database");
+        let keep = db
+            .create_file(1, b"keep.txt", 0o644, 1000, 1000)
+            .expect("create file that stays linked");
+        db.write_file(keep.ino, 0, b"kept")
+            .expect("write kept file");
+        let leaked = db
+            .create_file(1, b"gone.txt", 0o644, 1000, 1000)
+            .expect("create file unlinked while open");
+        db.write_file(leaked.ino, 0, b"leaked-chunk")
+            .expect("write chunk that should not survive");
+        db.open_file(leaked.ino, FileKind::RegularFile);
+        db.unlink_file(1, b"gone.txt")
+            .expect("unlink while the handle is still open");
+        assert_eq!(db.get_inode(leaked.ino).expect("inode still open").nlink, 0);
+        leaked.ino
+    };
+
+    {
+        let db = Db::open(&path).expect("reopen after crash");
+        assert_eq!(db.get_inode(1).expect("root stays").ino, 1);
+        assert_eq!(db.get_inode(leaked_ino), Err(DbError::NotFound));
+        assert_eq!(db.lookup(1, b"gone.txt"), Err(DbError::NotFound));
+        let keep = db.lookup(1, b"keep.txt").expect("linked file stays");
+        assert_eq!(
+            db.read_file(keep.ino, 0, 4).expect("read kept file"),
+            b"kept"
+        );
+    }
+    assert_eq!(
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM file_chunks WHERE ino = ?1",
+            leaked_ino
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM inodes WHERE ino = ?1",
+            leaked_ino
+        ),
+        0
+    );
+
+    {
+        let db = Db::open(&path).expect("second reopen");
+        assert_eq!(
+            db.get_inode(1).expect("root stays after second open").ino,
+            1
+        );
+        assert_eq!(db.get_inode(leaked_ino), Err(DbError::NotFound));
+        let keep = db.lookup(1, b"keep.txt").expect("linked file stays");
+        assert_eq!(
+            db.read_file(keep.ino, 0, 4).expect("read kept file"),
+            b"kept"
+        );
+    }
+    assert_eq!(
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM file_chunks WHERE ino = ?1",
+            leaked_ino
+        ),
+        0
+    );
+    remove_db(&path);
+}
+
+#[test]
+fn failed_symlink_create_leaves_no_dirent_or_inode() {
+    let path = disk_db_path("symlink-rollback");
+    {
+        let db = Db::open(&path).expect("open file-backed database");
+        db.create_file(1, b"keep.txt", 0o644, 1000, 1000)
+            .expect("create file that must stay");
+    }
+    exec_sql(
+        &path,
+        "CREATE TRIGGER reject_symlink_target_insert
+         BEFORE INSERT ON symlink_targets
+         BEGIN
+           SELECT RAISE(ABORT, 'reject symlink target');
+         END;",
+    );
+
+    {
+        let db = Db::open(&path).expect("reopen with rejecting trigger");
+        let created = db.create_symlink(1, b"link", b"target-path", 1000, 1000);
+        assert!(
+            created.is_err(),
+            "symlink create reports the failed target insert"
+        );
+        assert_eq!(db.lookup(1, b"link"), Err(DbError::NotFound));
+        let entries = db.list_dir(1).expect("list root");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"keep.txt");
+        assert_eq!(
+            db.lookup(1, b"keep.txt").expect("kept file").kind,
+            FileKind::RegularFile
+        );
+    }
+    assert_eq!(
+        query_i64(&path, "SELECT COUNT(*) FROM inodes WHERE ino != 1"),
+        1
+    );
+    assert_eq!(query_i64(&path, "SELECT COUNT(*) FROM dirents"), 1);
+    assert_eq!(query_i64(&path, "SELECT COUNT(*) FROM symlink_targets"), 0);
+
+    exec_sql(&path, "DROP TRIGGER reject_symlink_target_insert;");
+    {
+        let db = Db::open(&path).expect("reopen after dropping trigger");
+        let link = db
+            .create_symlink(1, b"link", b"target-path", 1000, 1000)
+            .expect("symlink create commits the node and the target together");
+        assert_eq!(
+            db.read_symlink(link.ino).expect("read symlink"),
+            b"target-path"
+        );
+        assert_eq!(link.size, b"target-path".len() as u64);
+        assert_eq!(db.lookup(1, b"link").expect("lookup symlink").ino, link.ino);
+    }
+    remove_db(&path);
+}
+
+fn disk_db_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".bench")
+        .join("correctness");
+    std::fs::create_dir_all(&dir).expect("create disk-backed test directory");
+    dir.join(format!("dbfs-{name}-{}-{nanos}.sqlite", std::process::id()))
+}
+
+fn remove_db(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+fn count_rows(path: &Path, sql: &str, ino: u64) -> i64 {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    conn.query_row(sql, params![ino as i64], |row| row.get(0))
+        .expect("count rows")
+}
+
+fn query_i64(path: &Path, sql: &str) -> i64 {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    conn.query_row(sql, [], |row| row.get(0))
+        .expect("query scalar")
+}
+
+fn exec_sql(path: &Path, sql: &str) {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("set busy timeout");
+    conn.execute_batch(sql).expect("execute sql");
 }
