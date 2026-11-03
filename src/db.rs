@@ -132,7 +132,7 @@ impl Db {
             "INSERT OR IGNORE INTO inodes
              (ino, kind, mode, uid, gid, size, atime, mtime, ctime,
               atime_nsec, mtime_nsec, ctime_nsec, nlink)
-             VALUES (1, ?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, ?6, ?6, ?6, 1)",
+             VALUES (1, ?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, ?6, ?6, ?6, 2)",
             params![
                 FileKind::Directory.as_i64(),
                 0o755_i64,
@@ -148,6 +148,7 @@ impl Db {
              WHERE ino = 1 AND uid = 0 AND gid = 0",
             params![mount_uid, mount_gid, now.secs, now.nsec as i64],
         )?;
+        recompute_directory_nlink(&conn)?;
 
         Ok(Self {
             conn: RefCell::new(conn),
@@ -645,8 +646,11 @@ impl Db {
         tx.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
             .execute(params![target.ino as i64])?;
         tx.prepare_cached(
-            "UPDATE inodes SET mtime = ?1, mtime_nsec = ?2, ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
-        )?.execute(params![now.secs, now.nsec as i64, parent_ino as i64])?;
+            "UPDATE inodes
+             SET mtime = ?1, mtime_nsec = ?2, ctime = ?1, ctime_nsec = ?2, nlink = nlink - 1
+             WHERE ino = ?3",
+        )?
+        .execute(params![now.secs, now.nsec as i64, parent_ino as i64])?;
         tx.commit()?;
 
         Ok(())
@@ -693,6 +697,11 @@ impl Db {
             }
         }
 
+        let source_is_dir = source.kind == FileKind::Directory;
+        let target_is_dir = existing_target
+            .as_ref()
+            .is_some_and(|target| target.kind == FileKind::Directory);
+
         let now = now_ts();
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
@@ -723,6 +732,13 @@ impl Db {
             parent_ino as i64,
             new_parent_ino as i64
         ])?;
+        if source_is_dir && parent_ino != new_parent_ino {
+            add_directory_nlink(&tx, parent_ino, -1)?;
+            add_directory_nlink(&tx, new_parent_ino, 1)?;
+        }
+        if target_is_dir {
+            add_directory_nlink(&tx, new_parent_ino, -1)?;
+        }
         tx.commit()?;
 
         Ok(())
@@ -825,14 +841,24 @@ impl Db {
         }
 
         let now = now_ts();
+        let nlink: i64 = if kind == FileKind::Directory { 2 } else { 1 };
+        let parent_delta: i64 = if kind == FileKind::Directory { 1 } else { 0 };
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
 
         tx.prepare_cached(
             "INSERT INTO inodes
              (kind, mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec, nlink)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, ?6, ?6, ?6, 1)",
-        )?.execute(params![kind.as_i64(), mode as i64, uid as i64, gid as i64, now.secs, now.nsec as i64])?;
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, ?6, ?6, ?6, ?7)",
+        )?.execute(params![
+            kind.as_i64(),
+            mode as i64,
+            uid as i64,
+            gid as i64,
+            now.secs,
+            now.nsec as i64,
+            nlink
+        ])?;
         let ino = tx.last_insert_rowid() as u64;
 
         if let Err(error) = tx
@@ -843,8 +869,16 @@ impl Db {
         }
 
         tx.prepare_cached(
-            "UPDATE inodes SET mtime = ?1, mtime_nsec = ?2, ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
-        )?.execute(params![now.secs, now.nsec as i64, parent_ino as i64])?;
+            "UPDATE inodes
+             SET mtime = ?1, mtime_nsec = ?2, ctime = ?1, ctime_nsec = ?2, nlink = nlink + ?3
+             WHERE ino = ?4",
+        )?
+        .execute(params![
+            now.secs,
+            now.nsec as i64,
+            parent_delta,
+            parent_ino as i64
+        ])?;
         tx.commit()?;
 
         Ok(Inode {
@@ -857,7 +891,7 @@ impl Db {
             atime: now,
             mtime: now,
             ctime: now,
-            nlink: 1,
+            nlink: nlink as u32,
         })
     }
 
@@ -951,6 +985,32 @@ fn timestamp_from_row(
         secs,
         nsec: nsec as u32,
     })
+}
+
+fn recompute_directory_nlink(conn: &Connection) -> Result<(), DbError> {
+    let directory = FileKind::Directory.as_i64();
+    conn.execute(
+        "UPDATE inodes
+         SET nlink = 2 + (
+           SELECT COUNT(*)
+           FROM dirents d
+           JOIN inodes child ON child.ino = d.child_ino
+           WHERE d.parent_ino = inodes.ino AND child.kind = ?1
+         )
+         WHERE kind = ?1",
+        [directory],
+    )?;
+    Ok(())
+}
+
+fn add_directory_nlink(
+    tx: &rusqlite::Transaction<'_>,
+    ino: u64,
+    delta: i64,
+) -> Result<(), DbError> {
+    tx.prepare_cached("UPDATE inodes SET nlink = nlink + ?1 WHERE ino = ?2")?
+        .execute(params![delta, ino as i64])?;
+    Ok(())
 }
 
 fn ensure_nsec_columns(conn: &Connection) -> Result<(), DbError> {
