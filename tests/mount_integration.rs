@@ -1,7 +1,8 @@
-use std::fs;
+use std::fs::{self, FileTimes};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn mounted_filesystem_supports_basic_file_lifecycle_when_enabled() {
@@ -44,6 +45,26 @@ fn mounted_filesystem_supports_basic_file_lifecycle_when_enabled() {
     let _ = fs::remove_file(db_path.with_extension("sqlite-shm"));
 }
 
+#[test]
+fn utimens_round_trips_nanoseconds_when_enabled() {
+    let Some(mounted) = Mounted::start("utimens-nsec") else {
+        return;
+    };
+
+    let path = mounted.mountpoint.join("notes.txt");
+    fs::write(&path, b"hello").expect("create file through mount");
+    let atime = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+    let mtime = UNIX_EPOCH + Duration::new(1_700_000_111, 987_654_321);
+    fs::set_times(&path, FileTimes::new().set_accessed(atime).set_modified(mtime))
+        .expect("utimens through mount");
+
+    let meta = fs::metadata(&path).expect("stat file through mount");
+    assert_eq!(meta.atime(), 1_700_000_000, "atime seconds");
+    assert_eq!(meta.atime_nsec(), 123_456_789, "atime nanoseconds");
+    assert_eq!(meta.mtime(), 1_700_000_111, "mtime seconds");
+    assert_eq!(meta.mtime_nsec(), 987_654_321, "mtime nanoseconds");
+}
+
 fn command_path(command: &str) -> Option<PathBuf> {
     std::env::var_os("PATH")?
         .to_string_lossy()
@@ -84,4 +105,47 @@ fn unmount(mountpoint: &Path, child: &mut Child) {
         .arg(mountpoint)
         .status();
     let _ = child.wait();
+}
+
+struct Mounted {
+    mountpoint: PathBuf,
+    db_path: PathBuf,
+    child: Child,
+}
+
+impl Mounted {
+    fn start(name: &str) -> Option<Self> {
+        if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || command_path("fusermount3").is_none()
+        {
+            return None;
+        }
+
+        let base = temp_path(name);
+        let db_path = base.with_extension("sqlite");
+        let mountpoint = base.with_extension("mnt");
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
+            .arg("mount")
+            .arg(&db_path)
+            .arg(&mountpoint)
+            .spawn()
+            .expect("start dbfs mount");
+        let mounted = Self {
+            mountpoint,
+            db_path,
+            child,
+        };
+        wait_for_mount(&mounted.mountpoint);
+        Some(mounted)
+    }
+}
+
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        unmount(&self.mountpoint, &mut self.child);
+        let _ = fs::remove_dir(&self.mountpoint);
+        let _ = fs::remove_file(&self.db_path);
+        let _ = fs::remove_file(self.db_path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(self.db_path.with_extension("sqlite-shm"));
+    }
 }

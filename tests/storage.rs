@@ -1,7 +1,7 @@
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dbfs::{Db, DbError, FileKind, MetadataUpdate};
+use dbfs::{Db, DbError, FileKind, MetadataUpdate, file_attr_from_inode};
 use rusqlite::Connection;
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -108,6 +108,48 @@ fn opening_legacy_database_migrates_root_owner_to_mount_user() {
 
     assert_eq!(root.uid, unsafe { libc::getuid() });
     assert_eq!(root.gid, unsafe { libc::getgid() });
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
+fn legacy_second_timestamps_read_back_with_zero_nsec() {
+    let path = temp_db_path("legacy-seconds");
+    {
+        let conn = Connection::open(&path).expect("open raw sqlite connection");
+        conn.execute_batch(
+            "
+            CREATE TABLE inodes (
+              ino INTEGER PRIMARY KEY,
+              kind INTEGER NOT NULL,
+              mode INTEGER NOT NULL,
+              uid INTEGER NOT NULL,
+              gid INTEGER NOT NULL,
+              size INTEGER NOT NULL,
+              atime INTEGER NOT NULL,
+              mtime INTEGER NOT NULL,
+              ctime INTEGER NOT NULL,
+              nlink INTEGER NOT NULL
+            );
+            INSERT INTO inodes
+              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              VALUES (1, 2, 493, 1, 1, 0, 10, 20, 30, 1);
+            INSERT INTO inodes
+              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              VALUES (2, 1, 420, 1, 1, 4, 111, 222, 333, 1);
+            ",
+        )
+        .expect("create legacy second-only inodes");
+    }
+
+    let db = Db::open(&path).expect("open legacy database");
+    let attr = file_attr_from_inode(&db.get_inode(2).expect("load legacy file"));
+
+    assert_eq!(attr.atime, UNIX_EPOCH + Duration::new(111, 0));
+    assert_eq!(attr.mtime, UNIX_EPOCH + Duration::new(222, 0));
+    assert_eq!(attr.ctime, UNIX_EPOCH + Duration::new(333, 0));
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
