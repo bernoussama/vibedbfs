@@ -65,6 +65,7 @@ fn mounted_sparse_file_past_4gib_reads_marker_at_that_offset() {
     {
         let file = OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&file_path)

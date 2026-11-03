@@ -24,8 +24,9 @@ pub struct Db {
 
 #[derive(Clone, Copy)]
 enum NewNode<'a> {
-    Plain,
-    Symlink(&'a [u8]),
+    Directory { mode: u32 },
+    File { mode: u32 },
+    Symlink { target: &'a [u8] },
 }
 
 impl Db {
@@ -240,15 +241,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        self.create_node(
-            parent_ino,
-            name,
-            FileKind::Directory,
-            mode,
-            uid,
-            gid,
-            NewNode::Plain,
-        )
+        self.create_node(parent_ino, name, NewNode::Directory { mode }, uid, gid)
     }
 
     pub fn create_file(
@@ -259,15 +252,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        self.create_node(
-            parent_ino,
-            name,
-            FileKind::RegularFile,
-            mode,
-            uid,
-            gid,
-            NewNode::Plain,
-        )
+        self.create_node(parent_ino, name, NewNode::File { mode }, uid, gid)
     }
 
     pub fn create_symlink(
@@ -278,15 +263,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        self.create_node(
-            parent_ino,
-            name,
-            FileKind::Symlink,
-            0o777,
-            uid,
-            gid,
-            NewNode::Symlink(target),
-        )
+        self.create_node(parent_ino, name, NewNode::Symlink { target }, uid, gid)
     }
 
     pub fn read_symlink(&self, ino: u64) -> Result<Vec<u8>, DbError> {
@@ -755,20 +732,19 @@ impl Db {
         &self,
         parent_ino: u64,
         name: &[u8],
-        kind: FileKind,
-        mode: u32,
+        node: NewNode<'_>,
         uid: u32,
         gid: u32,
-        extra: NewNode<'_>,
     ) -> Result<Inode, DbError> {
         if self.get_inode(parent_ino)?.kind != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
 
         let now = now_secs();
-        let size = match extra {
-            NewNode::Plain => 0,
-            NewNode::Symlink(target) => target.len() as u64,
+        let (kind, mode, size) = match node {
+            NewNode::Directory { mode } => (FileKind::Directory, mode, 0),
+            NewNode::File { mode } => (FileKind::RegularFile, mode, 0),
+            NewNode::Symlink { target } => (FileKind::Symlink, 0o777, target.len() as u64),
         };
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
@@ -785,7 +761,7 @@ impl Db {
             return Err(error.into());
         }
 
-        if let NewNode::Symlink(target) = extra {
+        if let NewNode::Symlink { target } = node {
             tx.prepare_cached(
                 "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
             )?.execute(params![ino as i64, target])?;
