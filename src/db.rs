@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,7 +7,7 @@ use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
 
 use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate};
 
-const CHUNK_SIZE: usize = 65_536;
+pub(crate) const CHUNK_SIZE: usize = 65_536;
 
 pub struct Db {
     conn: RefCell<Connection>,
@@ -420,8 +420,6 @@ impl Db {
             return Ok(0);
         }
 
-        let coalesced = coalesce_writes(writes);
-
         let now = now_secs();
         let mut new_size = inode.size;
         let mut written = 0usize;
@@ -438,7 +436,7 @@ impl Db {
                  ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
             )?;
 
-            for (offset, data) in &coalesced {
+            for (offset, data) in writes {
                 if data.is_empty() {
                     continue;
                 }
@@ -496,6 +494,45 @@ impl Db {
         tx.commit()?;
 
         Ok(written as u32)
+    }
+
+    pub(crate) fn read_chunk(&self, ino: u64, chunk_index: u64) -> Result<Vec<u8>, DbError> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare_cached(
+            "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
+        )?;
+        let chunk = stmt
+            .query_row(params![ino as i64, chunk_index as i64], |row| row.get(0))
+            .optional()?;
+        Ok(chunk.unwrap_or_default())
+    }
+
+    pub(crate) fn replace_chunks(
+        &self,
+        ino: u64,
+        size: u64,
+        chunks: &BTreeMap<u64, Vec<u8>>,
+    ) -> Result<(), DbError> {
+        let now = now_secs();
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+
+        {
+            let mut write_stmt = tx.prepare_cached(
+                "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
+            )?;
+            for (chunk_index, data) in chunks {
+                write_stmt.execute(params![ino as i64, *chunk_index as i64, data])?;
+            }
+        }
+
+        tx.prepare_cached(
+            "UPDATE inodes SET size = ?1, mtime = ?2, ctime = ?2 WHERE ino = ?3",
+        )?.execute(params![size as i64, now, ino as i64])?;
+        tx.commit()?;
+
+        Ok(())
     }
 
     pub fn truncate_file(&self, ino: u64, size: u64) -> Result<(), DbError> {
@@ -853,65 +890,4 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_secs() as i64
-}
-
-/// Merge overlapping and adjacent writes into non-overlapping spans.
-///
-/// Later writes in the input overwrite earlier ones where they overlap,
-/// preserving correct write-ordering semantics. The returned vec is
-/// sorted by offset with no overlaps.
-fn coalesce_writes(writes: &[(u64, Vec<u8>)]) -> Vec<(u64, Vec<u8>)> {
-    if writes.len() <= 1 {
-        return writes.to_vec();
-    }
-
-    let mut result: Vec<(u64, Vec<u8>)> = Vec::new();
-
-    for (offset, data) in writes {
-        if data.is_empty() {
-            continue;
-        }
-
-        let end = *offset + data.len() as u64;
-        let mut next = Vec::with_capacity(result.len() + 1);
-
-        for (span_offset, span_data) in result {
-            let span_end = span_offset + span_data.len() as u64;
-
-            if span_end <= *offset || span_offset >= end {
-                next.push((span_offset, span_data));
-                continue;
-            }
-
-            if span_offset < *offset {
-                let left_len = (*offset - span_offset) as usize;
-                next.push((span_offset, span_data[..left_len].to_vec()));
-            }
-
-            if span_end > end {
-                let right_start = (end - span_offset) as usize;
-                next.push((end, span_data[right_start..].to_vec()));
-            }
-        }
-
-        next.push((*offset, data.to_vec()));
-        result = next;
-    }
-
-    result.sort_by_key(|(offset, _)| *offset);
-
-    let mut merged: Vec<(u64, Vec<u8>)> = Vec::with_capacity(result.len());
-    for (offset, data) in result {
-        if let Some((last_offset, last_data)) = merged.last_mut() {
-            let last_end = *last_offset + last_data.len() as u64;
-            if offset == last_end {
-                last_data.extend_from_slice(&data);
-                continue;
-            }
-        }
-
-        merged.push((offset, data));
-    }
-
-    merged
 }

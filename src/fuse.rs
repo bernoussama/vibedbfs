@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,6 +10,7 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 
+use crate::db::CHUNK_SIZE;
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
@@ -21,7 +23,7 @@ pub struct Dbfs {
 #[derive(Debug, Clone)]
 struct DirtyFile {
     size: u64,
-    writes: Vec<(u64, Vec<u8>)>,
+    chunks: BTreeMap<u64, Vec<u8>>,
 }
 
 impl Dbfs {
@@ -212,17 +214,19 @@ impl Dbfs {
 
         let read_start = offset;
         let read_end = offset + read_len as u64;
-        for (write_offset, data) in &dirty.writes {
-            let write_start = *write_offset;
-            let write_end = write_start + data.len() as u64;
-            let copy_start = read_start.max(write_start);
-            let copy_end = read_end.min(write_end);
+        let chunk_size = CHUNK_SIZE as u64;
+        let chunk_range = read_start / chunk_size..read_end.div_ceil(chunk_size);
+        for (chunk_index, data) in dirty.chunks.range(chunk_range) {
+            let chunk_start = chunk_index * chunk_size;
+            let chunk_end = chunk_start + data.len() as u64;
+            let copy_start = read_start.max(chunk_start);
+            let copy_end = read_end.min(chunk_end);
             if copy_start >= copy_end {
                 continue;
             }
 
             let output_start = (copy_start - read_start) as usize;
-            let data_start = (copy_start - write_start) as usize;
+            let data_start = (copy_start - chunk_start) as usize;
             let copy_len = (copy_end - copy_start) as usize;
             output[output_start..output_start + copy_len]
                 .copy_from_slice(&data[data_start..data_start + copy_len]);
@@ -249,11 +253,33 @@ impl Dbfs {
             let size = self.db.get_inode(ino).map(|i| i.size).unwrap_or(0);
             DirtyFile {
                 size,
-                writes: Vec::new(),
+                chunks: BTreeMap::new(),
             }
         });
-        dirty.size = dirty.size.max(offset + data.len() as u64);
-        dirty.writes.push((offset, data.to_vec()));
+
+        let mut written = 0;
+        while written < data.len() {
+            let position = offset + written as u64;
+            let chunk_index = position / CHUNK_SIZE as u64;
+            let chunk_offset = (position % CHUNK_SIZE as u64) as usize;
+            let len = (CHUNK_SIZE - chunk_offset).min(data.len() - written);
+            let chunk = match dirty.chunks.entry(chunk_index) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) if len == CHUNK_SIZE => entry.insert(Vec::new()),
+                Entry::Vacant(entry) => entry.insert(
+                    self.db
+                        .read_chunk(ino, chunk_index)
+                        .map_err(errno_from_db_error)?,
+                ),
+            };
+            let chunk_end = chunk_offset + len;
+            if chunk.len() < chunk_end {
+                chunk.resize(chunk_end, 0);
+            }
+            chunk[chunk_offset..chunk_end].copy_from_slice(&data[written..written + len]);
+            written += len;
+            dirty.size = dirty.size.max(offset + written as u64);
+        }
 
         Ok(data.len() as u32)
     }
@@ -263,8 +289,8 @@ impl Dbfs {
             return Ok(());
         };
 
-        match self.db.write_file_batch(ino, &dirty.writes) {
-            Ok(_) => Ok(()),
+        match self.db.replace_chunks(ino, dirty.size, &dirty.chunks) {
+            Ok(()) => Ok(()),
             Err(error) => {
                 self.dirty_files.borrow_mut().insert(ino, dirty);
                 Err(errno_from_db_error(error))
