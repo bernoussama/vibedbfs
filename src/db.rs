@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs::File;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
@@ -41,6 +43,17 @@ impl Db {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         Self::initialize(conn)
+    }
+
+    pub(crate) fn sync_durable(&self) -> Result<(), DbError> {
+        let path = {
+            let conn = self.conn.borrow();
+            match conn.path() {
+                Some(path) if !path.is_empty() && path != ":memory:" => path.to_owned(),
+                _ => return Ok(()),
+            }
+        };
+        sync_database_file(Path::new(&path)).map_err(|error| DbError::Sqlite(error.to_string()))
     }
 
     pub fn pragma_i64(&self, name: &str) -> Result<i64, DbError> {
@@ -813,6 +826,21 @@ impl Db {
 
         Ok(false)
     }
+}
+
+fn sync_database_file(db_path: &Path) -> std::io::Result<()> {
+    let wal_path = path_with_suffix(db_path, "-wal");
+    match File::open(&wal_path) {
+        Ok(file) => file.sync_data(),
+        Err(error) if error.kind() == ErrorKind::NotFound => File::open(db_path)?.sync_data(),
+        Err(error) => Err(error),
+    }
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 fn pragma_query(name: &str) -> Result<String, DbError> {
