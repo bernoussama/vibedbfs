@@ -152,6 +152,8 @@
 
 ## Flush Data Flow (on close/fsync)
 
+Close flushes dirty bytes into SQLite. `fsync` does that flush and then calls `fdatasync` on the WAL file, or on the main database file when no WAL file is present.
+
 ```
  User: close(fd)  or  fsync(fd)
                 │

@@ -273,12 +273,8 @@ impl Dbfs {
     }
 
     fn sync_file(&self, ino: u64) -> Result<(), i32> {
-        let had_dirty = self.dirty_files.borrow().contains_key(&ino);
         self.flush_file(ino)?;
-        if had_dirty {
-            self.db.sync_durable().map_err(errno_from_db_error)?;
-        }
-        Ok(())
+        self.db.sync_durable().map_err(errno_from_db_error)
     }
 
     pub fn release_file(&self, ino: u64) -> Result<(), i32> {

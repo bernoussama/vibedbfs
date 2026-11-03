@@ -52,7 +52,7 @@ PRAGMA wal_autocheckpoint = 10000;
 
 File data is stored in 64 KiB chunk rows in SQLite. FUSE writes are buffered in memory and flushed to SQLite on `flush`, `fsync`, or `release`, which lets buffered write workloads avoid one SQLite transaction per small write. Overlapping dirty writes are coalesced before flush, and full-chunk writes skip the read-modify-write cycle. All SQL queries use prepared statement caching to avoid re-parsing.
 
-Important caveat: `fsync` currently flushes dbfs dirty writes into SQLite, but SQLite still runs with `synchronous = NORMAL`. This is not the strongest crash-durability mode.
+`flush` and `release` commit under `synchronous = NORMAL`. `fsync` also calls `fdatasync` on the WAL file, or on the main database file when no WAL file is present, so the committed bytes reach the host.
 
 ## Test
 
