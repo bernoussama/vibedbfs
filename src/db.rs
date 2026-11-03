@@ -22,6 +22,12 @@ pub struct Db {
     inode_kinds: RefCell<HashMap<u64, FileKind>>,
 }
 
+#[derive(Clone, Copy)]
+enum NewNode<'a> {
+    Plain,
+    Symlink(&'a [u8]),
+}
+
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
@@ -234,7 +240,15 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        self.create_node(parent_ino, name, FileKind::Directory, mode, uid, gid)
+        self.create_node(
+            parent_ino,
+            name,
+            FileKind::Directory,
+            mode,
+            uid,
+            gid,
+            NewNode::Plain,
+        )
     }
 
     pub fn create_file(
@@ -245,7 +259,15 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        self.create_node(parent_ino, name, FileKind::RegularFile, mode, uid, gid)
+        self.create_node(
+            parent_ino,
+            name,
+            FileKind::RegularFile,
+            mode,
+            uid,
+            gid,
+            NewNode::Plain,
+        )
     }
 
     pub fn create_symlink(
@@ -256,21 +278,15 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        let inode = self.create_node(parent_ino, name, FileKind::Symlink, 0o777, uid, gid)?;
-
-        let conn = self.conn.borrow();
-        conn.prepare_cached(
-            "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
-        )?.execute(params![inode.ino as i64, target])?;
-
-        conn.prepare_cached(
-            "UPDATE inodes SET size = ?1 WHERE ino = ?2",
-        )?.execute(params![target.len() as i64, inode.ino as i64])?;
-
-        Ok(Inode {
-            size: target.len() as u64,
-            ..inode
-        })
+        self.create_node(
+            parent_ino,
+            name,
+            FileKind::Symlink,
+            0o777,
+            uid,
+            gid,
+            NewNode::Symlink(target),
+        )
     }
 
     pub fn read_symlink(&self, ino: u64) -> Result<Vec<u8>, DbError> {
@@ -743,25 +759,36 @@ impl Db {
         mode: u32,
         uid: u32,
         gid: u32,
+        extra: NewNode<'_>,
     ) -> Result<Inode, DbError> {
         if self.get_inode(parent_ino)?.kind != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
 
         let now = now_secs();
+        let size = match extra {
+            NewNode::Plain => 0,
+            NewNode::Symlink(target) => target.len() as u64,
+        };
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
 
         tx.prepare_cached(
             "INSERT INTO inodes (kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, 1)",
-        )?.execute(params![kind.as_i64(), mode, uid, gid, now])?;
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, 1)",
+        )?.execute(params![kind.as_i64(), mode, uid, gid, size as i64, now])?;
         let ino = tx.last_insert_rowid() as u64;
 
         if let Err(error) = tx.prepare_cached(
             "INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)",
         ).and_then(|mut s| s.execute(params![parent_ino as i64, name, ino as i64])) {
             return Err(error.into());
+        }
+
+        if let NewNode::Symlink(target) = extra {
+            tx.prepare_cached(
+                "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
+            )?.execute(params![ino as i64, target])?;
         }
 
         tx.prepare_cached(
@@ -775,7 +802,7 @@ impl Db {
             mode,
             uid,
             gid,
-            size: 0,
+            size,
             atime: now,
             mtime: now,
             ctime: now,
