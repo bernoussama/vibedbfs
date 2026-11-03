@@ -121,6 +121,7 @@ impl Db {
              WHERE ino = 1 AND uid = 0 AND gid = 0",
             params![mount_uid, mount_gid, now],
         )?;
+        conn.execute("DELETE FROM inodes WHERE nlink = 0 AND ino != 1", [])?;
 
         Ok(Self {
             conn: RefCell::new(conn),
