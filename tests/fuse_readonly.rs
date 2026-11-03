@@ -290,6 +290,50 @@ fn mount_options_do_not_require_allow_other() {
 }
 
 #[test]
+fn directory_nlink_counts_subdirectories() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let fs = Dbfs::new(db);
+
+    assert_eq!(fs.getattr(1).expect("root").nlink, 2);
+
+    let docs = fs
+        .mkdir(1, b"docs", 0o755, 0, 1000, 1000)
+        .expect("mkdir docs");
+    assert_eq!(docs.nlink, 2);
+    assert_eq!(fs.getattr(1).expect("root after docs").nlink, 3);
+
+    fs.mkdir(docs.ino, b"nested", 0o755, 0, 1000, 1000)
+        .expect("mkdir nested");
+    assert_eq!(fs.getattr(docs.ino).expect("docs after nested").nlink, 3);
+    assert_eq!(fs.getattr(1).expect("root ignores nested").nlink, 3);
+
+    fs.create(1, b"notes.txt", 0o644, 0, 1000, 1000)
+        .expect("create file");
+    assert_eq!(fs.getattr(1).expect("root ignores file").nlink, 3);
+
+    let other = fs
+        .mkdir(1, b"other", 0o755, 0, 1000, 1000)
+        .expect("mkdir other");
+    assert_eq!(fs.getattr(1).expect("root after other").nlink, 4);
+
+    fs.rename(docs.ino, b"nested", other.ino, b"nested")
+        .expect("move nested");
+    assert_eq!(fs.getattr(docs.ino).expect("docs after move").nlink, 2);
+    assert_eq!(fs.getattr(other.ino).expect("other after move").nlink, 3);
+    assert_eq!(fs.getattr(1).expect("root after move").nlink, 4);
+
+    fs.rmdir(other.ino, b"nested").expect("remove nested");
+    assert_eq!(fs.getattr(other.ino).expect("other after rmdir").nlink, 2);
+
+    fs.rename(1, b"docs", 1, b"other")
+        .expect("replace empty directory");
+    assert_eq!(fs.getattr(1).expect("root after replace").nlink, 3);
+
+    fs.rmdir(1, b"other").expect("remove remaining directory");
+    assert_eq!(fs.getattr(1).expect("root after rmdir").nlink, 2);
+}
+
+#[test]
 fn creates_directory_through_fuse_helper() {
     let db = Db::open_in_memory().expect("open in-memory database");
     let fs = Dbfs::new(db);

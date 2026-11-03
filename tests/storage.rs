@@ -23,7 +23,7 @@ fn initializes_root_directory_inode() {
     assert_eq!(root.ino, 1);
     assert_eq!(root.kind, FileKind::Directory);
     assert_eq!(root.size, 0);
-    assert_eq!(root.nlink, 1);
+    assert_eq!(root.nlink, 2);
 }
 
 #[test]
@@ -150,6 +150,52 @@ fn legacy_second_timestamps_read_back_with_zero_nsec() {
     assert_eq!(attr.atime, UNIX_EPOCH + Duration::new(111, 0));
     assert_eq!(attr.mtime, UNIX_EPOCH + Duration::new(222, 0));
     assert_eq!(attr.ctime, UNIX_EPOCH + Duration::new(333, 0));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
+fn legacy_directory_nlink_counts_subdirectories() {
+    let path = temp_db_path("legacy-nlink");
+    {
+        let conn = Connection::open(&path).expect("open raw sqlite connection");
+        conn.execute_batch(
+            "
+            CREATE TABLE inodes (
+              ino INTEGER PRIMARY KEY,
+              kind INTEGER NOT NULL,
+              mode INTEGER NOT NULL,
+              uid INTEGER NOT NULL,
+              gid INTEGER NOT NULL,
+              size INTEGER NOT NULL,
+              atime INTEGER NOT NULL,
+              mtime INTEGER NOT NULL,
+              ctime INTEGER NOT NULL,
+              nlink INTEGER NOT NULL
+            );
+            CREATE TABLE dirents (
+              parent_ino INTEGER NOT NULL,
+              name BLOB NOT NULL,
+              child_ino INTEGER NOT NULL,
+              PRIMARY KEY (parent_ino, name)
+            );
+            INSERT INTO inodes
+              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              VALUES (1, 2, 493, 1, 1, 0, 1, 1, 1, 1);
+            INSERT INTO inodes
+              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              VALUES (2, 2, 493, 1, 1, 0, 1, 1, 1, 1);
+            INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, 'docs', 2);
+            ",
+        )
+        .expect("create legacy directories");
+    }
+
+    let db = Db::open(&path).expect("open legacy database");
+    assert_eq!(db.get_inode(1).expect("root").nlink, 3);
+    assert_eq!(db.get_inode(2).expect("docs").nlink, 2);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
