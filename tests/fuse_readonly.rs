@@ -326,6 +326,48 @@ fn release_flushes_buffered_fuse_writes() {
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }
 
+#[test]
+fn buffered_overlapping_writes_read_back_in_write_order() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let persisted = vec![b'a'; 70_000];
+    db.write_file(file.ino, 0, &persisted)
+        .expect("write persisted data");
+    let fs = Dbfs::new(db);
+
+    let writes: [(usize, &[u8]); 4] = [
+        (65_530, b"BBBBBBBBBBBB"),
+        (65_534, b"CC"),
+        (10, b"DDDD"),
+        (80_000, b"EE"),
+    ];
+    let mut expected = persisted;
+    for (offset, data) in writes {
+        fs.write(file.ino, offset as u64, data)
+            .expect("buffer write");
+        if expected.len() < offset + data.len() {
+            expected.resize(offset + data.len(), 0);
+        }
+        expected[offset..offset + data.len()].copy_from_slice(data);
+    }
+
+    assert_eq!(
+        fs.read(file.ino, 0, 100_000).expect("read buffered file"),
+        expected
+    );
+    fs.flush_file(file.ino).expect("flush file");
+    assert_eq!(
+        fs.read(file.ino, 0, 100_000).expect("read flushed file"),
+        expected
+    );
+    assert_eq!(
+        fs.getattr(file.ino).expect("flushed attr").size,
+        expected.len() as u64
+    );
+}
+
 fn raw_inode_size(path: &std::path::Path, ino: u64) -> i64 {
     Connection::open(path)
         .expect("open raw sqlite connection")
