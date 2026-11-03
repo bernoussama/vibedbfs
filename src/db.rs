@@ -365,7 +365,7 @@ impl Db {
             return Ok(Vec::new());
         }
 
-        let read_len = size.min((inode.size - offset) as u32) as usize;
+        let read_len = (size as u64).min(inode.size - offset) as usize;
         let mut output = vec![0; read_len];
         let conn = self.conn.borrow();
 
