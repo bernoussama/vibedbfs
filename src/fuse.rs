@@ -272,6 +272,11 @@ impl Dbfs {
         }
     }
 
+    fn sync_file(&self, ino: u64) -> Result<(), i32> {
+        self.flush_file(ino)?;
+        self.db.sync_durable().map_err(errno_from_db_error)
+    }
+
     pub fn release_file(&self, ino: u64) -> Result<(), i32> {
         let flushed = self.flush_file(ino);
         self.db.release_file(ino);
@@ -538,7 +543,7 @@ impl Filesystem for Dbfs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.flush_file(ino) {
+        match self.sync_file(ino) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
