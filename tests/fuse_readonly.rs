@@ -1,7 +1,7 @@
 use dbfs::{Db, Dbfs, DbfsDirEntry, FileKind, mount_options};
 use fuser::{FileType, MountOption};
 use rusqlite::{Connection, params};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -366,6 +366,102 @@ fn buffered_overlapping_writes_read_back_in_write_order() {
         fs.getattr(file.ino).expect("flushed attr").size,
         expected.len() as u64
     );
+}
+
+#[test]
+fn read_with_dirty_size_past_4gib_returns_the_marker() {
+    const FOUR_GIB: u64 = 1 << 32;
+    let marker_at = FOUR_GIB + 64;
+    let path = disk_db_path("dirty-read-past-4gib");
+    let db = Db::open(&path).expect("open file-backed database");
+    let file = db
+        .create_file(1, b"sparse.bin", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    fs.write(file.ino, marker_at, b"MARK")
+        .expect("buffer marker");
+    fs.write(file.ino, marker_at + FOUR_GIB, b"X")
+        .expect("extend dirty size by 4 GiB");
+
+    let data = fs.read(file.ino, marker_at, 4).expect("read marker");
+
+    assert_eq!(data, b"MARK");
+    remove_db(&path);
+}
+
+#[test]
+fn release_after_failed_flush_deletes_inode_unlinked_while_open() {
+    let path = disk_db_path("release-flush-fail");
+    let db = Db::open(&path).expect("open file-backed database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let ino = file.ino;
+    db.open_file(ino, FileKind::RegularFile);
+    db.open_file(ino, FileKind::RegularFile);
+    let fs = Dbfs::new(db);
+
+    fs.unlink(1, b"notes.txt").expect("unlink while open");
+    fs.write(ino, 0, b"dirty").expect("buffer a write");
+    exec_sql(
+        &path,
+        "CREATE TRIGGER reject_chunk_insert
+         BEFORE INSERT ON file_chunks
+         BEGIN
+           SELECT RAISE(ABORT, 'reject chunk');
+         END;",
+    );
+
+    assert!(
+        fs.release_file(ino).is_err(),
+        "first release reports the flush error"
+    );
+    assert!(
+        fs.getattr(ino).is_ok(),
+        "the other handle still keeps the inode"
+    );
+
+    assert!(
+        fs.release_file(ino).is_err(),
+        "last release still reports the flush error"
+    );
+    assert_eq!(fs.getattr(ino), Err(libc::ENOENT));
+
+    exec_sql(&path, "DROP TRIGGER reject_chunk_insert;");
+    assert!(
+        fs.release_file(ino).is_ok(),
+        "a later release finishes with the dirty buffer gone"
+    );
+    remove_db(&path);
+}
+
+fn disk_db_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".bench")
+        .join("correctness");
+    std::fs::create_dir_all(&dir).expect("create disk-backed test directory");
+    dir.join(format!(
+        "dbfs-fuse-{name}-{}-{nanos}.sqlite",
+        std::process::id()
+    ))
+}
+
+fn remove_db(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+fn exec_sql(path: &Path, sql: &str) {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("set busy timeout");
+    conn.execute_batch(sql).expect("execute sql");
 }
 
 fn raw_inode_size(path: &std::path::Path, ino: u64) -> i64 {

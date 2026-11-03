@@ -205,7 +205,7 @@ impl Dbfs {
             return Ok(Vec::new());
         }
 
-        let read_len = size.min((dirty.size - offset) as u32) as usize;
+        let read_len = (size as u64).min(dirty.size - offset) as usize;
         let mut output = vec![0; read_len];
         let persisted = self
             .db
@@ -308,10 +308,18 @@ impl Dbfs {
         }
     }
 
-    pub fn release_file(&self, ino: u64) -> Result<(), i32> {
+    fn sync_file(&self, ino: u64) -> Result<(), i32> {
         self.flush_file(ino)?;
+        self.db.sync_durable().map_err(errno_from_db_error)
+    }
+
+    pub fn release_file(&self, ino: u64) -> Result<(), i32> {
+        let flushed = self.flush_file(ino);
         self.db.release_file(ino);
-        Ok(())
+        if flushed.is_err() && self.db.get_inode(ino).is_err() {
+            self.dirty_files.borrow_mut().remove(&ino);
+        }
+        flushed
     }
 
     pub fn unlink(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
@@ -571,7 +579,7 @@ impl Filesystem for Dbfs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.flush_file(ino) {
+        match self.sync_file(ino) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
