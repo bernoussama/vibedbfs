@@ -239,8 +239,8 @@ impl Dbfs {
             Some(k) => k,
             None => self.db.get_inode(ino).map_err(errno_from_db_error)?.kind,
         };
-        if kind != FileKind::RegularFile {
-            return Err(libc::ENOENT);
+        if let Some(error) = kind.regular_file_error() {
+            return Err(errno_from_db_error(error));
         }
 
         let modified = Timestamp::from_system_time(SystemTime::now());
@@ -704,6 +704,8 @@ fn errno_from_db_error(error: DbError) -> i32 {
         DbError::DirectoryNotEmpty => libc::ENOTEMPTY,
         DbError::InvalidInput => libc::EINVAL,
         DbError::IsDirectory => libc::EISDIR,
+        DbError::NameTooLong => libc::ENAMETOOLONG,
+        DbError::NoSpace => libc::ENOSPC,
         DbError::NotDirectory => libc::ENOTDIR,
         DbError::Corrupt | DbError::Sqlite(_) => libc::EIO,
     }

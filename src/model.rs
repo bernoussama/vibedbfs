@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Error as SqlError, ErrorCode};
+use rusqlite::{Error as SqlError, ErrorCode, ffi};
 
 /// Seconds and nanoseconds since the Unix epoch.
 ///
@@ -59,6 +59,14 @@ impl FileKind {
             _ => Err(DbError::Corrupt),
         }
     }
+
+    pub(crate) fn regular_file_error(self) -> Option<DbError> {
+        match self {
+            Self::RegularFile => None,
+            Self::Directory => Some(DbError::IsDirectory),
+            Self::Symlink => Some(DbError::InvalidInput),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +105,8 @@ pub enum DbError {
     DirectoryNotEmpty,
     InvalidInput,
     IsDirectory,
+    NameTooLong,
+    NoSpace,
     NotDirectory,
     NotFound,
     Corrupt,
@@ -107,10 +117,23 @@ impl From<SqlError> for DbError {
     fn from(error: SqlError) -> Self {
         match error {
             SqlError::QueryReturnedNoRows => Self::NotFound,
-            SqlError::SqliteFailure(err, _) if err.code == ErrorCode::ConstraintViolation => {
-                Self::AlreadyExists
-            }
+            SqlError::SqliteFailure(err, message) => sqlite_failure(err, message),
             other => Self::Sqlite(other.to_string()),
         }
     }
+}
+
+fn sqlite_failure(err: ffi::Error, message: Option<String>) -> DbError {
+    if err.code == ErrorCode::DiskFull || err.extended_code == ffi::SQLITE_FULL {
+        return DbError::NoSpace;
+    }
+    if err.code == ErrorCode::ConstraintViolation
+        && matches!(
+            err.extended_code,
+            ffi::SQLITE_CONSTRAINT_PRIMARYKEY | ffi::SQLITE_CONSTRAINT_UNIQUE
+        )
+    {
+        return DbError::AlreadyExists;
+    }
+    DbError::Sqlite(SqlError::SqliteFailure(err, message).to_string())
 }

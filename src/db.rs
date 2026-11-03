@@ -149,6 +149,7 @@ impl Db {
     }
 
     pub fn lookup(&self, parent_ino: u64, name: &[u8]) -> Result<Inode, DbError> {
+        check_name(name)?;
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare_cached(
             "SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.nlink,
@@ -329,6 +330,7 @@ impl Db {
     }
 
     pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &[u8]) -> Result<Inode, DbError> {
+        check_name(new_name)?;
         let inode = self.get_inode(ino)?;
         if inode.kind == FileKind::Directory {
             return Err(DbError::IsDirectory);
@@ -368,8 +370,8 @@ impl Db {
 
     pub fn read_file(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, DbError> {
         let inode = self.get_inode(ino)?;
-        if inode.kind != FileKind::RegularFile {
-            return Err(DbError::NotFound);
+        if let Some(error) = inode.kind.regular_file_error() {
+            return Err(error);
         }
         if offset >= inode.size || size == 0 {
             return Ok(Vec::new());
@@ -430,8 +432,8 @@ impl Db {
         modified: Timestamp,
     ) -> Result<u32, DbError> {
         let inode = self.get_inode(ino)?;
-        if inode.kind != FileKind::RegularFile {
-            return Err(DbError::NotFound);
+        if let Some(error) = inode.kind.regular_file_error() {
+            return Err(error);
         }
         if writes.iter().all(|(_, data)| data.is_empty()) {
             return Ok(0);
@@ -520,8 +522,8 @@ impl Db {
 
     pub fn truncate_file(&self, ino: u64, size: u64) -> Result<(), DbError> {
         let inode = self.get_inode(ino)?;
-        if inode.kind != FileKind::RegularFile {
-            return Err(DbError::NotFound);
+        if let Some(error) = inode.kind.regular_file_error() {
+            return Err(error);
         }
 
         let now = now_ts();
@@ -636,6 +638,7 @@ impl Db {
         new_parent_ino: u64,
         new_name: &[u8],
     ) -> Result<(), DbError> {
+        check_name(new_name)?;
         let source = self.lookup(parent_ino, name)?;
         if self.get_inode(new_parent_ino)?.kind != FileKind::Directory {
             return Err(DbError::NotDirectory);
@@ -795,6 +798,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
+        check_name(name)?;
         if self.get_inode(parent_ino)?.kind != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
@@ -862,6 +866,16 @@ impl Db {
         }
 
         Ok(false)
+    }
+}
+
+const NAME_MAX: usize = 255;
+
+fn check_name(name: &[u8]) -> Result<(), DbError> {
+    if name.len() > NAME_MAX {
+        Err(DbError::NameTooLong)
+    } else {
+        Ok(())
     }
 }
 
