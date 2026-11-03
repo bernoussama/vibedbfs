@@ -420,6 +420,15 @@ impl Db {
     }
 
     pub fn write_file_batch(&self, ino: u64, writes: &[(u64, Vec<u8>)]) -> Result<u32, DbError> {
+        self.write_file_batch_at(ino, writes, now_ts())
+    }
+
+    pub(crate) fn write_file_batch_at(
+        &self,
+        ino: u64,
+        writes: &[(u64, Vec<u8>)],
+        modified: Timestamp,
+    ) -> Result<u32, DbError> {
         let inode = self.get_inode(ino)?;
         if inode.kind != FileKind::RegularFile {
             return Err(DbError::NotFound);
@@ -430,7 +439,6 @@ impl Db {
 
         let coalesced = coalesce_writes(writes);
 
-        let now = now_ts();
         let mut new_size = inode.size;
         let mut written = 0usize;
 
@@ -501,8 +509,8 @@ impl Db {
         )?
         .execute(params![
             new_size as i64,
-            now.secs,
-            now.nsec as i64,
+            modified.secs,
+            modified.nsec as i64,
             ino as i64
         ])?;
         tx.commit()?;

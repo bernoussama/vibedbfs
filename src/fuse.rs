@@ -22,6 +22,7 @@ pub struct Dbfs {
 struct DirtyFile {
     size: u64,
     writes: Vec<(u64, Vec<u8>)>,
+    mtime: Timestamp,
 }
 
 impl Dbfs {
@@ -39,8 +40,7 @@ impl Dbfs {
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
         if let Some(dirty) = self.dirty_files.borrow().get(&ino) {
-            attr.size = dirty.size;
-            attr.blocks = dirty.size.div_ceil(512);
+            overlay_dirty(&mut attr, dirty);
         }
         Ok(attr)
     }
@@ -52,8 +52,7 @@ impl Dbfs {
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
         if let Some(dirty) = self.dirty_files.borrow().get(&attr.ino) {
-            attr.size = dirty.size;
-            attr.blocks = dirty.size.div_ceil(512);
+            overlay_dirty(&mut attr, dirty);
         }
         Ok(attr)
     }
@@ -244,14 +243,17 @@ impl Dbfs {
             return Err(libc::ENOENT);
         }
 
+        let modified = Timestamp::from_system_time(SystemTime::now());
         let mut dirty_files = self.dirty_files.borrow_mut();
         let dirty = dirty_files.entry(ino).or_insert_with(|| {
             let size = self.db.get_inode(ino).map(|i| i.size).unwrap_or(0);
             DirtyFile {
                 size,
                 writes: Vec::new(),
+                mtime: modified,
             }
         });
+        dirty.mtime = modified;
         dirty.size = dirty.size.max(offset + data.len() as u64);
         dirty.writes.push((offset, data.to_vec()));
 
@@ -263,7 +265,7 @@ impl Dbfs {
             return Ok(());
         };
 
-        match self.db.write_file_batch(ino, &dirty.writes) {
+        match self.db.write_file_batch_at(ino, &dirty.writes, dirty.mtime) {
             Ok(_) => Ok(()),
             Err(error) => {
                 self.dirty_files.borrow_mut().insert(ino, dirty);
@@ -705,6 +707,14 @@ fn errno_from_db_error(error: DbError) -> i32 {
         DbError::NotDirectory => libc::ENOTDIR,
         DbError::Corrupt | DbError::Sqlite(_) => libc::EIO,
     }
+}
+
+fn overlay_dirty(attr: &mut FileAttr, dirty: &DirtyFile) {
+    attr.size = dirty.size;
+    attr.blocks = dirty.size.div_ceil(512);
+    let modified = dirty.mtime.to_system_time();
+    attr.mtime = modified;
+    attr.ctime = modified;
 }
 
 fn time_or_now(time: Option<TimeOrNow>) -> Option<SystemTime> {
