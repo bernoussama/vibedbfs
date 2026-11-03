@@ -176,3 +176,35 @@ fn fsync_of_dirty_data_fdatasyncs_the_wal() {
         b"durable"
     );
 }
+
+#[test]
+fn fsync_of_a_clean_file_fdatasyncs_the_wal() {
+    if !supports_fuse_trace() {
+        return;
+    }
+
+    let dir = work_dir("clean-fsync");
+    let db = dir.join("db.sqlite");
+    let mountpoint = dir.join("mnt");
+    let mounted = Mounted::start(&db, &mountpoint);
+    let file = mountpoint.join("notes.txt");
+    {
+        let mut initial = File::create(&file).expect("create file");
+        initial
+            .write_all(b"kept")
+            .expect("commit bytes before the traced fsync");
+    }
+
+    let log_path = dir.join("strace.log");
+    mounted.trace_syncs(&log_path, || {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&file)
+            .expect("reopen clean file");
+        file.sync_all().expect("fsync clean file");
+    });
+
+    let log = fs::read_to_string(&log_path).expect("read strace log");
+    assert_wal_synced(&log, &db);
+    assert_eq!(fs::read(&file).expect("read file after fsync"), b"kept");
+}
