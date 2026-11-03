@@ -681,6 +681,62 @@ fn reopen_drops_inodes_left_unlinked_while_open() {
     remove_db(&path);
 }
 
+#[test]
+fn failed_symlink_create_leaves_no_dirent_or_inode() {
+    let path = disk_db_path("symlink-rollback");
+    {
+        let db = Db::open(&path).expect("open file-backed database");
+        db.create_file(1, b"keep.txt", 0o644, 1000, 1000)
+            .expect("create file that must stay");
+    }
+    exec_sql(
+        &path,
+        "CREATE TRIGGER reject_symlink_target_insert
+         BEFORE INSERT ON symlink_targets
+         BEGIN
+           SELECT RAISE(ABORT, 'reject symlink target');
+         END;",
+    );
+
+    {
+        let db = Db::open(&path).expect("reopen with rejecting trigger");
+        let created = db.create_symlink(1, b"link", b"target-path", 1000, 1000);
+        assert!(
+            created.is_err(),
+            "symlink create reports the failed target insert"
+        );
+        assert_eq!(db.lookup(1, b"link"), Err(DbError::NotFound));
+        let entries = db.list_dir(1).expect("list root");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"keep.txt");
+        assert_eq!(
+            db.lookup(1, b"keep.txt").expect("kept file").kind,
+            FileKind::RegularFile
+        );
+    }
+    assert_eq!(
+        query_i64(&path, "SELECT COUNT(*) FROM inodes WHERE ino != 1"),
+        1
+    );
+    assert_eq!(query_i64(&path, "SELECT COUNT(*) FROM dirents"), 1);
+    assert_eq!(query_i64(&path, "SELECT COUNT(*) FROM symlink_targets"), 0);
+
+    exec_sql(&path, "DROP TRIGGER reject_symlink_target_insert;");
+    {
+        let db = Db::open(&path).expect("reopen after dropping trigger");
+        let link = db
+            .create_symlink(1, b"link", b"target-path", 1000, 1000)
+            .expect("symlink create commits the node and the target together");
+        assert_eq!(
+            db.read_symlink(link.ino).expect("read symlink"),
+            b"target-path"
+        );
+        assert_eq!(link.size, b"target-path".len() as u64);
+        assert_eq!(db.lookup(1, b"link").expect("lookup symlink").ino, link.ino);
+    }
+    remove_db(&path);
+}
+
 fn disk_db_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -703,4 +759,17 @@ fn count_rows(path: &Path, sql: &str, ino: u64) -> i64 {
     let conn = Connection::open(path).expect("open raw sqlite");
     conn.query_row(sql, params![ino as i64], |row| row.get(0))
         .expect("count rows")
+}
+
+fn query_i64(path: &Path, sql: &str) -> i64 {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    conn.query_row(sql, [], |row| row.get(0))
+        .expect("query scalar")
+}
+
+fn exec_sql(path: &Path, sql: &str) {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("set busy timeout");
+    conn.execute_batch(sql).expect("execute sql");
 }
