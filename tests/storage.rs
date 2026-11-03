@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dbfs::{Db, DbError, FileKind, MetadataUpdate};
@@ -584,4 +584,43 @@ fn metadata_update_leaves_unspecified_fields_unchanged() {
     assert_eq!(updated.gid, file.gid);
     assert_eq!(updated.atime, file.atime);
     assert_eq!(updated.mtime, file.mtime);
+}
+
+#[test]
+fn read_past_4gib_returns_the_marker_near_that_offset() {
+    const FOUR_GIB: u64 = 1 << 32;
+    let marker_at = FOUR_GIB + 64;
+    let path = disk_db_path("read-past-4gib");
+    let db = Db::open(&path).expect("open file-backed database");
+    let file = db
+        .create_file(1, b"sparse.bin", 0o644, 1000, 1000)
+        .expect("create file");
+
+    db.truncate_file(file.ino, marker_at + FOUR_GIB)
+        .expect("extend sparse file");
+    db.write_file(file.ino, marker_at, b"MARK")
+        .expect("write marker");
+
+    let data = db.read_file(file.ino, marker_at, 4).expect("read marker");
+
+    assert_eq!(data, b"MARK");
+    remove_db(&path);
+}
+
+fn disk_db_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".bench")
+        .join("correctness");
+    std::fs::create_dir_all(&dir).expect("create disk-backed test directory");
+    dir.join(format!("dbfs-{name}-{}-{nanos}.sqlite", std::process::id()))
+}
+
+fn remove_db(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }

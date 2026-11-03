@@ -1,7 +1,7 @@
 use dbfs::{Db, Dbfs, DbfsDirEntry, FileKind, mount_options};
 use fuser::{FileType, MountOption};
 use rusqlite::{Connection, params};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -322,6 +322,49 @@ fn release_flushes_buffered_fuse_writes() {
     assert_eq!(raw_inode_size(&path, file.ino), 5);
 
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
+fn read_with_dirty_size_past_4gib_returns_the_marker() {
+    const FOUR_GIB: u64 = 1 << 32;
+    let marker_at = FOUR_GIB + 64;
+    let path = disk_db_path("dirty-read-past-4gib");
+    let db = Db::open(&path).expect("open file-backed database");
+    let file = db
+        .create_file(1, b"sparse.bin", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+
+    fs.write(file.ino, marker_at, b"MARK")
+        .expect("buffer marker");
+    fs.write(file.ino, marker_at + FOUR_GIB, b"X")
+        .expect("extend dirty size by 4 GiB");
+
+    let data = fs.read(file.ino, marker_at, 4).expect("read marker");
+
+    assert_eq!(data, b"MARK");
+    remove_db(&path);
+}
+
+fn disk_db_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".bench")
+        .join("correctness");
+    std::fs::create_dir_all(&dir).expect("create disk-backed test directory");
+    dir.join(format!(
+        "dbfs-fuse-{name}-{}-{nanos}.sqlite",
+        std::process::id()
+    ))
+}
+
+fn remove_db(path: &Path) {
+    let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }
