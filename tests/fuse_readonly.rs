@@ -591,13 +591,7 @@ fn rename_noreplace_leaves_an_existing_target_in_place() {
     let fs = Dbfs::new(db);
 
     let error = fs
-        .rename(
-            1,
-            b"source.txt",
-            1,
-            b"target.txt",
-            libc::RENAME_NOREPLACE,
-        )
+        .rename(1, b"source.txt", 1, b"target.txt", libc::RENAME_NOREPLACE)
         .expect_err("noreplace existing");
     assert_eq!(error, libc::EEXIST);
     assert_eq!(
@@ -606,25 +600,13 @@ fn rename_noreplace_leaves_an_existing_target_in_place() {
     );
     assert_eq!(fs.read(target.ino, 0, 6).expect("target bytes"), b"target");
 
-    fs.rename(
-        1,
-        b"source.txt",
-        1,
-        b"fresh.txt",
-        libc::RENAME_NOREPLACE,
-    )
-    .expect("noreplace missing");
+    fs.rename(1, b"source.txt", 1, b"fresh.txt", libc::RENAME_NOREPLACE)
+        .expect("noreplace missing");
     assert_eq!(fs.lookup(1, b"source.txt"), Err(libc::ENOENT));
     assert_eq!(fs.lookup(1, b"fresh.txt").expect("fresh").ino, source.ino);
 
     let error = fs
-        .rename(
-            1,
-            b"fresh.txt",
-            1,
-            b"target.txt",
-            libc::RENAME_EXCHANGE,
-        )
+        .rename(1, b"fresh.txt", 1, b"target.txt", libc::RENAME_EXCHANGE)
         .expect_err("unknown flag");
     assert_eq!(error, libc::EINVAL);
     assert_eq!(
