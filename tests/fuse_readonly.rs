@@ -303,6 +303,28 @@ fn writes_regular_file_through_fuse_helper() {
 }
 
 #[test]
+fn write_updates_mtime_before_flush() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let old = UNIX_EPOCH + Duration::from_secs(10);
+    fs.setattr(file.ino, None, None, None, None, Some(old), Some(old))
+        .expect("set old times");
+
+    fs.write(file.ino, 0, b"hello").expect("write file");
+    let during = fs.getattr(file.ino).expect("getattr before flush");
+    assert!(during.mtime > old, "mtime advances at write");
+    assert!(during.ctime > old, "ctime advances at write");
+
+    fs.flush_file(file.ino).expect("flush file");
+    let after = fs.getattr(file.ino).expect("getattr after flush");
+    assert_eq!(after.mtime, during.mtime);
+    assert_eq!(after.ctime, during.ctime);
+}
+
+#[test]
 fn buffers_fuse_writes_until_flush() {
     let path = temp_db_path("buffered-write");
     let db = Db::open(&path).expect("open file-backed database");
