@@ -1,8 +1,11 @@
+use std::ffi::CString;
 use std::fs::{self, FileTimes};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rusqlite::Connection;
 
 #[test]
 fn mounted_filesystem_supports_basic_file_lifecycle_when_enabled() {
@@ -66,6 +69,47 @@ fn utimens_round_trips_nanoseconds_when_enabled() {
     assert_eq!(meta.atime_nsec(), 123_456_789, "atime nanoseconds");
     assert_eq!(meta.mtime(), 1_700_000_111, "mtime seconds");
     assert_eq!(meta.mtime_nsec(), 987_654_321, "mtime nanoseconds");
+}
+
+#[test]
+fn statfs_reports_sqlite_blocks_and_inodes_when_enabled() {
+    let Some(mounted) = Mounted::start("statfs") else {
+        return;
+    };
+
+    fs::write(mounted.mountpoint.join("notes.txt"), b"hello").expect("create file through mount");
+
+    let mut stat = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    let path = CString::new(mounted.mountpoint.to_str().expect("utf-8 mount path")).unwrap();
+    let rc = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
+    assert_eq!(rc, 0, "statvfs");
+
+    let conn = Connection::open(&mounted.db_path).expect("open database");
+    let page_size = pragma_u64(&conn, "page_size");
+    let page_count = pragma_u64(&conn, "page_count");
+    let freelist = pragma_u64(&conn, "freelist_count");
+    let files: i64 = conn
+        .query_row("SELECT COUNT(*) FROM inodes", [], |row| row.get(0))
+        .expect("count inodes");
+    let files = files as u64;
+
+    assert_eq!(stat.f_bsize as u64, page_size, "block size");
+    assert_eq!(stat.f_frsize as u64, page_size, "fragment size");
+    assert_eq!(stat.f_blocks, page_count, "block count");
+    assert_eq!(stat.f_bfree, freelist, "free blocks");
+    assert_eq!(stat.f_bavail, freelist, "available blocks");
+    assert_eq!(stat.f_files, files, "inode count");
+    assert!(stat.f_blocks > 0, "block count is derived");
+    assert!(stat.f_files >= 2, "root and the new file are counted");
+    assert_eq!(stat.f_namemax, 255, "name max");
+}
+
+fn pragma_u64(conn: &Connection, name: &str) -> u64 {
+    let sql = format!("PRAGMA {name}");
+    let value: i64 = conn
+        .query_row(&sql, [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("read {name}: {error}"));
+    value as u64
 }
 
 fn command_path(command: &str) -> Option<PathBuf> {
