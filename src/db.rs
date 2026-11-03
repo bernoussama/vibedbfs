@@ -663,6 +663,17 @@ impl Db {
         new_parent_ino: u64,
         new_name: &[u8],
     ) -> Result<(), DbError> {
+        self.rename_entry(parent_ino, name, new_parent_ino, new_name, false)
+    }
+
+    pub(crate) fn rename_entry(
+        &self,
+        parent_ino: u64,
+        name: &[u8],
+        new_parent_ino: u64,
+        new_name: &[u8],
+        noreplace: bool,
+    ) -> Result<(), DbError> {
         check_name(new_name)?;
         let source = self.lookup(parent_ino, name)?;
         if self.get_inode(new_parent_ino)?.kind != FileKind::Directory {
@@ -681,6 +692,10 @@ impl Db {
             Err(DbError::NotFound) => None,
             Err(error) => return Err(error),
         };
+
+        if noreplace && existing_target.is_some() {
+            return Err(DbError::AlreadyExists);
+        }
 
         if let Some(target) = &existing_target {
             match (source.kind, target.kind) {

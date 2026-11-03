@@ -201,7 +201,7 @@ fn names_longer_than_255_bytes_return_enametoolong() {
         .create(1, &max_name, 0o644, 0, 1000, 1000)
         .expect("create 255-byte name");
     assert_eq!(
-        fs.rename(1, &max_name, 1, &too_long)
+        fs.rename(1, &max_name, 1, &too_long, 0)
             .expect_err("rename to long name"),
         libc::ENAMETOOLONG
     );
@@ -316,7 +316,7 @@ fn directory_nlink_counts_subdirectories() {
         .expect("mkdir other");
     assert_eq!(fs.getattr(1).expect("root after other").nlink, 4);
 
-    fs.rename(docs.ino, b"nested", other.ino, b"nested")
+    fs.rename(docs.ino, b"nested", other.ino, b"nested", 0)
         .expect("move nested");
     assert_eq!(fs.getattr(docs.ino).expect("docs after move").nlink, 2);
     assert_eq!(fs.getattr(other.ino).expect("other after move").nlink, 3);
@@ -325,7 +325,7 @@ fn directory_nlink_counts_subdirectories() {
     fs.rmdir(other.ino, b"nested").expect("remove nested");
     assert_eq!(fs.getattr(other.ino).expect("other after rmdir").nlink, 2);
 
-    fs.rename(1, b"docs", 1, b"other")
+    fs.rename(1, b"docs", 1, b"other", 0)
         .expect("replace empty directory");
     assert_eq!(fs.getattr(1).expect("root after replace").nlink, 3);
 
@@ -576,6 +576,65 @@ fn removes_directory_through_fuse_helper() {
 }
 
 #[test]
+fn rename_noreplace_leaves_an_existing_target_in_place() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let source = db
+        .create_file(1, b"source.txt", 0o644, 1000, 1000)
+        .expect("create source");
+    let target = db
+        .create_file(1, b"target.txt", 0o644, 1000, 1000)
+        .expect("create target");
+    db.write_file(source.ino, 0, b"source")
+        .expect("write source");
+    db.write_file(target.ino, 0, b"target")
+        .expect("write target");
+    let fs = Dbfs::new(db);
+
+    let error = fs
+        .rename(
+            1,
+            b"source.txt",
+            1,
+            b"target.txt",
+            libc::RENAME_NOREPLACE,
+        )
+        .expect_err("noreplace existing");
+    assert_eq!(error, libc::EEXIST);
+    assert_eq!(
+        fs.lookup(1, b"source.txt").expect("source remains").ino,
+        source.ino
+    );
+    assert_eq!(fs.read(target.ino, 0, 6).expect("target bytes"), b"target");
+
+    fs.rename(
+        1,
+        b"source.txt",
+        1,
+        b"fresh.txt",
+        libc::RENAME_NOREPLACE,
+    )
+    .expect("noreplace missing");
+    assert_eq!(fs.lookup(1, b"source.txt"), Err(libc::ENOENT));
+    assert_eq!(fs.lookup(1, b"fresh.txt").expect("fresh").ino, source.ino);
+
+    let error = fs
+        .rename(
+            1,
+            b"fresh.txt",
+            1,
+            b"target.txt",
+            libc::RENAME_EXCHANGE,
+        )
+        .expect_err("unknown flag");
+    assert_eq!(error, libc::EINVAL);
+    assert_eq!(
+        fs.lookup(1, b"fresh.txt").expect("fresh kept").ino,
+        source.ino
+    );
+    assert_eq!(fs.read(target.ino, 0, 6).expect("target kept"), b"target");
+}
+
+#[test]
 fn renames_entry_through_fuse_helper() {
     let db = Db::open_in_memory().expect("open in-memory database");
     let file = db
@@ -583,7 +642,7 @@ fn renames_entry_through_fuse_helper() {
         .expect("create file");
     let fs = Dbfs::new(db);
 
-    fs.rename(1, b"old.txt", 1, b"new.txt")
+    fs.rename(1, b"old.txt", 1, b"new.txt", 0)
         .expect("rename file");
 
     assert_eq!(fs.lookup(1, b"old.txt"), Err(libc::ENOENT));

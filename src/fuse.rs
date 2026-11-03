@@ -330,12 +330,23 @@ impl Dbfs {
         name: &[u8],
         new_parent_ino: u64,
         new_name: &[u8],
+        flags: u32,
     ) -> Result<(), i32> {
+        let noreplace = libc::RENAME_NOREPLACE;
+        if flags & !noreplace != 0 {
+            return Err(libc::EINVAL);
+        }
         if let Ok(inode) = self.db.lookup(parent_ino, name) {
             self.flush_file(inode.ino)?;
         }
         self.db
-            .rename(parent_ino, name, new_parent_ino, new_name)
+            .rename_entry(
+                parent_ino,
+                name,
+                new_parent_ino,
+                new_name,
+                flags & noreplace != 0,
+            )
             .map_err(errno_from_db_error)
     }
 
@@ -687,12 +698,14 @@ impl Filesystem for Dbfs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        if flags != 0 {
-            reply.error(libc::EINVAL);
-            return;
-        }
-
-        match Dbfs::rename(self, parent, name.as_bytes(), newparent, newname.as_bytes()) {
+        match Dbfs::rename(
+            self,
+            parent,
+            name.as_bytes(),
+            newparent,
+            newname.as_bytes(),
+            flags,
+        ) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
