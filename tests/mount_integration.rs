@@ -1,4 +1,5 @@
 use std::fs::{self, File};
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -110,6 +111,52 @@ fn close_after_many_small_random_writes_does_not_stall_other_requests_when_enabl
             "block {index} holds wrong data"
         );
     }
+}
+
+#[test]
+fn large_write_keeps_daemon_memory_bounded_when_enabled() {
+    if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || command_path("fusermount3").is_none() {
+        return;
+    }
+
+    const MIB: u64 = 1 << 20;
+    const WRITTEN_MIB: u64 = 512;
+
+    let mount = Mount::start(temp_path("large-write").with_extension("sqlite"));
+    let mut file = File::create(mount.mountpoint.join("large.bin")).expect("create large.bin");
+    let mut block = vec![0u8; MIB as usize];
+    for i in 0..WRITTEN_MIB {
+        block.fill(i as u8);
+        file.write_all(&block).expect("write 1 MiB block");
+    }
+
+    let rss = daemon_rss_bytes(mount.child.id());
+    drop(file);
+    assert!(
+        rss < WRITTEN_MIB * MIB / 4,
+        "daemon RSS was {} MiB after writing {WRITTEN_MIB} MiB",
+        rss / MIB
+    );
+
+    let file = File::open(mount.mountpoint.join("large.bin")).expect("reopen large.bin");
+    assert_eq!(
+        file.metadata().expect("stat large.bin").len(),
+        WRITTEN_MIB * MIB
+    );
+    let mut last = vec![0u8; MIB as usize];
+    file.read_exact_at(&mut last, (WRITTEN_MIB - 1) * MIB)
+        .expect("read last block");
+    assert!(last.iter().all(|&byte| byte == (WRITTEN_MIB - 1) as u8));
+}
+
+fn daemon_rss_bytes(pid: u32) -> u64 {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).expect("read daemon status");
+    let kib: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+        .expect("parse VmRSS");
+    kib * 1024
 }
 
 struct Mount {
