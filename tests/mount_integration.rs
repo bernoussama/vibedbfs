@@ -104,6 +104,58 @@ fn statfs_reports_sqlite_blocks_and_inodes_when_enabled() {
     assert_eq!(stat.f_namemax, 255, "name max");
 }
 
+#[test]
+fn rename_noreplace_does_not_replace_an_existing_target_when_enabled() {
+    let Some(mounted) = Mounted::start("rename-noreplace") else {
+        return;
+    };
+
+    let source = mounted.mountpoint.join("source.txt");
+    let target = mounted.mountpoint.join("target.txt");
+    let fresh = mounted.mountpoint.join("fresh.txt");
+    fs::write(&source, b"source").expect("write source");
+    fs::write(&target, b"target").expect("write target");
+
+    let rc = rename_at(&source, &target, libc::RENAME_NOREPLACE);
+    let error = std::io::Error::last_os_error();
+    assert_eq!(rc, -1, "noreplace of an existing file");
+    assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
+    assert_eq!(fs::read(&source).expect("source remains"), b"source");
+    assert_eq!(fs::read(&target).expect("target unchanged"), b"target");
+
+    let rc = rename_at(&source, &fresh, libc::RENAME_NOREPLACE);
+    assert_eq!(
+        rc,
+        0,
+        "noreplace of a missing file: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(!source.exists());
+    assert_eq!(fs::read(&fresh).expect("fresh contents"), b"source");
+
+    fs::write(&source, b"again").expect("rewrite source");
+    let rc = rename_at(&source, &fresh, libc::RENAME_EXCHANGE);
+    let error = std::io::Error::last_os_error();
+    assert_eq!(rc, -1, "unknown rename flag");
+    assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    assert_eq!(fs::read(&source).expect("source kept"), b"again");
+    assert_eq!(fs::read(&fresh).expect("fresh kept"), b"source");
+}
+
+fn rename_at(from: &Path, to: &Path, flags: libc::c_uint) -> i32 {
+    let from = CString::new(from.to_str().expect("utf-8 source")).unwrap();
+    let to = CString::new(to.to_str().expect("utf-8 target")).unwrap();
+    unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            flags,
+        )
+    }
+}
+
 fn pragma_u64(conn: &Connection, name: &str) -> u64 {
     let sql = format!("PRAGMA {name}");
     let value: i64 = conn
