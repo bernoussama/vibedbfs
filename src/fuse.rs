@@ -9,7 +9,7 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 
-use crate::{Db, DbError, FileKind, Inode, MetadataUpdate};
+use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
 
@@ -156,8 +156,8 @@ impl Dbfs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<i64>,
-        mtime: Option<i64>,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
     ) -> Result<FileAttr, i32> {
         self.flush_file(ino)?;
         if let Some(size) = size {
@@ -173,8 +173,8 @@ impl Dbfs {
                     mode,
                     uid,
                     gid,
-                    atime,
-                    mtime,
+                    atime: atime.map(Timestamp::from_system_time),
+                    mtime: mtime.map(Timestamp::from_system_time),
                 },
             )
             .map(|inode| file_attr_from_inode(&inode))
@@ -279,7 +279,10 @@ impl Dbfs {
     }
 
     pub fn unlink(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
-        let inode = self.db.lookup(parent_ino, name).map_err(errno_from_db_error)?;
+        let inode = self
+            .db
+            .lookup(parent_ino, name)
+            .map_err(errno_from_db_error)?;
         self.flush_file(inode.ino)?;
         self.db
             .unlink_inode(parent_ino, name, &inode)
@@ -479,8 +482,8 @@ impl Filesystem for Dbfs {
             uid,
             gid,
             size,
-            time_or_now_secs(atime),
-            time_or_now_secs(mtime),
+            time_or_now(atime),
+            time_or_now(mtime),
         ) {
             Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(errno) => reply.error(errno),
@@ -677,9 +680,9 @@ pub fn file_attr_from_inode(inode: &Inode) -> FileAttr {
         ino: inode.ino,
         size: inode.size,
         blocks: inode.size.div_ceil(512),
-        atime: unix_time(inode.atime),
-        mtime: unix_time(inode.mtime),
-        ctime: unix_time(inode.ctime),
+        atime: inode.atime.to_system_time(),
+        mtime: inode.mtime.to_system_time(),
+        ctime: inode.ctime.to_system_time(),
         crtime: UNIX_EPOCH,
         kind: DbfsDirEntry::file_type(inode.kind),
         perm: inode.mode as u16,
@@ -704,24 +707,9 @@ fn errno_from_db_error(error: DbError) -> i32 {
     }
 }
 
-fn unix_time(secs: i64) -> std::time::SystemTime {
-    if secs >= 0 {
-        UNIX_EPOCH + Duration::from_secs(secs as u64)
-    } else {
-        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
-    }
-}
-
-fn time_or_now_secs(time: Option<TimeOrNow>) -> Option<i64> {
+fn time_or_now(time: Option<TimeOrNow>) -> Option<SystemTime> {
     match time? {
-        TimeOrNow::SpecificTime(time) => system_time_secs(time),
-        TimeOrNow::Now => system_time_secs(SystemTime::now()),
-    }
-}
-
-fn system_time_secs(time: SystemTime) -> Option<i64> {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => Some(duration.as_secs() as i64),
-        Err(error) => Some(-(error.duration().as_secs() as i64)),
+        TimeOrNow::SpecificTime(time) => Some(time),
+        TimeOrNow::Now => Some(SystemTime::now()),
     }
 }

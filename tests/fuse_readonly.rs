@@ -2,7 +2,7 @@ use dbfs::{Db, Dbfs, DbfsDirEntry, FileKind, mount_options};
 use fuser::{FileType, MountOption};
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn temp_db_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -226,8 +226,8 @@ fn setattr_helper_updates_metadata_and_size() {
             Some(2000),
             Some(3000),
             Some(5),
-            Some(123),
-            Some(456),
+            Some(UNIX_EPOCH + Duration::from_secs(123)),
+            Some(UNIX_EPOCH + Duration::from_secs(456)),
         )
         .expect("set attrs");
 
@@ -235,6 +235,29 @@ fn setattr_helper_updates_metadata_and_size() {
     assert_eq!(attr.uid, 2000);
     assert_eq!(attr.gid, 3000);
     assert_eq!(attr.size, 5);
+    assert_eq!(attr.atime, UNIX_EPOCH + Duration::from_secs(123));
+    assert_eq!(attr.mtime, UNIX_EPOCH + Duration::from_secs(456));
+}
+
+#[test]
+fn setattr_round_trips_nanosecond_timestamps() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let atime = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+    let mtime = UNIX_EPOCH + Duration::new(1_700_000_111, 987_654_321);
+
+    let attr = fs
+        .setattr(file.ino, None, None, None, None, Some(atime), Some(mtime))
+        .expect("set times");
+
+    assert_eq!(attr.atime, atime);
+    assert_eq!(attr.mtime, mtime);
+    let again = fs.getattr(file.ino).expect("get file attr");
+    assert_eq!(again.atime, atime);
+    assert_eq!(again.mtime, mtime);
 }
 
 #[test]

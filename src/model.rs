@@ -1,4 +1,39 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use rusqlite::{Error as SqlError, ErrorCode};
+
+/// Seconds and nanoseconds since the Unix epoch.
+///
+/// Negative `secs` follows fuser's split. The duration before the epoch is
+/// `secs.unsigned_abs()` seconds plus `nsec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timestamp {
+    pub secs: i64,
+    pub nsec: u32,
+}
+
+impl Timestamp {
+    pub fn from_system_time(time: SystemTime) -> Self {
+        match time.duration_since(UNIX_EPOCH) {
+            Ok(duration) => Self {
+                secs: duration.as_secs() as i64,
+                nsec: duration.subsec_nanos(),
+            },
+            Err(error) => Self {
+                secs: -(error.duration().as_secs() as i64),
+                nsec: error.duration().subsec_nanos(),
+            },
+        }
+    }
+
+    pub fn to_system_time(self) -> SystemTime {
+        if self.secs >= 0 {
+            UNIX_EPOCH + Duration::new(self.secs as u64, self.nsec)
+        } else {
+            UNIX_EPOCH - Duration::new(self.secs.unsigned_abs(), self.nsec)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -34,9 +69,9 @@ pub struct Inode {
     pub uid: u32,
     pub gid: u32,
     pub size: u64,
-    pub atime: i64,
-    pub mtime: i64,
-    pub ctime: i64,
+    pub atime: Timestamp,
+    pub mtime: Timestamp,
+    pub ctime: Timestamp,
     pub nlink: u32,
 }
 
@@ -52,8 +87,8 @@ pub struct MetadataUpdate {
     pub mode: Option<u32>,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
-    pub atime: Option<i64>,
-    pub mtime: Option<i64>,
+    pub atime: Option<Timestamp>,
+    pub mtime: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

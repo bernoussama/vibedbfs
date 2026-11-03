@@ -1,6 +1,6 @@
 use std::time::{Duration, UNIX_EPOCH};
 
-use dbfs::{FileKind, Inode, file_attr_from_inode};
+use dbfs::{FileKind, Inode, Timestamp, file_attr_from_inode};
 use fuser::FileType;
 
 #[test]
@@ -12,9 +12,15 @@ fn maps_regular_file_inode_to_fuse_attr() {
         uid: 1000,
         gid: 1001,
         size: 12345,
-        atime: 10,
-        mtime: 20,
-        ctime: 30,
+        atime: Timestamp {
+            secs: 10,
+            nsec: 123_456_789,
+        },
+        mtime: Timestamp { secs: 20, nsec: 0 },
+        ctime: Timestamp {
+            secs: -5,
+            nsec: 250_000_000,
+        },
         nlink: 1,
     };
 
@@ -27,9 +33,9 @@ fn maps_regular_file_inode_to_fuse_attr() {
     assert_eq!(attr.gid, 1001);
     assert_eq!(attr.size, 12345);
     assert_eq!(attr.nlink, 1);
-    assert_eq!(attr.atime, UNIX_EPOCH + Duration::from_secs(10));
+    assert_eq!(attr.atime, UNIX_EPOCH + Duration::new(10, 123_456_789));
     assert_eq!(attr.mtime, UNIX_EPOCH + Duration::from_secs(20));
-    assert_eq!(attr.ctime, UNIX_EPOCH + Duration::from_secs(30));
+    assert_eq!(attr.ctime, UNIX_EPOCH - Duration::new(5, 250_000_000));
 }
 
 #[test]
@@ -41,9 +47,9 @@ fn maps_directory_inode_to_fuse_attr() {
         uid: 0,
         gid: 0,
         size: 0,
-        atime: 0,
-        mtime: 0,
-        ctime: 0,
+        atime: Timestamp { secs: 0, nsec: 0 },
+        mtime: Timestamp { secs: 0, nsec: 0 },
+        ctime: Timestamp { secs: 0, nsec: 0 },
         nlink: 1,
     };
 

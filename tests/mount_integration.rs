@@ -55,8 +55,11 @@ fn utimens_round_trips_nanoseconds_when_enabled() {
     fs::write(&path, b"hello").expect("create file through mount");
     let atime = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
     let mtime = UNIX_EPOCH + Duration::new(1_700_000_111, 987_654_321);
-    fs::set_times(&path, FileTimes::new().set_accessed(atime).set_modified(mtime))
-        .expect("utimens through mount");
+    fs::set_times(
+        &path,
+        FileTimes::new().set_accessed(atime).set_modified(mtime),
+    )
+    .expect("utimens through mount");
 
     let meta = fs::metadata(&path).expect("stat file through mount");
     assert_eq!(meta.atime(), 1_700_000_000, "atime seconds");
@@ -115,7 +118,8 @@ struct Mounted {
 
 impl Mounted {
     fn start(name: &str) -> Option<Self> {
-        if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || command_path("fusermount3").is_none()
+        if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none()
+            || command_path("fusermount3").is_none()
         {
             return None;
         }

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dbfs::{Db, DbError, FileKind, MetadataUpdate, file_attr_from_inode};
+use dbfs::{Db, DbError, FileKind, MetadataUpdate, Timestamp, file_attr_from_inode};
 use rusqlite::Connection;
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -589,8 +589,8 @@ fn updates_inode_metadata_fields() {
             mode: Some(0o600),
             uid: Some(2000),
             gid: Some(3000),
-            atime: Some(123),
-            mtime: Some(456),
+            atime: Some(Timestamp { secs: 123, nsec: 0 }),
+            mtime: Some(Timestamp { secs: 456, nsec: 0 }),
         },
     )
     .expect("update metadata");
@@ -599,9 +599,9 @@ fn updates_inode_metadata_fields() {
     assert_eq!(updated.mode, 0o600);
     assert_eq!(updated.uid, 2000);
     assert_eq!(updated.gid, 3000);
-    assert_eq!(updated.atime, 123);
-    assert_eq!(updated.mtime, 456);
-    assert!(updated.ctime >= file.ctime);
+    assert_eq!(updated.atime, Timestamp { secs: 123, nsec: 0 });
+    assert_eq!(updated.mtime, Timestamp { secs: 456, nsec: 0 });
+    assert!(updated.ctime.to_system_time() >= file.ctime.to_system_time());
 }
 
 #[test]
