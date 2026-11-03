@@ -703,10 +703,10 @@ impl Db {
                 | (FileKind::Symlink, FileKind::Directory) => return Err(DbError::IsDirectory),
                 (FileKind::Directory, FileKind::RegularFile)
                 | (FileKind::Directory, FileKind::Symlink) => return Err(DbError::NotDirectory),
-                (FileKind::Directory, FileKind::Directory) => {
-                    if !self.list_dir(target.ino)?.is_empty() {
-                        return Err(DbError::DirectoryNotEmpty);
-                    }
+                (FileKind::Directory, FileKind::Directory)
+                    if !self.list_dir(target.ino)?.is_empty() =>
+                {
+                    return Err(DbError::DirectoryNotEmpty);
                 }
                 _ => {}
             }

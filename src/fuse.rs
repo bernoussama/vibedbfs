@@ -665,8 +665,8 @@ impl Filesystem for Dbfs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        let file_type = mode & libc::S_IFMT as u32;
-        const S_IFREG: u32 = libc::S_IFREG as u32;
+        let file_type = mode & libc::S_IFMT;
+        const S_IFREG: u32 = libc::S_IFREG;
         match file_type {
             // Regular file: delegate to create
             0 | S_IFREG => {
@@ -674,7 +674,7 @@ impl Filesystem for Dbfs {
                     self,
                     parent,
                     name.as_bytes(),
-                    mode & !(libc::S_IFMT as u32),
+                    mode & !libc::S_IFMT,
                     umask,
                     req.uid(),
                     req.gid(),
