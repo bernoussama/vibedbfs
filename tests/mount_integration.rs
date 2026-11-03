@@ -5,9 +5,10 @@ use std::process::{Child, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn mounted_filesystem_supports_basic_file_lifecycle_when_enabled() {
     if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || command_path("fusermount3").is_none() {
-        panic!("skipped mount test must be #[ignore], not a passing return");
+        panic!("FUSE mount tests require DBFS_RUN_FUSE_TESTS=1 and fusermount3");
     }
 
     let base = temp_path("mount-integration");

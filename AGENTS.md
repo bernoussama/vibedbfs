@@ -21,7 +21,7 @@ See `README.md` for full details. Quick reference:
 | Build (dev) | `cargo build` |
 | Build (release) | `cargo build --release` |
 | Unit/integration tests | `cargo test` |
-| FUSE mount integration | `DBFS_RUN_FUSE_TESTS=1 cargo test --test mount_integration` |
+| FUSE mount integration | `DBFS_RUN_FUSE_TESTS=1 cargo test --test mount_integration -- --ignored` |
 | Python/libfuse tests | `pytest tests/test_with_libfuse.py -v -k "not syscall"` |
 | Run (mount) | `cargo run -- mount <db_path> <mount_dir>` |
 | Unmount | `fusermount3 -u <mount_dir>` |
