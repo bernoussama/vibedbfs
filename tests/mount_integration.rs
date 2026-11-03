@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[test]
 fn mounted_filesystem_supports_basic_file_lifecycle_when_enabled() {
     if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || command_path("fusermount3").is_none() {
-        return;
+        panic!("skipped mount test must be #[ignore], not a passing return");
     }
 
     let base = temp_path("mount-integration");
