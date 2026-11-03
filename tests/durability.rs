@@ -6,11 +6,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+fn supports_fuse() -> bool {
+    Path::new("/dev/fuse").exists() && command_exists("fusermount3") && command_exists("mountpoint")
+}
+
 fn supports_fuse_trace() -> bool {
-    Path::new("/dev/fuse").exists()
-        && command_exists("fusermount3")
-        && command_exists("strace")
-        && command_exists("mountpoint")
+    supports_fuse() && command_exists("strace")
 }
 
 fn command_exists(name: &str) -> bool {
@@ -35,7 +36,7 @@ fn work_dir(name: &str) -> PathBuf {
 }
 
 struct Mounted {
-    child: Child,
+    child: Option<Child>,
     mountpoint: PathBuf,
 }
 
@@ -60,13 +61,40 @@ impl Mounted {
             panic!("dbfs did not mount {}: {err}", mountpoint.display());
         }
         Self {
-            child,
+            child: Some(child),
             mountpoint: mountpoint.to_path_buf(),
         }
     }
 
+    fn kill_and_unmount(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let status = Command::new("kill")
+                .args(["-9", &child.id().to_string()])
+                .status()
+                .expect("run kill");
+            assert!(status.success(), "kill -9 of dbfs failed");
+            let exited = child.wait().expect("wait for killed dbfs");
+            assert!(
+                exited.code().is_none(),
+                "dbfs was not killed by a signal: {exited}"
+            );
+        }
+        let _ = Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&self.mountpoint)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
     fn trace_syncs(&self, log: &Path, body: impl FnOnce()) {
         let (attached_tx, attached_rx) = mpsc::channel();
+        let pid = self
+            .child
+            .as_ref()
+            .expect("dbfs is running")
+            .id()
+            .to_string();
         let mut strace = Command::new("strace")
             .arg("-f")
             .arg("-y")
@@ -75,7 +103,7 @@ impl Mounted {
             .arg("-o")
             .arg(log)
             .arg("-p")
-            .arg(self.child.id().to_string())
+            .arg(pid)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -105,9 +133,13 @@ impl Drop for Mounted {
         let _ = Command::new("fusermount3")
             .arg("-uz")
             .arg(&self.mountpoint)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -207,4 +239,36 @@ fn fsync_of_a_clean_file_fdatasyncs_the_wal() {
     let log = fs::read_to_string(&log_path).expect("read strace log");
     assert_wal_synced(&log, &db);
     assert_eq!(fs::read(&file).expect("read file after fsync"), b"kept");
+}
+
+#[test]
+fn fsynced_bytes_survive_kill_and_remount() {
+    if !supports_fuse() {
+        return;
+    }
+
+    let dir = work_dir("kill-remount");
+    let db = dir.join("db.sqlite");
+    let mountpoint = dir.join("mnt");
+    let mut mounted = Mounted::start(&db, &mountpoint);
+    let file = mountpoint.join("notes.txt");
+    let mut handle = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&file)
+        .expect("create file");
+    handle
+        .write_all(b"kept-across-kill")
+        .expect("write bytes");
+    handle.sync_all().expect("fsync before kill");
+
+    mounted.kill_and_unmount();
+    drop(handle);
+
+    let remount_point = dir.join("mnt2");
+    let _remounted = Mounted::start(&db, &remount_point);
+    assert_eq!(
+        fs::read(remount_point.join("notes.txt")).expect("read file after remount"),
+        b"kept-across-kill"
+    );
 }
