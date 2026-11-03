@@ -11,10 +11,22 @@ use fuser::{
 };
 
 use crate::db::CHUNK_SIZE;
-use crate::{Db, DbError, FileKind, Inode, MetadataUpdate};
+use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
 const FLUSH_THRESHOLD: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsStats {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub bsize: u32,
+    pub namelen: u32,
+    pub frsize: u32,
+}
 
 pub struct Dbfs {
     db: Db,
@@ -25,6 +37,7 @@ pub struct Dbfs {
 struct DirtyFile {
     size: u64,
     chunks: BTreeMap<u64, Vec<u8>>,
+    mtime: Timestamp,
 }
 
 impl Dbfs {
@@ -35,6 +48,21 @@ impl Dbfs {
         }
     }
 
+    pub fn statfs(&self) -> Result<FsStats, i32> {
+        let usage = self.db.volume_usage().map_err(errno_from_db_error)?;
+        let bsize = usage.page_size as u32;
+        Ok(FsStats {
+            blocks: usage.page_count,
+            bfree: usage.freelist_count,
+            bavail: usage.freelist_count,
+            files: usage.files,
+            ffree: 0,
+            bsize,
+            namelen: 255,
+            frsize: bsize,
+        })
+    }
+
     pub fn getattr(&self, ino: u64) -> Result<FileAttr, i32> {
         let mut attr = self
             .db
@@ -42,8 +70,7 @@ impl Dbfs {
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
         if let Some(dirty) = self.dirty_files.borrow().get(&ino) {
-            attr.size = dirty.size;
-            attr.blocks = dirty.size.div_ceil(512);
+            overlay_dirty(&mut attr, dirty);
         }
         Ok(attr)
     }
@@ -55,8 +82,7 @@ impl Dbfs {
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
         if let Some(dirty) = self.dirty_files.borrow().get(&attr.ino) {
-            attr.size = dirty.size;
-            attr.blocks = dirty.size.div_ceil(512);
+            overlay_dirty(&mut attr, dirty);
         }
         Ok(attr)
     }
@@ -159,8 +185,8 @@ impl Dbfs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<i64>,
-        mtime: Option<i64>,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
     ) -> Result<FileAttr, i32> {
         self.flush_file(ino)?;
         if let Some(size) = size {
@@ -176,8 +202,8 @@ impl Dbfs {
                     mode,
                     uid,
                     gid,
-                    atime,
-                    mtime,
+                    atime: atime.map(Timestamp::from_system_time),
+                    mtime: mtime.map(Timestamp::from_system_time),
                 },
             )
             .map(|inode| file_attr_from_inode(&inode))
@@ -245,8 +271,8 @@ impl Dbfs {
             Some(k) => k,
             None => self.db.get_inode(ino).map_err(errno_from_db_error)?.kind,
         };
-        if kind != FileKind::RegularFile {
-            return Err(libc::ENOENT);
+        if let Some(error) = kind.regular_file_error() {
+            return Err(errno_from_db_error(error));
         }
 
         let buffered = self
@@ -258,15 +284,18 @@ impl Dbfs {
             self.flush_file(ino)?;
         }
 
+        let modified = Timestamp::from_system_time(SystemTime::now());
         let mut dirty_files = self.dirty_files.borrow_mut();
         let dirty = dirty_files.entry(ino).or_insert_with(|| {
             let size = self.db.get_inode(ino).map(|i| i.size).unwrap_or(0);
             DirtyFile {
                 size,
                 chunks: BTreeMap::new(),
+                mtime: modified,
             }
         });
 
+        dirty.mtime = modified;
         let mut written = 0;
         while written < data.len() {
             let position = offset + written as u64;
@@ -299,7 +328,7 @@ impl Dbfs {
             return Ok(());
         };
 
-        match self.db.replace_chunks(ino, dirty.size, &dirty.chunks) {
+        match self.db.replace_chunks(ino, dirty.size, &dirty.chunks, dirty.mtime) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.dirty_files.borrow_mut().insert(ino, dirty);
@@ -323,7 +352,10 @@ impl Dbfs {
     }
 
     pub fn unlink(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
-        let inode = self.db.lookup(parent_ino, name).map_err(errno_from_db_error)?;
+        let inode = self
+            .db
+            .lookup(parent_ino, name)
+            .map_err(errno_from_db_error)?;
         self.flush_file(inode.ino)?;
         self.db
             .unlink_inode(parent_ino, name, &inode)
@@ -342,12 +374,23 @@ impl Dbfs {
         name: &[u8],
         new_parent_ino: u64,
         new_name: &[u8],
+        flags: u32,
     ) -> Result<(), i32> {
+        let noreplace = libc::RENAME_NOREPLACE;
+        if flags & !noreplace != 0 {
+            return Err(libc::EINVAL);
+        }
         if let Ok(inode) = self.db.lookup(parent_ino, name) {
             self.flush_file(inode.ino)?;
         }
         self.db
-            .rename(parent_ino, name, new_parent_ino, new_name)
+            .rename_entry(
+                parent_ino,
+                name,
+                new_parent_ino,
+                new_name,
+                flags & noreplace != 0,
+            )
             .map_err(errno_from_db_error)
     }
 
@@ -399,7 +442,19 @@ impl Filesystem for Dbfs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 512, 255, 65_536);
+        match Dbfs::statfs(self) {
+            Ok(stat) => reply.statfs(
+                stat.blocks,
+                stat.bfree,
+                stat.bavail,
+                stat.files,
+                stat.ffree,
+                stat.bsize,
+                stat.namelen,
+                stat.frsize,
+            ),
+            Err(errno) => reply.error(errno),
+        }
     }
 
     fn mkdir(
@@ -523,8 +578,8 @@ impl Filesystem for Dbfs {
             uid,
             gid,
             size,
-            time_or_now_secs(atime),
-            time_or_now_secs(mtime),
+            time_or_now(atime),
+            time_or_now(mtime),
         ) {
             Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(errno) => reply.error(errno),
@@ -654,8 +709,8 @@ impl Filesystem for Dbfs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        let file_type = mode & libc::S_IFMT as u32;
-        const S_IFREG: u32 = libc::S_IFREG as u32;
+        let file_type = mode & libc::S_IFMT;
+        const S_IFREG: u32 = libc::S_IFREG;
         match file_type {
             // Regular file: delegate to create
             0 | S_IFREG => {
@@ -663,7 +718,7 @@ impl Filesystem for Dbfs {
                     self,
                     parent,
                     name.as_bytes(),
-                    mode & !(libc::S_IFMT as u32),
+                    mode & !libc::S_IFMT,
                     umask,
                     req.uid(),
                     req.gid(),
@@ -687,12 +742,14 @@ impl Filesystem for Dbfs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        if flags != 0 {
-            reply.error(libc::EINVAL);
-            return;
-        }
-
-        match Dbfs::rename(self, parent, name.as_bytes(), newparent, newname.as_bytes()) {
+        match Dbfs::rename(
+            self,
+            parent,
+            name.as_bytes(),
+            newparent,
+            newname.as_bytes(),
+            flags,
+        ) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
@@ -721,9 +778,9 @@ pub fn file_attr_from_inode(inode: &Inode) -> FileAttr {
         ino: inode.ino,
         size: inode.size,
         blocks: inode.size.div_ceil(512),
-        atime: unix_time(inode.atime),
-        mtime: unix_time(inode.mtime),
-        ctime: unix_time(inode.ctime),
+        atime: inode.atime.to_system_time(),
+        mtime: inode.mtime.to_system_time(),
+        ctime: inode.ctime.to_system_time(),
         crtime: UNIX_EPOCH,
         kind: DbfsDirEntry::file_type(inode.kind),
         perm: inode.mode as u16,
@@ -743,29 +800,64 @@ fn errno_from_db_error(error: DbError) -> i32 {
         DbError::DirectoryNotEmpty => libc::ENOTEMPTY,
         DbError::InvalidInput => libc::EINVAL,
         DbError::IsDirectory => libc::EISDIR,
+        DbError::NameTooLong => libc::ENAMETOOLONG,
+        DbError::NoSpace => libc::ENOSPC,
         DbError::NotDirectory => libc::ENOTDIR,
         DbError::Corrupt | DbError::Sqlite(_) => libc::EIO,
     }
 }
 
-fn unix_time(secs: i64) -> std::time::SystemTime {
-    if secs >= 0 {
-        UNIX_EPOCH + Duration::from_secs(secs as u64)
-    } else {
-        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
-    }
+fn overlay_dirty(attr: &mut FileAttr, dirty: &DirtyFile) {
+    attr.size = dirty.size;
+    attr.blocks = dirty.size.div_ceil(512);
+    let modified = dirty.mtime.to_system_time();
+    attr.mtime = modified;
+    attr.ctime = modified;
 }
 
-fn time_or_now_secs(time: Option<TimeOrNow>) -> Option<i64> {
+fn time_or_now(time: Option<TimeOrNow>) -> Option<SystemTime> {
     match time? {
-        TimeOrNow::SpecificTime(time) => system_time_secs(time),
-        TimeOrNow::Now => system_time_secs(SystemTime::now()),
+        TimeOrNow::SpecificTime(time) => Some(time),
+        TimeOrNow::Now => Some(SystemTime::now()),
     }
 }
 
-fn system_time_secs(time: SystemTime) -> Option<i64> {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => Some(duration.as_secs() as i64),
-        Err(error) => Some(-(error.duration().as_secs() as i64)),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statfs_matches_sqlite_pages_and_inode_count() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        db.create_file(1, b"notes.txt", 0o644, 1, 1)
+            .expect("create file");
+        let usage = db.volume_usage().expect("read sqlite volume");
+        let fs = Dbfs::new(db);
+        let stat = fs.statfs().expect("statfs");
+
+        assert_eq!(stat.bsize as u64, usage.page_size);
+        assert_eq!(stat.frsize, stat.bsize);
+        assert_eq!(stat.blocks, usage.page_count);
+        assert_eq!(stat.bfree, usage.freelist_count);
+        assert_eq!(stat.bavail, usage.freelist_count);
+        assert_eq!(stat.files, usage.files);
+        assert!(stat.blocks > 0);
+        assert!(stat.files >= 2);
+        assert_eq!(stat.namelen, 255);
+    }
+
+    #[test]
+    fn flush_returns_enospc_when_the_database_is_full() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"big.bin", 0o644, 1, 1)
+            .expect("create file");
+        db.cap_page_count_at_current()
+            .expect("cap sqlite page count");
+        let fs = Dbfs::new(db);
+        let payload = vec![1u8; 256 * 1024];
+        fs.write(file.ino, 0, &payload).expect("buffer write");
+        let error = fs.flush_file(file.ino).expect_err("flush full database");
+        assert_eq!(error, libc::ENOSPC);
     }
 }

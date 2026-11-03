@@ -1,10 +1,12 @@
-use std::fs::{self, File, OpenOptions};
+use std::ffi::CString;
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rusqlite::Connection;
 use dbfs::Db;
 
 #[test]
@@ -47,6 +49,122 @@ fn mounted_filesystem_supports_basic_file_lifecycle_when_enabled() {
     let _ = fs::remove_file(&db_path);
     let _ = fs::remove_file(db_path.with_extension("sqlite-wal"));
     let _ = fs::remove_file(db_path.with_extension("sqlite-shm"));
+}
+
+#[test]
+fn utimens_round_trips_nanoseconds_when_enabled() {
+    let Some(mounted) = Mounted::start("utimens-nsec") else {
+        return;
+    };
+
+    let path = mounted.mountpoint.join("notes.txt");
+    fs::write(&path, b"hello").expect("create file through mount");
+    let atime = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+    let mtime = UNIX_EPOCH + Duration::new(1_700_000_111, 987_654_321);
+    fs::set_times(
+        &path,
+        FileTimes::new().set_accessed(atime).set_modified(mtime),
+    )
+    .expect("utimens through mount");
+
+    let meta = fs::metadata(&path).expect("stat file through mount");
+    assert_eq!(meta.atime(), 1_700_000_000, "atime seconds");
+    assert_eq!(meta.atime_nsec(), 123_456_789, "atime nanoseconds");
+    assert_eq!(meta.mtime(), 1_700_000_111, "mtime seconds");
+    assert_eq!(meta.mtime_nsec(), 987_654_321, "mtime nanoseconds");
+}
+
+#[test]
+fn statfs_reports_sqlite_blocks_and_inodes_when_enabled() {
+    let Some(mounted) = Mounted::start("statfs") else {
+        return;
+    };
+
+    fs::write(mounted.mountpoint.join("notes.txt"), b"hello").expect("create file through mount");
+
+    let mut stat = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    let path = CString::new(mounted.mountpoint.to_str().expect("utf-8 mount path")).unwrap();
+    let rc = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
+    assert_eq!(rc, 0, "statvfs");
+
+    let conn = Connection::open(&mounted.db_path).expect("open database");
+    let page_size = pragma_u64(&conn, "page_size");
+    let page_count = pragma_u64(&conn, "page_count");
+    let freelist = pragma_u64(&conn, "freelist_count");
+    let files: i64 = conn
+        .query_row("SELECT COUNT(*) FROM inodes", [], |row| row.get(0))
+        .expect("count inodes");
+    let files = files as u64;
+
+    assert_eq!(stat.f_bsize as u64, page_size, "block size");
+    assert_eq!(stat.f_frsize as u64, page_size, "fragment size");
+    assert_eq!(stat.f_blocks, page_count, "block count");
+    assert_eq!(stat.f_bfree, freelist, "free blocks");
+    assert_eq!(stat.f_bavail, freelist, "available blocks");
+    assert_eq!(stat.f_files, files, "inode count");
+    assert!(stat.f_blocks > 0, "block count is derived");
+    assert!(stat.f_files >= 2, "root and the new file are counted");
+    assert_eq!(stat.f_namemax, 255, "name max");
+}
+
+#[test]
+fn rename_noreplace_does_not_replace_an_existing_target_when_enabled() {
+    let Some(mounted) = Mounted::start("rename-noreplace") else {
+        return;
+    };
+
+    let source = mounted.mountpoint.join("source.txt");
+    let target = mounted.mountpoint.join("target.txt");
+    let fresh = mounted.mountpoint.join("fresh.txt");
+    fs::write(&source, b"source").expect("write source");
+    fs::write(&target, b"target").expect("write target");
+
+    let rc = rename_at(&source, &target, libc::RENAME_NOREPLACE);
+    let error = std::io::Error::last_os_error();
+    assert_eq!(rc, -1, "noreplace of an existing file");
+    assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
+    assert_eq!(fs::read(&source).expect("source remains"), b"source");
+    assert_eq!(fs::read(&target).expect("target unchanged"), b"target");
+
+    let rc = rename_at(&source, &fresh, libc::RENAME_NOREPLACE);
+    assert_eq!(
+        rc,
+        0,
+        "noreplace of a missing file: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(!source.exists());
+    assert_eq!(fs::read(&fresh).expect("fresh contents"), b"source");
+
+    fs::write(&source, b"again").expect("rewrite source");
+    let rc = rename_at(&source, &fresh, libc::RENAME_EXCHANGE);
+    let error = std::io::Error::last_os_error();
+    assert_eq!(rc, -1, "unknown rename flag");
+    assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    assert_eq!(fs::read(&source).expect("source kept"), b"again");
+    assert_eq!(fs::read(&fresh).expect("fresh kept"), b"source");
+}
+
+fn rename_at(from: &Path, to: &Path, flags: libc::c_uint) -> i32 {
+    let from = CString::new(from.to_str().expect("utf-8 source")).unwrap();
+    let to = CString::new(to.to_str().expect("utf-8 target")).unwrap();
+    unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            flags,
+        )
+    }
+}
+
+fn pragma_u64(conn: &Connection, name: &str) -> u64 {
+    let sql = format!("PRAGMA {name}");
+    let value: i64 = conn
+        .query_row(&sql, [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("read {name}: {error}"));
+    value as u64
 }
 
 #[test]
@@ -329,4 +447,48 @@ fn unmount(mountpoint: &Path, child: &mut Child) {
         .arg(mountpoint)
         .status();
     let _ = child.wait();
+}
+
+struct Mounted {
+    mountpoint: PathBuf,
+    db_path: PathBuf,
+    child: Child,
+}
+
+impl Mounted {
+    fn start(name: &str) -> Option<Self> {
+        if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none()
+            || command_path("fusermount3").is_none()
+        {
+            return None;
+        }
+
+        let base = temp_path(name);
+        let db_path = base.with_extension("sqlite");
+        let mountpoint = base.with_extension("mnt");
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
+            .arg("mount")
+            .arg(&db_path)
+            .arg(&mountpoint)
+            .spawn()
+            .expect("start dbfs mount");
+        let mounted = Self {
+            mountpoint,
+            db_path,
+            child,
+        };
+        wait_for_mount(&mounted.mountpoint);
+        Some(mounted)
+    }
+}
+
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        unmount(&self.mountpoint, &mut self.child);
+        let _ = fs::remove_dir(&self.mountpoint);
+        let _ = fs::remove_file(&self.db_path);
+        let _ = fs::remove_file(self.db_path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(self.db_path.with_extension("sqlite-shm"));
+    }
 }

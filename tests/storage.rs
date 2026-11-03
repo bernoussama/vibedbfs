@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dbfs::{Db, DbError, FileKind, MetadataUpdate};
+use dbfs::{Db, DbError, FileKind, MetadataUpdate, Timestamp, file_attr_from_inode};
 use rusqlite::{Connection, params};
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -23,7 +23,7 @@ fn initializes_root_directory_inode() {
     assert_eq!(root.ino, 1);
     assert_eq!(root.kind, FileKind::Directory);
     assert_eq!(root.size, 0);
-    assert_eq!(root.nlink, 1);
+    assert_eq!(root.nlink, 2);
 }
 
 #[test]
@@ -108,6 +108,94 @@ fn opening_legacy_database_migrates_root_owner_to_mount_user() {
 
     assert_eq!(root.uid, unsafe { libc::getuid() });
     assert_eq!(root.gid, unsafe { libc::getgid() });
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
+fn legacy_second_timestamps_read_back_with_zero_nsec() {
+    let path = temp_db_path("legacy-seconds");
+    {
+        let conn = Connection::open(&path).expect("open raw sqlite connection");
+        conn.execute_batch(
+            "
+            CREATE TABLE inodes (
+              ino INTEGER PRIMARY KEY,
+              kind INTEGER NOT NULL,
+              mode INTEGER NOT NULL,
+              uid INTEGER NOT NULL,
+              gid INTEGER NOT NULL,
+              size INTEGER NOT NULL,
+              atime INTEGER NOT NULL,
+              mtime INTEGER NOT NULL,
+              ctime INTEGER NOT NULL,
+              nlink INTEGER NOT NULL
+            );
+            INSERT INTO inodes
+              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              VALUES (1, 2, 493, 1, 1, 0, 10, 20, 30, 1);
+            INSERT INTO inodes
+              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              VALUES (2, 1, 420, 1, 1, 4, 111, 222, 333, 1);
+            ",
+        )
+        .expect("create legacy second-only inodes");
+    }
+
+    let db = Db::open(&path).expect("open legacy database");
+    let attr = file_attr_from_inode(&db.get_inode(2).expect("load legacy file"));
+
+    assert_eq!(attr.atime, UNIX_EPOCH + Duration::new(111, 0));
+    assert_eq!(attr.mtime, UNIX_EPOCH + Duration::new(222, 0));
+    assert_eq!(attr.ctime, UNIX_EPOCH + Duration::new(333, 0));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
+fn legacy_directory_nlink_counts_subdirectories() {
+    let path = temp_db_path("legacy-nlink");
+    {
+        let conn = Connection::open(&path).expect("open raw sqlite connection");
+        conn.execute_batch(
+            "
+            CREATE TABLE inodes (
+              ino INTEGER PRIMARY KEY,
+              kind INTEGER NOT NULL,
+              mode INTEGER NOT NULL,
+              uid INTEGER NOT NULL,
+              gid INTEGER NOT NULL,
+              size INTEGER NOT NULL,
+              atime INTEGER NOT NULL,
+              mtime INTEGER NOT NULL,
+              ctime INTEGER NOT NULL,
+              nlink INTEGER NOT NULL
+            );
+            CREATE TABLE dirents (
+              parent_ino INTEGER NOT NULL,
+              name BLOB NOT NULL,
+              child_ino INTEGER NOT NULL,
+              PRIMARY KEY (parent_ino, name)
+            );
+            INSERT INTO inodes
+              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              VALUES (1, 2, 493, 1, 1, 0, 1, 1, 1, 1);
+            INSERT INTO inodes
+              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              VALUES (2, 2, 493, 1, 1, 0, 1, 1, 1, 1);
+            INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, 'docs', 2);
+            ",
+        )
+        .expect("create legacy directories");
+    }
+
+    let db = Db::open(&path).expect("open legacy database");
+    assert_eq!(db.get_inode(1).expect("root").nlink, 3);
+    assert_eq!(db.get_inode(2).expect("docs").nlink, 2);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
@@ -547,8 +635,8 @@ fn updates_inode_metadata_fields() {
             mode: Some(0o600),
             uid: Some(2000),
             gid: Some(3000),
-            atime: Some(123),
-            mtime: Some(456),
+            atime: Some(Timestamp { secs: 123, nsec: 0 }),
+            mtime: Some(Timestamp { secs: 456, nsec: 0 }),
         },
     )
     .expect("update metadata");
@@ -557,9 +645,9 @@ fn updates_inode_metadata_fields() {
     assert_eq!(updated.mode, 0o600);
     assert_eq!(updated.uid, 2000);
     assert_eq!(updated.gid, 3000);
-    assert_eq!(updated.atime, 123);
-    assert_eq!(updated.mtime, 456);
-    assert!(updated.ctime >= file.ctime);
+    assert_eq!(updated.atime, Timestamp { secs: 123, nsec: 0 });
+    assert_eq!(updated.mtime, Timestamp { secs: 456, nsec: 0 });
+    assert!(updated.ctime.to_system_time() >= file.ctime.to_system_time());
 }
 
 #[test]
