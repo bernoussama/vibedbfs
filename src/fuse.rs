@@ -273,9 +273,12 @@ impl Dbfs {
     }
 
     pub fn release_file(&self, ino: u64) -> Result<(), i32> {
-        self.flush_file(ino)?;
+        let flushed = self.flush_file(ino);
         self.db.release_file(ino);
-        Ok(())
+        if flushed.is_err() && self.db.get_inode(ino).is_err() {
+            self.dirty_files.borrow_mut().remove(&ino);
+        }
+        flushed
     }
 
     pub fn unlink(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
