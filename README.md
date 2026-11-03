@@ -50,7 +50,7 @@ PRAGMA busy_timeout = 5000;
 PRAGMA wal_autocheckpoint = 10000;
 ```
 
-File data is stored in 64 KiB chunk rows in SQLite. FUSE writes are buffered in memory and flushed to SQLite on `flush`, `fsync`, or `release`, which lets buffered write workloads avoid one SQLite transaction per small write. Overlapping dirty writes are coalesced before flush, and full-chunk writes skip the read-modify-write cycle. All SQL queries use prepared statement caching to avoid re-parsing.
+File data is stored in 64 KiB chunk rows in SQLite. FUSE writes are buffered in memory, one 64 KiB buffer per chunk, and flushed to SQLite on `flush`, `fsync`, or `release`, or once a file buffers 64 MiB. This lets buffered write workloads avoid one SQLite transaction per small write. Overlapping dirty writes merge in their chunk buffer, and full-chunk writes skip the read-modify-write cycle. All SQL queries use prepared statement caching to avoid re-parsing.
 
 Important caveat: `fsync` currently flushes dbfs dirty writes into SQLite, but SQLite still runs with `synchronous = NORMAL`. This is not the strongest crash-durability mode.
 
