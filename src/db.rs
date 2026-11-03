@@ -22,6 +22,13 @@ pub struct Db {
     inode_kinds: RefCell<HashMap<u64, FileKind>>,
 }
 
+#[derive(Clone, Copy)]
+enum NewNode<'a> {
+    Directory { mode: u32 },
+    File { mode: u32 },
+    Symlink { target: &'a [u8] },
+}
+
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
@@ -121,6 +128,7 @@ impl Db {
              WHERE ino = 1 AND uid = 0 AND gid = 0",
             params![mount_uid, mount_gid, now],
         )?;
+        conn.execute("DELETE FROM inodes WHERE nlink = 0 AND ino != 1", [])?;
 
         Ok(Self {
             conn: RefCell::new(conn),
@@ -233,7 +241,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        self.create_node(parent_ino, name, FileKind::Directory, mode, uid, gid)
+        self.create_node(parent_ino, name, NewNode::Directory { mode }, uid, gid)
     }
 
     pub fn create_file(
@@ -244,7 +252,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        self.create_node(parent_ino, name, FileKind::RegularFile, mode, uid, gid)
+        self.create_node(parent_ino, name, NewNode::File { mode }, uid, gid)
     }
 
     pub fn create_symlink(
@@ -255,21 +263,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
-        let inode = self.create_node(parent_ino, name, FileKind::Symlink, 0o777, uid, gid)?;
-
-        let conn = self.conn.borrow();
-        conn.prepare_cached(
-            "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
-        )?.execute(params![inode.ino as i64, target])?;
-
-        conn.prepare_cached(
-            "UPDATE inodes SET size = ?1 WHERE ino = ?2",
-        )?.execute(params![target.len() as i64, inode.ino as i64])?;
-
-        Ok(Inode {
-            size: target.len() as u64,
-            ..inode
-        })
+        self.create_node(parent_ino, name, NewNode::Symlink { target }, uid, gid)
     }
 
     pub fn read_symlink(&self, ino: u64) -> Result<Vec<u8>, DbError> {
@@ -365,7 +359,7 @@ impl Db {
             return Ok(Vec::new());
         }
 
-        let read_len = size.min((inode.size - offset) as u32) as usize;
+        let read_len = (size as u64).min(inode.size - offset) as usize;
         let mut output = vec![0; read_len];
         let conn = self.conn.borrow();
 
@@ -738,8 +732,7 @@ impl Db {
         &self,
         parent_ino: u64,
         name: &[u8],
-        kind: FileKind,
-        mode: u32,
+        node: NewNode<'_>,
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
@@ -748,19 +741,30 @@ impl Db {
         }
 
         let now = now_secs();
+        let (kind, mode, size) = match node {
+            NewNode::Directory { mode } => (FileKind::Directory, mode, 0),
+            NewNode::File { mode } => (FileKind::RegularFile, mode, 0),
+            NewNode::Symlink { target } => (FileKind::Symlink, 0o777, target.len() as u64),
+        };
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
 
         tx.prepare_cached(
             "INSERT INTO inodes (kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, 1)",
-        )?.execute(params![kind.as_i64(), mode, uid, gid, now])?;
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, 1)",
+        )?.execute(params![kind.as_i64(), mode, uid, gid, size as i64, now])?;
         let ino = tx.last_insert_rowid() as u64;
 
         if let Err(error) = tx.prepare_cached(
             "INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)",
         ).and_then(|mut s| s.execute(params![parent_ino as i64, name, ino as i64])) {
             return Err(error.into());
+        }
+
+        if let NewNode::Symlink { target } = node {
+            tx.prepare_cached(
+                "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
+            )?.execute(params![ino as i64, target])?;
         }
 
         tx.prepare_cached(
@@ -774,7 +778,7 @@ impl Db {
             mode,
             uid,
             gid,
-            size: 0,
+            size,
             atime: now,
             mtime: now,
             ctime: now,

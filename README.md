@@ -62,10 +62,10 @@ Run the Rust tests:
 cargo test
 ```
 
-The mount integration test is skipped unless FUSE tests are explicitly enabled and `fusermount3` is available:
+The mount integration test is ignored unless you select ignored tests and FUSE is available:
 
 ```bash
-DBFS_RUN_FUSE_TESTS=1 cargo test --test mount_integration
+DBFS_RUN_FUSE_TESTS=1 cargo test --test mount_integration -- --ignored
 ```
 
 There is also a libfuse-oriented pytest test harness:
