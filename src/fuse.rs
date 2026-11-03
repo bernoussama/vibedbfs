@@ -14,6 +14,7 @@ use crate::db::CHUNK_SIZE;
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
+const FLUSH_THRESHOLD: usize = 64 * 1024 * 1024;
 
 pub struct Dbfs {
     db: Db,
@@ -246,6 +247,15 @@ impl Dbfs {
         };
         if kind != FileKind::RegularFile {
             return Err(libc::ENOENT);
+        }
+
+        let buffered = self
+            .dirty_files
+            .borrow()
+            .get(&ino)
+            .map_or(0, |dirty| dirty.chunks.len() * CHUNK_SIZE);
+        if buffered >= FLUSH_THRESHOLD {
+            self.flush_file(ino)?;
         }
 
         let mut dirty_files = self.dirty_files.borrow_mut();
