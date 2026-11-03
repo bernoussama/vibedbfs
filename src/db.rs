@@ -9,6 +9,13 @@ use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
 
 const CHUNK_SIZE: usize = 65_536;
 
+pub(crate) struct VolumeUsage {
+    pub page_size: u64,
+    pub page_count: u64,
+    pub freelist_count: u64,
+    pub files: u64,
+}
+
 pub struct Db {
     conn: RefCell<Connection>,
     /// Tracks how many open file handles reference each inode.
@@ -49,6 +56,20 @@ impl Db {
             .borrow()
             .query_row(&sql, [], |row| row.get(0))
             .map_err(Into::into)
+    }
+
+    pub(crate) fn volume_usage(&self) -> Result<VolumeUsage, DbError> {
+        let conn = self.conn.borrow();
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        let files: i64 = conn.query_row("SELECT COUNT(*) FROM inodes", [], |row| row.get(0))?;
+        Ok(VolumeUsage {
+            page_size: page_size as u64,
+            page_count: page_count as u64,
+            freelist_count: freelist_count as u64,
+            files: files as u64,
+        })
     }
 
     pub fn pragma_string(&self, name: &str) -> Result<String, DbError> {

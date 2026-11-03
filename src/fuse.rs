@@ -13,6 +13,18 @@ use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsStats {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub bsize: u32,
+    pub namelen: u32,
+    pub frsize: u32,
+}
+
 pub struct Dbfs {
     db: Db,
     dirty_files: RefCell<HashMap<u64, DirtyFile>>,
@@ -31,6 +43,21 @@ impl Dbfs {
             db,
             dirty_files: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub fn statfs(&self) -> Result<FsStats, i32> {
+        let usage = self.db.volume_usage().map_err(errno_from_db_error)?;
+        let bsize = usage.page_size as u32;
+        Ok(FsStats {
+            blocks: usage.page_count,
+            bfree: usage.freelist_count,
+            bavail: usage.freelist_count,
+            files: usage.files,
+            ffree: 0,
+            bsize,
+            namelen: 255,
+            frsize: bsize,
+        })
     }
 
     pub fn getattr(&self, ino: u64) -> Result<FileAttr, i32> {
@@ -360,7 +387,19 @@ impl Filesystem for Dbfs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 512, 255, 65_536);
+        match Dbfs::statfs(self) {
+            Ok(stat) => reply.statfs(
+                stat.blocks,
+                stat.bfree,
+                stat.bavail,
+                stat.files,
+                stat.ffree,
+                stat.bsize,
+                stat.namelen,
+                stat.frsize,
+            ),
+            Err(errno) => reply.error(errno),
+        }
     }
 
     fn mkdir(
@@ -729,6 +768,26 @@ fn time_or_now(time: Option<TimeOrNow>) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statfs_matches_sqlite_pages_and_inode_count() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        db.create_file(1, b"notes.txt", 0o644, 1, 1)
+            .expect("create file");
+        let usage = db.volume_usage().expect("read sqlite volume");
+        let fs = Dbfs::new(db);
+        let stat = fs.statfs().expect("statfs");
+
+        assert_eq!(stat.bsize as u64, usage.page_size);
+        assert_eq!(stat.frsize, stat.bsize);
+        assert_eq!(stat.blocks, usage.page_count);
+        assert_eq!(stat.bfree, usage.freelist_count);
+        assert_eq!(stat.bavail, usage.freelist_count);
+        assert_eq!(stat.files, usage.files);
+        assert!(stat.blocks > 0);
+        assert!(stat.files >= 2);
+        assert_eq!(stat.namelen, 255);
+    }
 
     #[test]
     fn flush_returns_enospc_when_the_database_is_full() {
