@@ -1,8 +1,8 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
@@ -26,16 +26,16 @@ pub(crate) struct VolumeUsage {
 }
 
 pub struct Db {
-    conn: RefCell<Connection>,
+    conn: Mutex<Connection>,
     /// Tracks how many open file handles reference each inode.
     /// When unlink removes the last directory entry but the inode is still
     /// open (open_count > 0), we defer deletion until the file is released.
-    open_counts: RefCell<HashMap<u64, u64>>,
+    open_counts: Mutex<HashMap<u64, u64>>,
     /// Inodes pending deletion once all handles are closed.
-    pending_delete: RefCell<Vec<u64>>,
+    pending_delete: Mutex<Vec<u64>>,
     /// Cached inode kinds for open files (set on open, cleared on release).
     /// Avoids redundant get_inode calls on every write/read.
-    inode_kinds: RefCell<HashMap<u64, FileKind>>,
+    inode_kinds: Mutex<HashMap<u64, FileKind>>,
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +68,7 @@ impl Db {
 
     pub(crate) fn sync_durable(&self) -> Result<(), DbError> {
         let path = {
-            let conn = self.conn.borrow();
+            let conn = self.conn.lock().unwrap();
             match conn.path() {
                 Some(path) if !path.is_empty() && path != ":memory:" => path.to_owned(),
                 _ => return Ok(()),
@@ -80,13 +80,14 @@ impl Db {
     pub fn pragma_i64(&self, name: &str) -> Result<i64, DbError> {
         let sql = pragma_query(name)?;
         self.conn
-            .borrow()
+            .lock()
+            .unwrap()
             .query_row(&sql, [], |row| row.get(0))
             .map_err(Into::into)
     }
 
     pub(crate) fn volume_usage(&self) -> Result<VolumeUsage, DbError> {
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
         let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
         let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
@@ -102,7 +103,8 @@ impl Db {
     pub fn pragma_string(&self, name: &str) -> Result<String, DbError> {
         let sql = pragma_query(name)?;
         self.conn
-            .borrow()
+            .lock()
+            .unwrap()
             .query_row(&sql, [], |row| row.get(0))
             .map_err(Into::into)
     }
@@ -179,15 +181,15 @@ impl Db {
         conn.execute("DELETE FROM inodes WHERE nlink = 0 AND ino != 1", [])?;
 
         Ok(Self {
-            conn: RefCell::new(conn),
-            open_counts: RefCell::new(HashMap::new()),
-            pending_delete: RefCell::new(Vec::new()),
-            inode_kinds: RefCell::new(HashMap::new()),
+            conn: Mutex::new(conn),
+            open_counts: Mutex::new(HashMap::new()),
+            pending_delete: Mutex::new(Vec::new()),
+            inode_kinds: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn get_inode(&self, ino: u64) -> Result<Inode, DbError> {
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink,
                     atime_nsec, mtime_nsec, ctime_nsec
@@ -200,7 +202,7 @@ impl Db {
 
     pub fn lookup(&self, parent_ino: u64, name: &[u8]) -> Result<Inode, DbError> {
         check_name(name)?;
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.nlink,
                     i.atime_nsec, i.mtime_nsec, i.ctime_nsec
@@ -217,7 +219,7 @@ impl Db {
             return Err(DbError::NotDirectory);
         }
 
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT d.name, i.ino, i.kind
              FROM dirents d
@@ -253,7 +255,7 @@ impl Db {
             return Err(DbError::NotDirectory);
         }
 
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT d.name, i.ino, i.kind
              FROM dirents d
@@ -323,7 +325,7 @@ impl Db {
             return Err(DbError::InvalidInput);
         }
 
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         conn.prepare_cached("SELECT target FROM symlink_targets WHERE ino = ?1")?
             .query_row(params![ino as i64], |row| row.get(0))
             .map_err(Into::into)
@@ -331,19 +333,19 @@ impl Db {
 
     /// Track that a file handle has been opened for this inode.
     pub fn open_file(&self, ino: u64, kind: FileKind) {
-        *self.open_counts.borrow_mut().entry(ino).or_insert(0) += 1;
-        self.inode_kinds.borrow_mut().insert(ino, kind);
+        *self.open_counts.lock().unwrap().entry(ino).or_insert(0) += 1;
+        self.inode_kinds.lock().unwrap().insert(ino, kind);
     }
 
     /// Return the cached inode kind for an open file, if available.
     pub fn inode_kind(&self, ino: u64) -> Option<FileKind> {
-        self.inode_kinds.borrow().get(&ino).copied()
+        self.inode_kinds.lock().unwrap().get(&ino).copied()
     }
 
     /// Release a file handle. If this was the last handle and the inode
     /// is pending deletion, delete it now.
     pub fn release_file(&self, ino: u64) {
-        let mut open_counts = self.open_counts.borrow_mut();
+        let mut open_counts = self.open_counts.lock().unwrap();
         let count = open_counts.entry(ino).or_insert(0);
         if *count > 0 {
             *count -= 1;
@@ -351,16 +353,17 @@ impl Db {
 
         if *count == 0 {
             open_counts.remove(&ino);
-            self.inode_kinds.borrow_mut().remove(&ino);
+            self.inode_kinds.lock().unwrap().remove(&ino);
             drop(open_counts);
 
-            let mut pending = self.pending_delete.borrow_mut();
+            let mut pending = self.pending_delete.lock().unwrap();
             if let Some(pos) = pending.iter().position(|&p| p == ino) {
                 pending.swap_remove(pos);
                 drop(pending);
                 let _ = self
                     .conn
-                    .borrow()
+                    .lock()
+                    .unwrap()
                     .prepare_cached("DELETE FROM inodes WHERE ino = ?1")
                     .and_then(|mut s| s.execute(params![ino as i64]));
             }
@@ -378,7 +381,7 @@ impl Db {
         }
 
         let now = now_ts();
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         tx.prepare_cached("INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)")?
@@ -417,7 +420,7 @@ impl Db {
 
         let read_len = (size as u64).min(inode.size - offset) as usize;
         let mut output = vec![0; read_len];
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
 
         let start = offset as usize;
         let end = start + read_len;
@@ -480,7 +483,7 @@ impl Db {
         let mut new_size = inode.size;
         let mut written = 0usize;
 
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         {
@@ -557,7 +560,7 @@ impl Db {
     }
 
     pub(crate) fn read_chunk(&self, ino: u64, chunk_index: u64) -> Result<Vec<u8>, DbError> {
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached("SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2")?;
         let chunk = stmt
@@ -573,7 +576,7 @@ impl Db {
         chunks: &BTreeMap<u64, Vec<u8>>,
         now: Timestamp,
     ) -> Result<(), DbError> {
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         {
@@ -601,7 +604,7 @@ impl Db {
         }
 
         let now = now_ts();
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         if size == 0 {
@@ -661,7 +664,7 @@ impl Db {
         }
 
         let now = now_ts();
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         tx.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
@@ -684,7 +687,7 @@ impl Db {
         }
 
         let now = now_ts();
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let child_count: i64 = tx
             .prepare_cached("SELECT COUNT(*) FROM dirents WHERE parent_ino = ?1")?
@@ -770,7 +773,7 @@ impl Db {
             .is_some_and(|target| target.kind == FileKind::Directory);
 
         let now = now_ts();
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         if let Some(target) = existing_target {
@@ -838,7 +841,8 @@ impl Db {
 
         let open_count = self
             .open_counts
-            .borrow()
+            .lock()
+            .unwrap()
             .get(&target.ino)
             .copied()
             .unwrap_or(0);
@@ -847,8 +851,8 @@ impl Db {
                 "UPDATE inodes SET nlink = 0, ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
             )?
             .execute(params![now.secs, now.nsec as i64, target.ino as i64])?;
-            if !self.pending_delete.borrow().contains(&target.ino) {
-                self.pending_delete.borrow_mut().push(target.ino);
+            if !self.pending_delete.lock().unwrap().contains(&target.ino) {
+                self.pending_delete.lock().unwrap().push(target.ino);
             }
         } else {
             tx.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
@@ -867,7 +871,7 @@ impl Db {
         let atime = update.atime.unwrap_or(inode.atime);
         let mtime = update.mtime.unwrap_or(inode.mtime);
 
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         conn.prepare_cached(
             "UPDATE inodes
              SET mode = ?1, uid = ?2, gid = ?3,
@@ -914,7 +918,7 @@ impl Db {
         };
         let nlink: i64 = if kind == FileKind::Directory { 2 } else { 1 };
         let parent_delta: i64 = if kind == FileKind::Directory { 1 } else { 0 };
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         tx.prepare_cached(
@@ -977,7 +981,7 @@ impl Db {
             return Ok(true);
         }
 
-        let conn = self.conn.borrow();
+        let conn = self.conn.lock().unwrap();
         let mut stmt =
             conn.prepare_cached("SELECT parent_ino FROM dirents WHERE child_ino = ?1")?;
         let mut current = ino;
@@ -1163,10 +1167,12 @@ impl Db {
     pub(crate) fn cap_page_count_at_current(&self) -> Result<(), DbError> {
         let pages: i64 = self
             .conn
-            .borrow()
+            .lock()
+            .unwrap()
             .query_row("PRAGMA page_count", [], |row| row.get(0))?;
         self.conn
-            .borrow()
+            .lock()
+            .unwrap()
             .pragma_update(None, "max_page_count", pages)?;
         Ok(())
     }

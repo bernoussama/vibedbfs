@@ -1,8 +1,9 @@
-use std::cell::RefCell;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
+use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -28,9 +29,26 @@ pub struct FsStats {
     pub frsize: u32,
 }
 
+/// The filesystem as the FUSE session sees it. Its state lives in [`Shared`] behind an
+/// `Arc`, so the shutdown path can reach the same dirty buffers from another thread.
 pub struct Dbfs {
+    shared: Arc<Shared>,
+}
+
+/// State shared by the FUSE session and the shutdown path. `Dbfs` derefs to it, so
+/// methods reach `self.db` and `self.dirty_files` directly. The `fuse` module is
+/// private, so this type is not reachable outside the crate.
+pub struct Shared {
     db: Db,
-    dirty_files: RefCell<HashMap<u64, DirtyFile>>,
+    dirty_files: Mutex<HashMap<u64, DirtyFile>>,
+}
+
+impl Deref for Dbfs {
+    type Target = Shared;
+
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -43,8 +61,10 @@ struct DirtyFile {
 impl Dbfs {
     pub fn new(db: Db) -> Self {
         Self {
-            db,
-            dirty_files: RefCell::new(HashMap::new()),
+            shared: Arc::new(Shared {
+                db,
+                dirty_files: Mutex::new(HashMap::new()),
+            }),
         }
     }
 
@@ -69,7 +89,7 @@ impl Dbfs {
             .get_inode(ino)
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
-        if let Some(dirty) = self.dirty_files.borrow().get(&ino) {
+        if let Some(dirty) = self.dirty_files.lock().unwrap().get(&ino) {
             overlay_dirty(&mut attr, dirty);
         }
         Ok(attr)
@@ -81,7 +101,7 @@ impl Dbfs {
             .lookup(parent_ino, name)
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
-        if let Some(dirty) = self.dirty_files.borrow().get(&attr.ino) {
+        if let Some(dirty) = self.dirty_files.lock().unwrap().get(&attr.ino) {
             overlay_dirty(&mut attr, dirty);
         }
         Ok(attr)
@@ -218,7 +238,7 @@ impl Dbfs {
     }
 
     pub fn read(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        let dirty_files = self.dirty_files.borrow();
+        let dirty_files = self.dirty_files.lock().unwrap();
         let Some(dirty) = dirty_files.get(&ino) else {
             return self
                 .db
@@ -277,7 +297,8 @@ impl Dbfs {
 
         let buffered = self
             .dirty_files
-            .borrow()
+            .lock()
+            .unwrap()
             .get(&ino)
             .map_or(0, |dirty| dirty.chunks.len() * CHUNK_SIZE);
         if buffered >= FLUSH_THRESHOLD {
@@ -285,7 +306,7 @@ impl Dbfs {
         }
 
         let modified = Timestamp::from_system_time(SystemTime::now());
-        let mut dirty_files = self.dirty_files.borrow_mut();
+        let mut dirty_files = self.dirty_files.lock().unwrap();
         let dirty = dirty_files.entry(ino).or_insert_with(|| {
             let size = self.db.get_inode(ino).map(|i| i.size).unwrap_or(0);
             DirtyFile {
@@ -324,14 +345,14 @@ impl Dbfs {
     }
 
     pub fn flush_file(&self, ino: u64) -> Result<(), i32> {
-        let Some(dirty) = self.dirty_files.borrow_mut().remove(&ino) else {
+        let Some(dirty) = self.dirty_files.lock().unwrap().remove(&ino) else {
             return Ok(());
         };
 
         match self.db.replace_chunks(ino, dirty.size, &dirty.chunks, dirty.mtime) {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.dirty_files.borrow_mut().insert(ino, dirty);
+                self.dirty_files.lock().unwrap().insert(ino, dirty);
                 Err(errno_from_db_error(error))
             }
         }
@@ -346,7 +367,7 @@ impl Dbfs {
         let flushed = self.flush_file(ino);
         self.db.release_file(ino);
         if flushed.is_err() && self.db.get_inode(ino).is_err() {
-            self.dirty_files.borrow_mut().remove(&ino);
+            self.dirty_files.lock().unwrap().remove(&ino);
         }
         flushed
     }
