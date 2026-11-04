@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +39,7 @@ fn sighup_flushes_an_open_file_and_exits_zero() {
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn sigterm_after_close_unmounts_and_exits_zero() {
-    require_fuse();
+    let _serial = require_fuse();
     let work = work_dir("shutdown-closed");
     let (db, mnt) = (work.join("db.sqlite"), work.join("mnt"));
     let payload = payload();
@@ -61,7 +62,7 @@ fn sigterm_after_close_unmounts_and_exits_zero() {
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn external_unmount_exits_zero_and_keeps_data() {
-    require_fuse();
+    let _serial = require_fuse();
     let work = work_dir("shutdown-external");
     let (db, mnt) = (work.join("db.sqlite"), work.join("mnt"));
     let payload = payload();
@@ -90,7 +91,7 @@ fn external_unmount_exits_zero_and_keeps_data() {
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn failed_flush_on_shutdown_exits_one_with_a_message() {
-    require_fuse();
+    let _serial = require_fuse();
     let work = work_dir("shutdown-flush-fails");
     let (db, mnt) = (work.join("db.sqlite"), work.join("mnt"));
     let payload = payload();
@@ -134,7 +135,7 @@ fn failed_flush_on_shutdown_exits_one_with_a_message() {
 /// that dbfs flushes while the mount is still up. The payload is written before the
 /// signal and `write` has returned, so the test does not race with the kernel.
 fn assert_open_file_survives_signal(signal: libc::c_int) {
-    require_fuse();
+    let _serial = require_fuse();
     let work = work_dir("shutdown-open");
     let (db, mnt) = (work.join("db.sqlite"), work.join("mnt"));
     let payload = payload();
@@ -260,10 +261,18 @@ fn payload() -> Vec<u8> {
     (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect()
 }
 
-fn require_fuse() {
+/// Serializes the tests in this file. Each test holds a file open with unflushed
+/// data. If another test forks a process meanwhile (to start dbfs or run
+/// fusermount3), the child inherits that fd and closes it at exec. The kernel then
+/// sends FUSE_FLUSH, which commits the data early and breaks the test's
+/// assumption that the data is still dirty when the signal arrives.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn require_fuse() -> MutexGuard<'static, ()> {
     if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || !command_exists("fusermount3") {
         panic!("shutdown tests require DBFS_RUN_FUSE_TESTS=1 and fusermount3");
     }
+    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn command_exists(name: &str) -> bool {
