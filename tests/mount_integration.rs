@@ -147,6 +147,30 @@ fn rename_noreplace_does_not_replace_an_existing_target_when_enabled() {
 
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn rm_rf_removes_every_entry_of_a_large_directory_when_enabled() {
+    // The kernel lists a directory in buffer-sized batches. `rm -rf` deletes
+    // each batch before asking for the next, so positional readdir offsets
+    // used to skip entries and leave the directory non-empty.
+    if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() {
+        return;
+    }
+    let mount = BenchMount::start("rm-rf");
+    let tree = mount.mountpoint().join("tree");
+    std::fs::create_dir(&tree).expect("mkdir tree");
+    for i in 0..5_000 {
+        File::create(tree.join(format!("entry-{i:05}"))).expect("create entry");
+    }
+    let status = std::process::Command::new("rm")
+        .arg("-rf")
+        .arg(&tree)
+        .status()
+        .expect("run rm -rf");
+    assert!(status.success(), "rm -rf failed: {status}");
+    assert!(!tree.exists(), "rm -rf left the directory behind");
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn mounted_fallocate_extends_size_and_reads_zeros_when_enabled() {
     const MIB: u64 = 1 << 20;
     let mount = BenchMount::start("fallocate");

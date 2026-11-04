@@ -919,6 +919,80 @@ fn child_ino_lookups_use_an_index() {
     remove_db(&path);
 }
 
+#[test]
+fn version_2_dirents_are_rebuilt_with_stable_ids() {
+    let path = disk_db_path("schema-v2-dirents");
+    let (docs, notes) = {
+        let db = Db::open(&path).expect("create database");
+        let docs = db.create_dir(1, b"docs", 0o755, 1, 1).expect("mkdir");
+        let notes = db.create_file(docs.ino, b"notes", 0o644, 1, 1).expect("create");
+        db.write_file(notes.ino, 0, b"kept").expect("write");
+        (docs, notes)
+    };
+    // Rewrite dirents in the version 2 layout: composite primary key, no id.
+    exec_sql(
+        &path,
+        "CREATE TABLE dirents_v2 (
+           parent_ino INTEGER NOT NULL, name BLOB NOT NULL, child_ino INTEGER NOT NULL,
+           PRIMARY KEY (parent_ino, name),
+           FOREIGN KEY (parent_ino) REFERENCES inodes(ino) ON DELETE CASCADE,
+           FOREIGN KEY (child_ino) REFERENCES inodes(ino) ON DELETE CASCADE
+         );
+         INSERT INTO dirents_v2 SELECT parent_ino, name, child_ino FROM dirents;
+         DROP TABLE dirents;
+         ALTER TABLE dirents_v2 RENAME TO dirents;
+         CREATE INDEX dirents_child ON dirents(child_ino);
+         PRAGMA user_version = 2;",
+    );
+    {
+        let db = Db::open(&path).expect("migrate version 2 database");
+        assert_eq!(db.lookup(1, b"docs").expect("docs survives").ino, docs.ino);
+        let found = db.lookup(docs.ino, b"notes").expect("notes survives");
+        assert_eq!(found.ino, notes.ino);
+        assert_eq!(db.read_file(notes.ino, 0, 4).expect("read"), b"kept");
+        assert_eq!(
+            db.create_file(1, b"docs", 0o644, 1, 1).err(),
+            Some(DbError::AlreadyExists),
+            "names stay unique per directory"
+        );
+    }
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    assert_eq!(
+        query_i64(&path, "SELECT COUNT(*) FROM pragma_table_info('dirents') WHERE name = 'id'"),
+        1
+    );
+    remove_db(&path);
+}
+
+#[test]
+fn directory_listing_query_uses_the_scan_index_without_sorting() {
+    let path = disk_db_path("schema-scan-index");
+    drop(Db::open(&path).expect("create database"));
+    let conn = Connection::open(&path).expect("open raw sqlite");
+    let plan: Vec<String> = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT d.id, d.name, d.child_ino, i.kind
+             FROM dirents d JOIN inodes i ON i.ino = d.child_ino
+             WHERE d.parent_ino = 1 AND d.id > 5 ORDER BY d.id",
+        )
+        .expect("prepare plan")
+        .query_map([], |row| row.get::<_, String>(3))
+        .expect("query plan")
+        .collect::<Result<_, _>>()
+        .expect("read plan");
+    assert!(
+        plan.iter().any(|step| step.contains("dirents_scan")),
+        "listing should use dirents_scan, got {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+        "listing should not sort, got {plan:?}"
+    );
+    drop(conn);
+    remove_db(&path);
+}
+
 fn disk_db_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

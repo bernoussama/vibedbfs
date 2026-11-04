@@ -16,7 +16,8 @@ pub(crate) const CHUNK_SIZE: usize = 65_536;
 /// - 0: databases created before versioning existed (may lack `*_nsec` columns)
 /// - 1: `inodes` has `atime_nsec`, `mtime_nsec`, `ctime_nsec`
 /// - 2: index `dirents_child` on `dirents(child_ino)`
-pub const SCHEMA_VERSION: i64 = 2;
+/// - 3: `dirents.id` is a stable per-entry id, used as the readdir cookie
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub(crate) struct VolumeUsage {
     pub page_size: u64,
@@ -129,10 +130,10 @@ impl Db {
             );
 
             CREATE TABLE IF NOT EXISTS dirents (
+              id INTEGER PRIMARY KEY,
               parent_ino INTEGER NOT NULL,
               name BLOB NOT NULL,
               child_ino INTEGER NOT NULL,
-              PRIMARY KEY (parent_ino, name),
               FOREIGN KEY (parent_ino) REFERENCES inodes(ino) ON DELETE CASCADE,
               FOREIGN KEY (child_ino) REFERENCES inodes(ino) ON DELETE CASCADE
             );
@@ -249,41 +250,54 @@ impl Db {
         Ok(entries)
     }
 
-    /// Like `list_dir` but skips the first `offset` rows in SQL.
-    pub fn list_dir_offset(&self, ino: u64, offset: u64) -> Result<Vec<DirEntry>, DbError> {
+    /// Streams the entries of directory `ino` whose id is greater than `after_id`,
+    /// in id order, to `emit(id, name, child_ino, kind)`. Stops early when `emit`
+    /// returns true.
+    ///
+    /// Entry ids never change for the life of an entry (rename within a directory
+    /// keeps it), so a readdir cookie built from the id stays valid while other
+    /// entries are added or removed. Names are borrowed from SQLite, not copied.
+    pub fn read_dir_after(
+        &self,
+        ino: u64,
+        after_id: i64,
+        mut emit: impl FnMut(i64, &[u8], u64, FileKind) -> bool,
+    ) -> Result<(), DbError> {
         if self.get_inode(ino)?.kind != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
-            "SELECT d.name, i.ino, i.kind
+            "SELECT d.id, d.name, d.child_ino, i.kind
              FROM dirents d
              JOIN inodes i ON i.ino = d.child_ino
-             WHERE d.parent_ino = ?1
-             ORDER BY d.name
-             LIMIT -1 OFFSET ?2",
+             WHERE d.parent_ino = ?1 AND d.id > ?2
+             ORDER BY d.id",
         )?;
+        let mut rows = stmt.query(params![ino as i64, after_id])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let name = row.get_ref(1)?.as_blob().map_err(SqlError::from)?;
+            let child = row.get::<_, i64>(2)? as u64;
+            let kind = FileKind::from_i64(row.get(3)?)?;
+            if emit(id, name, child, kind) {
+                break;
+            }
+        }
+        Ok(())
+    }
 
-        let entries = stmt
-            .query_map(params![ino as i64, offset as i64], |row| {
-                let kind = FileKind::from_i64(row.get(2)?).map_err(|err| {
-                    SqlError::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Integer,
-                        Box::new(std::io::Error::other(format!("{err:?}"))),
-                    )
-                })?;
-
-                Ok(DirEntry {
-                    name: row.get(0)?,
-                    ino: row.get::<_, i64>(1)? as u64,
-                    kind,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(entries)
+    /// Returns the parent directory of directory `ino` (the root is its own parent).
+    pub fn parent_of_dir(&self, ino: u64) -> Result<u64, DbError> {
+        if ino == 1 {
+            return Ok(1);
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached("SELECT parent_ino FROM dirents WHERE child_ino = ?1 LIMIT 1")?
+            .query_row(params![ino as i64], |row| row.get::<_, i64>(0))
+            .map(|parent| parent as u64)
+            .map_err(Into::into)
     }
 
     pub fn create_dir(
@@ -1128,6 +1142,35 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
         // Without this index, `is_descendant` and the `child_ino` foreign-key
         // cascade on every inode delete scan the whole `dirents` table.
         tx.execute_batch("CREATE INDEX IF NOT EXISTS dirents_child ON dirents(child_ino);")?;
+    }
+    if version < 3 {
+        // Give every entry a stable id for readdir cookies. Positional cookies
+        // (LIMIT/OFFSET) shift when entries are deleted between readdir calls,
+        // so `rm -rf` skipped about half of a large directory.
+        if !table_has_column(&tx, "dirents", "id")? {
+            tx.execute_batch(
+                "CREATE TABLE dirents_v3 (
+                   id INTEGER PRIMARY KEY,
+                   parent_ino INTEGER NOT NULL,
+                   name BLOB NOT NULL,
+                   child_ino INTEGER NOT NULL,
+                   FOREIGN KEY (parent_ino) REFERENCES inodes(ino) ON DELETE CASCADE,
+                   FOREIGN KEY (child_ino) REFERENCES inodes(ino) ON DELETE CASCADE
+                 );
+                 INSERT INTO dirents_v3 (parent_ino, name, child_ino)
+                   SELECT parent_ino, name, child_ino FROM dirents ORDER BY parent_ino, name;
+                 DROP TABLE dirents;
+                 ALTER TABLE dirents_v3 RENAME TO dirents;",
+            )?;
+        }
+        // Every SQLite index ends with the rowid, so `dirents_scan` on
+        // (parent_ino) is ordered by id within a directory and serves the
+        // keyset query in `read_dir_after` without a sort.
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS dirents_name ON dirents(parent_ino, name);
+             CREATE INDEX IF NOT EXISTS dirents_child ON dirents(child_ino);
+             CREATE INDEX IF NOT EXISTS dirents_scan ON dirents(parent_ino);",
+        )?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;

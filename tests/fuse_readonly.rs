@@ -68,24 +68,102 @@ fn reads_directory_entries_with_dot_entries_first() {
                 name: b".".to_vec(),
                 ino: 1,
                 kind: FileType::Directory,
+                offset: 1,
             },
             DbfsDirEntry {
                 name: b"..".to_vec(),
                 ino: 1,
                 kind: FileType::Directory,
+                offset: 2,
             },
             DbfsDirEntry {
                 name: b"docs".to_vec(),
                 ino: docs.ino,
                 kind: FileType::Directory,
+                offset: 3,
             },
             DbfsDirEntry {
                 name: b"notes.txt".to_vec(),
                 ino: notes.ino,
                 kind: FileType::RegularFile,
+                offset: 4,
             },
         ]
     );
+}
+
+#[test]
+fn readdir_resumes_without_skipping_while_entries_are_deleted() {
+    // `rm -rf` pattern: read a page, delete what was returned, read the next
+    // page from the last cookie. Positional cookies skipped about half the
+    // directory here; stable id cookies must visit every entry once.
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let dir = db.create_dir(1, b"big", 0o755, 1000, 1000).expect("mkdir");
+    let total = 1_000;
+    for i in 0..total {
+        db.create_file(dir.ino, format!("f{i:04}").as_bytes(), 0o644, 1000, 1000)
+            .expect("create file");
+    }
+    let fs = Dbfs::new(db);
+
+    let mut offset = 0;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let mut page = Vec::new();
+        fs.readdir_stream(dir.ino, offset, |_, next, _, name| {
+            page.push((next, name.to_vec()));
+            page.len() == 37
+        })
+        .expect("readdir page");
+        if page.is_empty() {
+            break;
+        }
+        for (next, name) in page {
+            offset = next;
+            if name != b"." && name != b".." {
+                assert!(seen.insert(name.clone()), "entry {name:?} returned twice");
+                fs.unlink(dir.ino, &name).expect("unlink listed entry");
+            }
+        }
+    }
+
+    assert_eq!(seen.len(), total);
+    assert_eq!(fs.rmdir(1, b"big"), Ok(()));
+}
+
+#[test]
+fn readdir_dotdot_points_at_the_parent_directory() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let outer = db.create_dir(1, b"outer", 0o755, 1000, 1000).expect("mkdir outer");
+    let inner = db
+        .create_dir(outer.ino, b"inner", 0o755, 1000, 1000)
+        .expect("mkdir inner");
+    let fs = Dbfs::new(db);
+
+    let entries = fs.readdir(inner.ino, 0).expect("readdir inner");
+    assert_eq!(entries[1].name, b"..");
+    assert_eq!(entries[1].ino, outer.ino);
+}
+
+#[test]
+fn readdir_cookie_survives_rename_within_the_directory() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    for name in [b"a", b"b", b"c"] {
+        db.create_file(1, name, 0o644, 1000, 1000).expect("create");
+    }
+    let fs = Dbfs::new(db);
+
+    let first = fs.readdir(1, 0).expect("readdir");
+    let after_a = first.iter().find(|e| e.name == b"a").expect("a listed").offset;
+    fs.rename(1, b"a", 1, b"z", 0).expect("rename a to z");
+
+    let rest: Vec<_> = fs
+        .readdir(1, after_a)
+        .expect("resume readdir")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(rest, vec![b"b".to_vec(), b"c".to_vec()]);
 }
 
 #[test]

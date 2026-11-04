@@ -186,38 +186,51 @@ impl Dbfs {
         Ok(attr)
     }
 
+    /// Streams directory entries starting after FUSE offset `offset` to
+    /// `emit(ino, next_offset, kind, name)`, stopping when it returns true
+    /// (the reply buffer is full).
+    ///
+    /// Offsets are stable cookies, not positions: `.` is 1, `..` is 2, and an
+    /// entry with dirent id `n` is `n + 2`. Removing entries between calls (as
+    /// `rm -rf` does) therefore never skips or repeats the remaining entries.
+    pub fn readdir_stream(
+        &self,
+        ino: u64,
+        offset: i64,
+        mut emit: impl FnMut(u64, i64, FileType, &[u8]) -> bool,
+    ) -> Result<(), i32> {
+        const DOT: i64 = 1;
+        const DOTDOT: i64 = 2;
+        let parent = match self.db.parent_of_dir(ino) {
+            Ok(parent) => parent,
+            Err(DbError::NotFound) => ino,
+            Err(error) => return Err(errno_from_db_error(error)),
+        };
+        if offset < DOT && emit(ino, DOT, FileType::Directory, b".") {
+            return Ok(());
+        }
+        if offset < DOTDOT && emit(parent, DOTDOT, FileType::Directory, b"..") {
+            return Ok(());
+        }
+        self.db
+            .read_dir_after(ino, (offset - DOTDOT).max(0), |id, name, child, kind| {
+                emit(child, id + DOTDOT, DbfsDirEntry::file_type(kind), name)
+            })
+            .map_err(errno_from_db_error)
+    }
+
+    /// Collects every entry after `offset`. See `readdir_stream`.
     pub fn readdir(&self, ino: u64, offset: i64) -> Result<Vec<DbfsDirEntry>, i32> {
         let mut entries = Vec::new();
-        let dot_count: i64 = 2;
-
-        if offset < 1 {
+        self.readdir_stream(ino, offset, |ino, next_offset, kind, name| {
             entries.push(DbfsDirEntry {
-                name: b".".to_vec(),
+                name: name.to_vec(),
                 ino,
-                kind: FileType::Directory,
+                kind,
+                offset: next_offset,
             });
-        }
-        if offset < 2 {
-            entries.push(DbfsDirEntry {
-                name: b"..".to_vec(),
-                ino: self.parent_ino(ino).unwrap_or(ino),
-                kind: FileType::Directory,
-            });
-        }
-
-        let db_offset = (offset - dot_count).max(0) as u64;
-        entries.extend(
-            self.db
-                .list_dir_offset(ino, db_offset)
-                .map_err(errno_from_db_error)?
-                .into_iter()
-                .map(|entry| DbfsDirEntry {
-                    name: entry.name,
-                    ino: entry.ino,
-                    kind: DbfsDirEntry::file_type(entry.kind),
-                }),
-        );
-
+            false
+        })?;
         Ok(entries)
     }
 
@@ -556,9 +569,6 @@ impl Dbfs {
             .map_err(errno_from_db_error)
     }
 
-    fn parent_ino(&self, ino: u64) -> Option<u64> {
-        if ino == 1 { Some(1) } else { None }
-    }
 }
 
 impl Filesystem for Dbfs {
@@ -591,21 +601,11 @@ impl Filesystem for Dbfs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        match Dbfs::readdir(self, ino, offset) {
-            Ok(entries) => {
-                for (i, entry) in entries.into_iter().enumerate() {
-                    let next_offset = offset + (i as i64) + 1;
-                    if reply.add(
-                        entry.ino,
-                        next_offset,
-                        entry.kind,
-                        OsStr::from_bytes(&entry.name),
-                    ) {
-                        break;
-                    }
-                }
-                reply.ok();
-            }
+        let result = self.readdir_stream(ino, offset, |ino, next_offset, kind, name| {
+            reply.add(ino, next_offset, kind, OsStr::from_bytes(name))
+        });
+        match result {
+            Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
     }
@@ -990,6 +990,8 @@ pub struct DbfsDirEntry {
     pub name: Vec<u8>,
     pub ino: u64,
     pub kind: FileType,
+    /// The FUSE offset of the next entry: pass it to `readdir` to resume after this one.
+    pub offset: i64,
 }
 
 impl DbfsDirEntry {
