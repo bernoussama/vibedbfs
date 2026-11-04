@@ -342,10 +342,22 @@ fn run_passes_allow_other_to_the_mounter() {
 #[test]
 fn write_buffer_accepts_sizes_with_suffixes() {
     assert_eq!(parse_mount(&[]).write_buffer, None);
-    assert_eq!(parse_mount(&["--write-buffer", "8M"]).write_buffer, Some(8 << 20));
-    assert_eq!(parse_mount(&["--write-buffer", "512k"]).write_buffer, Some(512 << 10));
-    assert_eq!(parse_mount(&["--write-buffer", "1G"]).write_buffer, Some(1 << 30));
-    assert_eq!(parse_mount(&["--write-buffer", "65536"]).write_buffer, Some(65_536));
+    assert_eq!(
+        parse_mount(&["--write-buffer", "8M"]).write_buffer,
+        Some(8 << 20)
+    );
+    assert_eq!(
+        parse_mount(&["--write-buffer", "512k"]).write_buffer,
+        Some(512 << 10)
+    );
+    assert_eq!(
+        parse_mount(&["--write-buffer", "1G"]).write_buffer,
+        Some(1 << 30)
+    );
+    assert_eq!(
+        parse_mount(&["--write-buffer", "65536"]).write_buffer,
+        Some(65_536)
+    );
 }
 
 #[test]
@@ -357,4 +369,10 @@ fn write_buffer_rejects_bad_sizes() {
             "`{bad}` should be rejected"
         );
     }
+}
+
+#[test]
+fn kernel_cache_is_off_unless_requested() {
+    assert!(!parse_mount(&[]).kernel_cache);
+    assert!(parse_mount(&["--kernel-cache"]).kernel_cache);
 }

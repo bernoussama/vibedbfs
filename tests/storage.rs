@@ -324,10 +324,7 @@ fn batched_overlapping_writes_preserve_write_order() {
 
     db.write_file_batch(
         file.ino,
-        &[
-            (10, &b"BBBB"[..]),
-            (0, &b"abcdefghijklmnopqrst"[..]),
-        ],
+        &[(10, &b"BBBB"[..]), (0, &b"abcdefghijklmnopqrst"[..])],
     )
     .expect("write batch");
 
@@ -733,10 +730,7 @@ fn reopen_drops_inodes_left_unlinked_while_open() {
             b"kept"
         );
     }
-    assert_eq!(
-        count_chunks(&path, leaked_ino),
-        0
-    );
+    assert_eq!(count_chunks(&path, leaked_ino), 0);
     assert_eq!(
         count_rows(
             &path,
@@ -759,10 +753,7 @@ fn reopen_drops_inodes_left_unlinked_while_open() {
             b"kept"
         );
     }
-    assert_eq!(
-        count_chunks(&path, leaked_ino),
-        0
-    );
+    assert_eq!(count_chunks(&path, leaked_ino), 0);
     remove_db(&path);
 }
 
@@ -929,7 +920,9 @@ fn version_2_dirents_are_rebuilt_with_stable_ids() {
     let (docs, notes) = {
         let db = Db::open(&path).expect("create database");
         let docs = db.create_dir(1, b"docs", 0o755, 1, 1).expect("mkdir");
-        let notes = db.create_file(docs.ino, b"notes", 0o644, 1, 1).expect("create");
+        let notes = db
+            .create_file(docs.ino, b"notes", 0o644, 1, 1)
+            .expect("create");
         db.write_file(notes.ino, 0, b"kept").expect("write");
         (docs, notes)
     };
@@ -962,7 +955,10 @@ fn version_2_dirents_are_rebuilt_with_stable_ids() {
     }
     assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
     assert_eq!(
-        query_i64(&path, "SELECT COUNT(*) FROM pragma_table_info('dirents') WHERE name = 'id'"),
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM pragma_table_info('dirents') WHERE name = 'id'"
+        ),
         1
     );
     remove_db(&path);
@@ -1068,7 +1064,10 @@ fn inode_head_reports_corrupt_kind() {
     };
     Connection::open(&path)
         .expect("open raw sqlite")
-        .execute("UPDATE inodes SET kind = 9 WHERE ino = ?1", params![ino as i64])
+        .execute(
+            "UPDATE inodes SET kind = 9 WHERE ino = ?1",
+            params![ino as i64],
+        )
         .expect("corrupt kind");
 
     let db = Db::open(&path).expect("reopen database");
@@ -1085,8 +1084,10 @@ fn read_across_a_missing_chunk_returns_zeros_for_the_hole() {
     let file = db
         .create_file(1, b"holey.bin", 0o644, 1000, 1000)
         .expect("create file");
-    db.write_file(file.ino, (CHUNK - 3) as u64, b"abc").expect("chunk 0 tail");
-    db.write_file(file.ino, (2 * CHUNK) as u64, b"xyz").expect("chunk 2 head");
+    db.write_file(file.ino, (CHUNK - 3) as u64, b"abc")
+        .expect("chunk 0 tail");
+    db.write_file(file.ino, (2 * CHUNK) as u64, b"xyz")
+        .expect("chunk 2 head");
 
     let data = db
         .read_file(file.ino, (CHUNK - 3) as u64, (CHUNK + 6) as u32)
@@ -1107,7 +1108,8 @@ fn read_over_a_short_chunk_returns_zeros_up_to_size() {
         .expect("create file");
     // Chunk 0 is stored with 4 bytes only; chunk 1 sets the size past it.
     db.write_file(file.ino, 0, b"head").expect("short chunk");
-    db.write_file(file.ino, (CHUNK + 1) as u64, b"!").expect("next chunk");
+    db.write_file(file.ino, (CHUNK + 1) as u64, b"!")
+        .expect("next chunk");
 
     let data = db
         .read_file(file.ino, 2, CHUNK as u32)
@@ -1130,7 +1132,10 @@ fn truncating_inside_a_chunk_keeps_the_prefix_and_extends_with_zeros() {
     db.truncate_file(file.ino, 4).expect("truncate smaller");
     db.truncate_file(file.ino, 8).expect("truncate larger");
 
-    assert_eq!(db.read_file(file.ino, 0, 16).expect("read"), b"0123\0\0\0\0");
+    assert_eq!(
+        db.read_file(file.ino, 0, 16).expect("read"),
+        b"0123\0\0\0\0"
+    );
 }
 
 #[test]
@@ -1165,7 +1170,8 @@ fn the_last_chunk_of_one_file_does_not_touch_the_next_inode() {
     let a = db.create_file(1, b"a", 0o644, 1, 1).expect("create a");
     let b = db.create_file(1, b"b", 0o644, 1, 1).expect("create b");
     db.write_file(b.ino, 0, b"bbbb").expect("write b");
-    db.write_file(a.ino, MAX_FILE_SIZE - 1, b"a").expect("write a's last byte");
+    db.write_file(a.ino, MAX_FILE_SIZE - 1, b"a")
+        .expect("write a's last byte");
 
     db.truncate_file(a.ino, 0).expect("truncate a");
     assert_eq!(db.read_file(b.ino, 0, 4).expect("read b"), b"bbbb");
@@ -1191,21 +1197,48 @@ fn timestamps_outside_the_nanosecond_range_are_clamped_not_rejected() {
         .expect("utimensat never fails on odd times")
     };
 
-    let epoch = set(Timestamp { secs: -1, nsec: 0 }, Timestamp { secs: 0, nsec: 0 });
+    let epoch = set(
+        Timestamp { secs: -1, nsec: 0 },
+        Timestamp { secs: 0, nsec: 0 },
+    );
     assert_eq!(epoch.atime, Timestamp { secs: -1, nsec: 0 });
     assert_eq!(epoch.mtime, Timestamp { secs: 0, nsec: 0 });
 
     let precise = set(
-        Timestamp { secs: 1_700_000_000, nsec: 123_456_789 },
-        Timestamp { secs: -86_400, nsec: 5 },
+        Timestamp {
+            secs: 1_700_000_000,
+            nsec: 123_456_789,
+        },
+        Timestamp {
+            secs: -86_400,
+            nsec: 5,
+        },
     );
-    assert_eq!(precise.atime, Timestamp { secs: 1_700_000_000, nsec: 123_456_789 });
-    assert_eq!(precise.mtime, Timestamp { secs: -86_400, nsec: 5 });
+    assert_eq!(
+        precise.atime,
+        Timestamp {
+            secs: 1_700_000_000,
+            nsec: 123_456_789
+        }
+    );
+    assert_eq!(
+        precise.mtime,
+        Timestamp {
+            secs: -86_400,
+            nsec: 5
+        }
+    );
 
     // Year 5138 and year -1000: clamped to the ends of 1677..2262.
     let far = set(
-        Timestamp { secs: 99_999_999_999, nsec: 0 },
-        Timestamp { secs: -99_999_999_999, nsec: 0 },
+        Timestamp {
+            secs: 99_999_999_999,
+            nsec: 0,
+        },
+        Timestamp {
+            secs: -99_999_999_999,
+            nsec: 0,
+        },
     );
     assert_eq!(far.atime, Timestamp::from_ns(i64::MAX));
     assert_eq!(far.mtime, Timestamp::from_ns(i64::MIN));
@@ -1262,7 +1295,13 @@ fn version_3_database_is_rekeyed_with_contents_intact() {
         let data = db.lookup(1, b"data.bin").expect("file kept");
         assert_eq!(data.ino, 2);
         assert_eq!(data.size, 131_077);
-        assert_eq!(data.atime, Timestamp { secs: 1_700_000_000, nsec: 123_456_789 });
+        assert_eq!(
+            data.atime,
+            Timestamp {
+                secs: 1_700_000_000,
+                nsec: 123_456_789
+            }
+        );
         assert_eq!(data.mtime, Timestamp { secs: -5, nsec: 7 });
         let bytes = db.read_file(2, 0, 200_000).expect("read file");
         assert_eq!(bytes.len(), 131_077);
@@ -1277,8 +1316,13 @@ fn version_3_database_is_rekeyed_with_contents_intact() {
             3,
             "no entry was cascaded away by the table rebuild"
         );
-        assert_eq!(db.pragma_i64("foreign_keys").expect("pragma"), 1, "foreign keys back on");
-        db.unlink_file(1, b"data.bin").expect("unlink after migration");
+        assert_eq!(
+            db.pragma_i64("foreign_keys").expect("pragma"),
+            1,
+            "foreign keys back on"
+        );
+        db.unlink_file(1, b"data.bin")
+            .expect("unlink after migration");
     }
     assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
     assert_eq!(count_chunks(&path, 2), 0, "unlink deletes the chunk range");

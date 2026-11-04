@@ -518,9 +518,8 @@ impl Db {
                     scratch.clear();
                     let mut rows = read_stmt.query(params![key])?;
                     if let Some(row) = rows.next()? {
-                        scratch.extend_from_slice(
-                            row.get_ref(0)?.as_blob().map_err(SqlError::from)?,
-                        );
+                        scratch
+                            .extend_from_slice(row.get_ref(0)?.as_blob().map_err(SqlError::from)?);
                     }
                     drop(rows);
                     let required_len = piece.chunk.end;
@@ -786,7 +785,6 @@ impl Db {
         Ok(existing_target)
     }
 
-
     pub fn update_metadata(&self, ino: u64, update: MetadataUpdate) -> Result<Inode, DbError> {
         let inode = self.get_inode(ino)?;
         let now = now_ts();
@@ -1025,8 +1023,10 @@ fn delete_inode_rows(conn: &Connection, ino: u64) -> Result<(), DbError> {
 
 /// Sets size, mtime and ctime of `ino` after a data change.
 fn set_size(conn: &Connection, ino: u64, size: u64, modified: Timestamp) -> Result<(), DbError> {
-    conn.prepare_cached("UPDATE inodes SET size = ?1, mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?3")?
-        .execute(params![size as i64, modified.to_ns(), ino as i64])?;
+    conn.prepare_cached(
+        "UPDATE inodes SET size = ?1, mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?3",
+    )?
+    .execute(params![size as i64, modified.to_ns(), ino as i64])?;
     Ok(())
 }
 

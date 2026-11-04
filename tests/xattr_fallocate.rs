@@ -259,11 +259,23 @@ fn fallocate_to_the_largest_storable_size_succeeds() {
     const MAX_FILE_SIZE: i64 = 1 << 40;
     fs.fallocate(file, 0, MAX_FILE_SIZE, 0)
         .expect("fallocate to max");
-    assert_eq!(fs.getattr(file).expect("getattr").size, MAX_FILE_SIZE as u64);
+    assert_eq!(
+        fs.getattr(file).expect("getattr").size,
+        MAX_FILE_SIZE as u64
+    );
 
-    assert_eq!(fs.fallocate(file, 0, MAX_FILE_SIZE + 1, 0), Err(libc::EFBIG));
-    assert_eq!(fs.fallocate(file, MAX_FILE_SIZE, 1, KEEP_SIZE), Err(libc::EFBIG));
-    assert_eq!(fs.getattr(file).expect("getattr").size, MAX_FILE_SIZE as u64);
+    assert_eq!(
+        fs.fallocate(file, 0, MAX_FILE_SIZE + 1, 0),
+        Err(libc::EFBIG)
+    );
+    assert_eq!(
+        fs.fallocate(file, MAX_FILE_SIZE, 1, KEEP_SIZE),
+        Err(libc::EFBIG)
+    );
+    assert_eq!(
+        fs.getattr(file).expect("getattr").size,
+        MAX_FILE_SIZE as u64
+    );
 }
 
 #[test]

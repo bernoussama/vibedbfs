@@ -61,6 +61,17 @@ pub struct MountConfig {
     /// data is written to the database. Minimum 64K.
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub write_buffer: Option<usize>,
+
+    /// Let the kernel cache more: writeback cache, parallel directory
+    /// operations, 1 MiB requests, cached symlinks, attributes and entries
+    /// cached for a day, and page cache kept across opens.
+    ///
+    /// Faster for small writes and repeated reads. With the writeback cache,
+    /// written data can sit in the kernel's page cache until the file is closed
+    /// or synced, so a crash or `docker stop` with files still open can lose
+    /// data that dbfs never saw. Off by default.
+    #[arg(long)]
+    pub kernel_cache: bool,
 }
 
 /// Parses `N`, `NK`, `NM` or `NG` (powers of 1024), at least 64 KiB.

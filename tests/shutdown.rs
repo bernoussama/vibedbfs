@@ -272,7 +272,9 @@ fn require_fuse() -> MutexGuard<'static, ()> {
     if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || !command_exists("fusermount3") {
         panic!("shutdown tests require DBFS_RUN_FUSE_TESTS=1 and fusermount3");
     }
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn command_exists(name: &str) -> bool {

@@ -282,3 +282,94 @@ How to read these numbers:
 
 All four filesystems completed `rm -rf` of the 20,000-entry directory in every
 round.
+
+## Like-for-Like: Every Filesystem in One Container, with FUSE Pass-Through
+
+The comparison above measured dbfs through FUSE against ext4 and btrfs without
+FUSE. So the gap mixed what FUSE itself costs with what dbfs's design costs.
+This run adds libfuse's `passthrough_hp`, which separates the two:
+
+- **ext4 → passthrough_hp over ext4** is the cost of FUSE itself.
+- **passthrough_hp → dbfs** is the cost of dbfs's design.
+
+Everything ran from one privileged container. The script is
+`scripts/bench-docker/compare.sh`, the image is `scripts/bench-docker/Dockerfile`
+(Ubuntu 26.04 with libfuse 3.18.2 built with liburing), and the kernel is
+7.0.0-38. Every filesystem used the same NVMe disk.
+
+- **ext4:** the host filesystem under `.bench/`.
+- **btrfs:** a 24 GiB loop image on that disk (`losetup --direct-io=on`). There is
+  no ext4 loop control in this run, so the btrfs-backed rows include the loop
+  device's cost.
+- **FUSE speed-ups.** Every FUSE mount got every speed-up available to it.
+
+| Config | Speed-ups |
+|---|---|
+| `pt` | `passthrough_hp`: kernel FUSE passthrough for reads and writes, multithreaded, `--clone-fd`, splice, FUSE over io_uring, writeback cache, 1-day TTLs, keep_cache, 4 MiB requests |
+| `pt-user` | The same, with `--nopassthrough`, so data goes through user space as it does in dbfs |
+| `dbfs` | dbfs defaults |
+| `dbfs-kc` | dbfs `--kernel-cache` (new): writeback cache, parallel dirops, 1 MiB requests, cached symlinks, 1-day TTLs, keep_cache. fuser 0.16 can't run multithreaded, and doesn't support io_uring or kernel passthrough. |
+
+The script switched FUSE over io_uring on for the run
+(`/sys/module/fuse/parameters/enable_uring=Y`) and back off afterwards. Each
+config ran 3 rounds of `bench_io`, interleaved, with a fresh mount for each
+workload; the medians are below. fio ran 2 rounds.
+
+The dbfs columns for ext4 and btrfs say where dbfs keeps its database.
+
+| Workload | ext4 | pt ext4 | pt-user ext4 | dbfs ext4 | dbfs-kc ext4 | btrfs | pt btrfs | pt-user btrfs | dbfs btrfs | dbfs-kc btrfs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| seqwrite (MiB/s) | 4,030 | 2,631 | 777 | 174 | 195 | 1,573 | 1,372 | 553 | 148 | 132 |
+| randwrite (MiB/s) | 978 | 178 | 190 | 25.4 | 29.0 | 160 | 122 | 121 | 18.3 | 19.9 |
+| seqread, warm (MiB/s) | 9,572 | 9,829 | 8,429 | 1,397 | **8,545** | 7,203 | 7,388 | 8,129 | 1,424 | **8,080** |
+| randread, warm (MiB/s) | 2,754 | 2,629 | 2,912 | 105 | **2,959** | 2,647 | 2,542 | 2,856 | 106 | **2,926** |
+| metadata total (s) | 0.18 | 1.01 | 1.14 | 2.39 | 2.50 | 0.40 | 1.17 | 1.27 | 3.00 | 3.38 |
+| metadata: create 5,000 (s) | 0.098 | 0.663 | 0.678 | 1.25 | 1.42 | 0.206 | 0.745 | 0.726 | 1.60 | 1.84 |
+| metadata: unlink 5,000 (s) | 0.056 | 0.198 | 0.302 | 0.929 | 0.947 | 0.164 | 0.289 | 0.405 | 1.19 | 1.33 |
+| bigdir total (s) | 0.74 | 2.99 | 3.27 | 5.52 | 5.50 | 0.82 | 3.02 | 3.18 | 6.92 | 6.80 |
+| bigdir: `rm -rf` 20,000 (s) | 0.23 | 0.88 | 1.33 | 2.57 | 2.52 | 0.44 | 1.01 | 1.49 | 3.18 | 3.20 |
+
+| fio (2 runs) | ext4 | pt ext4 | pt-user ext4 | dbfs ext4 | dbfs-kc ext4 | btrfs | pt btrfs | pt-user btrfs | dbfs btrfs | dbfs-kc btrfs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| randwrite 4k, no fsync (MiB/s) | 977 / 908 | 167 / 175 | 169 / 170 | 10.1 / 27.1 | 30.5 / 29.8 | 280 / 178 | 142 / 134 | 142 / 137 | 19.9 / 12.1 | 13.4 / 22.6 |
+| randwrite 4k, fsync each write (IOPS) | 206 / 205 | 189 / 190 | 180 / 178 | 202 / 203 | 207 / 195 | 87 / 87 | 80 / 80 | 79 / 79 | 78 / 67 | 65 / 76 |
+| randread 4k, all caches dropped (MiB/s) | 36.6 / 35.8 | 65.2 / 66.9 | 55.5 / 57.8 | 47.9 / 45.9 | 45.6 / 46.3 | 31.2 / 30.7 | 70.6 / 78.1 | 63.6 / 65.8 | 62.1 / 66.4 | 67.5 / 53.0 |
+| seqwrite 128k (MiB/s) | 3,684 / 4,697 | 2,994 / 2,133 | 760 / 694 | 203 / 218 | 187 / 195 | 1,340 / 1,344 | 1,138 / 1,138 | 535 / 514 | 167 / 172 | 149 / 147 |
+
+Every config completed `rm -rf` of the 20,000-entry directory in every round.
+
+### What FUSE costs (ext4 → pt over ext4)
+
+- **Warm reads.** Free once the kernel caches pages (`keep_cache`).
+- **Sequential writes.** About 35% with kernel passthrough. About 80% when data
+  goes through user space.
+- **4 KiB random writes.** 5.5×. Kernel passthrough doesn't help here, because
+  every write is still a FUSE request.
+- **Metadata.** 4–5×: every create, stat and unlink is a FUSE round trip.
+
+### What dbfs's design costs (pt-user → dbfs, the same FUSE data path)
+
+- **Reads with `--kernel-cache`.** On par with `passthrough_hp` (8.5 against
+  8.4 GiB/s sequential; 2.96 against 2.91 GiB/s random). Without the flag,
+  dbfs drops its page cache on every open, and warm reads are 6× (sequential)
+  to 28× (random) slower.
+- **Writes.** 4× slower sequentially and 6–7× slower for 4 KiB random writes. The
+  bottleneck is dbfs's own write path: a single thread, one lock per request, a
+  copy into the arena, and SQLite chunk upserts on flush. The number of requests
+  is not the limit: `--kernel-cache` raises the request size to 1 MiB and adds
+  the writeback cache, yet random writes improve only 14% and sequential writes
+  not at all.
+- **Metadata.** About 2× slower. Each create or unlink is a SQLite transaction on
+  one thread, while `passthrough_hp` runs multithreaded system calls on ext4.
+- **Durable writes.** At the disk's limit, like everything else: about 200 IOPS
+  on ext4, matching both ext4 and `passthrough_hp`.
+
+### Not like for like even here
+
+- **Cold random reads.** Both FUSE stacks beat native ext4. Each layer reads more
+  than fio asks for: FUSE readahead, and dbfs's whole 64 KiB chunks. Later
+  random reads then hit pages that are already cached. Native ext4 detects the
+  random pattern and reads 4 KiB only. Treat this row as how each stack behaves,
+  not as a ranking.
+- **Loop device cost.** The btrfs-backed numbers include it. Earlier runs measured
+  it as halving fsync IOPS.

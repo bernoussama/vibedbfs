@@ -43,7 +43,7 @@ Stopping dbfs with Ctrl-C, or sending it SIGTERM or SIGHUP, also unmounts cleanl
 ## Mount options
 
 ```bash
-dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
+dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [--kernel-cache] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
 ```
 
 By default only the user who mounted dbfs can access the filesystem. `dbfs mount --help` lists every option.
@@ -54,6 +54,7 @@ By default only the user who mounted dbfs can access the filesystem. `dbfs mount
 | `--allow-root` | Lets root access the mount, in addition to the mounting user. |
 | `--auto-unmount` | Unmounts the filesystem when dbfs exits, including after a crash or SIGKILL, so no stale mount is left behind. Requires `--allow-other` or `--allow-root`. |
 | `--write-buffer SIZE` | Memory for buffered writes, shared by all open files. Default `64M`, minimum `64K`; accepts `K`, `M` and `G` suffixes. Memory is reserved as it is used, so set `8M` in a container with a small memory limit. |
+| `--kernel-cache` | Let the kernel cache more: writeback cache, parallel directory operations, 1 MiB requests, cached symlinks, attributes cached for a day, and page cache kept across opens. Repeated reads run at page-cache speed (6–28× faster in the benchmarks). Off by default because, with the writeback cache, data written to a file that is still open can sit in the kernel until close or fsync, so a crash or `docker stop` can lose it. |
 | `-o OPT[,OPT...]` | Extra options. Repeatable, and each value may be a comma-separated list. Known names map to typed FUSE options: `ro`, `rw`, `atime`, `noatime`, `suid`, `nosuid`, `dev`, `nodev`, `exec`, `noexec`, `dirsync`, `sync`, `async`, `fsname=NAME`, `subtype=NAME`. Any other option is passed to `fusermount3`, which accepts only the options it knows, such as `max_read=N`. An unknown option, such as `context=...`, makes the mount fail with `unknown option`. |
 
 `default_permissions` is always on and cannot be turned off. The kernel therefore enforces file mode bits and owners, even for other users.
