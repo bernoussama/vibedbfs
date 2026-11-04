@@ -5,7 +5,7 @@ mod model;
 mod run;
 
 pub use cli::{Cli, Command};
-pub use db::Db;
+pub use db::{Db, SCHEMA_VERSION};
 pub use fuse::{Dbfs, DbfsDirEntry, FsStats, file_attr_from_inode};
 pub use model::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
 pub use run::{RunError, mount_options, run, run_with_mounter};

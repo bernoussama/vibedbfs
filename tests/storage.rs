@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dbfs::{Db, DbError, FileKind, MetadataUpdate, Timestamp, file_attr_from_inode};
+use dbfs::{
+    Db, DbError, FileKind, MetadataUpdate, SCHEMA_VERSION, Timestamp, file_attr_from_inode,
+};
 use rusqlite::{Connection, params};
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -822,6 +824,98 @@ fn failed_symlink_create_leaves_no_dirent_or_inode() {
         assert_eq!(link.size, b"target-path".len() as u64);
         assert_eq!(db.lookup(1, b"link").expect("lookup symlink").ino, link.ino);
     }
+    remove_db(&path);
+}
+
+#[test]
+fn new_database_is_created_at_current_schema_version() {
+    let path = disk_db_path("schema-new");
+    {
+        let db = Db::open(&path).expect("open new database");
+        assert_eq!(
+            db.pragma_i64("user_version").expect("read user_version"),
+            SCHEMA_VERSION
+        );
+    }
+    remove_db(&path);
+}
+
+#[test]
+fn unversioned_legacy_database_migrates_to_current_schema() {
+    let path = disk_db_path("schema-legacy");
+    exec_sql(
+        &path,
+        "CREATE TABLE inodes (
+           ino INTEGER PRIMARY KEY, kind INTEGER NOT NULL, mode INTEGER NOT NULL,
+           uid INTEGER NOT NULL, gid INTEGER NOT NULL, size INTEGER NOT NULL,
+           atime INTEGER NOT NULL, mtime INTEGER NOT NULL, ctime INTEGER NOT NULL,
+           nlink INTEGER NOT NULL
+         );
+         INSERT INTO inodes VALUES (1, 2, 493, 1, 1, 0, 1, 1, 1, 2);",
+    );
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), 0);
+    {
+        let db = Db::open(&path).expect("open and migrate legacy database");
+        db.create_file(1, b"after-migration", 0o644, 1, 1)
+            .expect("legacy database is writable after migration");
+    }
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM pragma_table_info('inodes') WHERE name LIKE '%_nsec'"
+        ),
+        3
+    );
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'dirents_child'"
+        ),
+        1
+    );
+    // Opening again is a no-op.
+    drop(Db::open(&path).expect("reopen migrated database"));
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    remove_db(&path);
+}
+
+#[test]
+fn database_from_newer_dbfs_is_rejected_untouched() {
+    let path = disk_db_path("schema-newer");
+    drop(Db::open(&path).expect("create database"));
+    let newer = SCHEMA_VERSION + 1;
+    exec_sql(&path, &format!("PRAGMA user_version = {newer}"));
+    assert_eq!(
+        Db::open(&path).err(),
+        Some(DbError::UnsupportedSchema(newer))
+    );
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), newer);
+    remove_db(&path);
+}
+
+#[test]
+fn child_ino_lookups_use_an_index() {
+    let path = disk_db_path("schema-child-index");
+    drop(Db::open(&path).expect("create database"));
+    let conn = Connection::open(&path).expect("open raw sqlite");
+    for sql in [
+        "SELECT parent_ino FROM dirents WHERE child_ino = 5",
+        "DELETE FROM dirents WHERE child_ino = 5",
+    ] {
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query plan")
+            .collect::<Result<_, _>>()
+            .expect("read plan");
+        assert!(
+            plan.iter().any(|step| step.contains("dirents_child")),
+            "{sql} should use dirents_child, got {plan:?}"
+        );
+    }
+    drop(conn);
     remove_db(&path);
 }
 

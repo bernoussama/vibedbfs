@@ -46,6 +46,12 @@ pub enum RunError {
 impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Db(DbError::UnsupportedSchema(version)) => write!(
+                f,
+                "database schema version {version} is newer than this dbfs supports \
+                 ({}); upgrade dbfs",
+                crate::SCHEMA_VERSION
+            ),
             Self::Db(error) => write!(f, "database error: {error:?}"),
             Self::Mount(error) => write!(f, "mount error: {error}"),
         }

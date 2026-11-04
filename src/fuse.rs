@@ -803,7 +803,7 @@ fn errno_from_db_error(error: DbError) -> i32 {
         DbError::NameTooLong => libc::ENAMETOOLONG,
         DbError::NoSpace => libc::ENOSPC,
         DbError::NotDirectory => libc::ENOTDIR,
-        DbError::Corrupt | DbError::Sqlite(_) => libc::EIO,
+        DbError::Corrupt | DbError::UnsupportedSchema(_) | DbError::Sqlite(_) => libc::EIO,
     }
 }
 

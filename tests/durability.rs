@@ -254,6 +254,7 @@ fn fsynced_bytes_survive_kill_and_remount() {
     let file = mountpoint.join("notes.txt");
     let mut handle = OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(&file)
         .expect("create file");

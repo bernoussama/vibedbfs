@@ -11,6 +11,13 @@ use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
 
 pub(crate) const CHUNK_SIZE: usize = 65_536;
 
+/// On-disk schema version, stored in `PRAGMA user_version`.
+///
+/// - 0: databases created before versioning existed (may lack `*_nsec` columns)
+/// - 1: `inodes` has `atime_nsec`, `mtime_nsec`, `ctime_nsec`
+/// - 2: index `dirents_child` on `dirents(child_ino)`
+pub const SCHEMA_VERSION: i64 = 2;
+
 pub(crate) struct VolumeUsage {
     pub page_size: u64,
     pub page_count: u64,
@@ -143,7 +150,7 @@ impl Db {
             );
             ",
         )?;
-        ensure_nsec_columns(&conn)?;
+        migrate(&conn)?;
 
         let now = now_ts();
         let mount_uid = unsafe { libc::getuid() } as i64;
@@ -551,9 +558,8 @@ impl Db {
 
     pub(crate) fn read_chunk(&self, ino: u64, chunk_index: u64) -> Result<Vec<u8>, DbError> {
         let conn = self.conn.borrow();
-        let mut stmt = conn.prepare_cached(
-            "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
-        )?;
+        let mut stmt = conn
+            .prepare_cached("SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2")?;
         let chunk = stmt
             .query_row(params![ino as i64, chunk_index as i64], |row| row.get(0))
             .optional()?;
@@ -935,9 +941,8 @@ impl Db {
         }
 
         if let NewNode::Symlink { target } = node {
-            tx.prepare_cached(
-                "INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)",
-            )?.execute(params![ino as i64, target])?;
+            tx.prepare_cached("INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)")?
+                .execute(params![ino as i64, target])?;
         }
 
         tx.prepare_cached(
@@ -1023,7 +1028,7 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 fn pragma_query(name: &str) -> Result<String, DbError> {
     match name {
-        "busy_timeout" | "foreign_keys" | "journal_mode" | "synchronous" => {
+        "busy_timeout" | "foreign_keys" | "journal_mode" | "synchronous" | "user_version" => {
             Ok(format!("PRAGMA {name}"))
         }
         _ => Err(DbError::InvalidInput),
@@ -1097,6 +1102,31 @@ fn add_directory_nlink(
 ) -> Result<(), DbError> {
     tx.prepare_cached("UPDATE inodes SET nlink = nlink + ?1 WHERE ino = ?2")?
         .execute(params![delta, ino as i64])?;
+    Ok(())
+}
+
+/// Bring an existing database up to `SCHEMA_VERSION`, one step at a time,
+/// in a single transaction. A failure leaves the database at its old version.
+fn migrate(conn: &Connection) -> Result<(), DbError> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(DbError::UnsupportedSchema(version));
+    }
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    if version < 1 {
+        ensure_nsec_columns(&tx)?;
+    }
+    if version < 2 {
+        // Without this index, `is_descendant` and the `child_ino` foreign-key
+        // cascade on every inode delete scan the whole `dirents` table.
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS dirents_child ON dirents(child_ino);")?;
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
     Ok(())
 }
 

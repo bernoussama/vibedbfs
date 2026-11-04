@@ -110,6 +110,8 @@ pub enum DbError {
     NotDirectory,
     NotFound,
     Corrupt,
+    /// The database was written by a newer dbfs with this schema version.
+    UnsupportedSchema(i64),
     Sqlite(String),
 }
 
