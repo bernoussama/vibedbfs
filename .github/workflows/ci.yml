@@ -94,6 +94,15 @@ jobs:
         run: |
           sudo sed -i 's/^#\?user_allow_other/user_allow_other/' /etc/fuse.conf
           grep -qx 'user_allow_other' /etc/fuse.conf
+      - name: Let fusermount3 auto-unmount
+        # Ubuntu's AppArmor profile for fusermount3 denies the `rprivate` remount
+        # of / that fusermount3 does before an auto-unmount, so a killed daemon
+        # leaves a stale mount ("failed to mark mounts private"). Unload the
+        # profile so the --auto-unmount test exercises dbfs, not that bug.
+        run: |
+          if [ -e /etc/apparmor.d/fusermount3 ] && command -v apparmor_parser >/dev/null; then
+            sudo apparmor_parser -R /etc/apparmor.d/fusermount3 || true
+          fi
       - name: Read ptrace policy
         # A missing file means no Yama restriction, so treat it as 0.
         run: |
