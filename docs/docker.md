@@ -100,7 +100,9 @@ Start the mount. It runs in the foreground until it is unmounted, so use a separ
 dbfs mount --allow-other /srv/dbfs.sqlite /srv/dbfs
 ```
 
-Add `--auto-unmount` (C2) so that a killed dbfs does not leave a stale mount behind.
+Add `--auto-unmount` (C2) so that a killed dbfs does not leave a stale mount behind. On Ubuntu hosts, the AppArmor profile shipped for `fusermount3` denies the
+`rprivate` remount that the cleanup needs, so a killed dbfs still leaves a stale mount there.
+Unmount it with `fusermount3 -u <mnt>`.
 
 Now use the mount from a container, then read the file on the host:
 
