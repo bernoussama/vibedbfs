@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dbfs::{
-    Db, DbError, FileKind, MetadataUpdate, SCHEMA_VERSION, Timestamp, file_attr_from_inode,
+    Db, DbError, Dbfs, FileKind, MetadataUpdate, SCHEMA_VERSION, Timestamp, file_attr_from_inode,
 };
 use rusqlite::{Connection, params};
 
@@ -451,16 +451,17 @@ fn unlinking_open_hardlink_preserves_remaining_names() {
     db.write_file(file.ino, 0, b"hello").expect("write file");
     db.link(file.ino, 1, b"b.txt").expect("create hardlink");
 
-    db.open_file(file.ino, dbfs::FileKind::RegularFile);
-    db.unlink_file(1, b"a.txt")
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open file");
+    fs.unlink(1, b"a.txt")
         .expect("unlink one hardlink while open");
-    db.release_file(file.ino);
+    fs.release_file(fh).expect("release");
 
-    assert_eq!(db.lookup(1, b"a.txt"), Err(DbError::NotFound));
-    let remaining = db.lookup(1, b"b.txt").expect("lookup remaining hardlink");
+    assert_eq!(fs.lookup(1, b"a.txt"), Err(libc::ENOENT));
+    let remaining = fs.lookup(1, b"b.txt").expect("lookup remaining hardlink");
     assert_eq!(remaining.ino, file.ino);
     assert_eq!(remaining.nlink, 1);
-    assert_eq!(db.read_file(file.ino, 0, 5).expect("read file"), b"hello");
+    assert_eq!(fs.read(file.ino, 0, 5).expect("read file"), b"hello");
 }
 
 #[test]
@@ -712,10 +713,12 @@ fn reopen_drops_inodes_left_unlinked_while_open() {
             .expect("create file unlinked while open");
         db.write_file(leaked.ino, 0, b"leaked-chunk")
             .expect("write chunk that should not survive");
-        db.open_file(leaked.ino, FileKind::RegularFile);
-        db.unlink_file(1, b"gone.txt")
+        let fs = Dbfs::new(db);
+        let _fh = fs.open(leaked.ino).expect("open file");
+        fs.unlink(1, b"gone.txt")
             .expect("unlink while the handle is still open");
-        assert_eq!(db.get_inode(leaked.ino).expect("inode still open").nlink, 0);
+        assert_eq!(fs.getattr(leaked.ino).expect("inode still open").nlink, 0);
+        // Dropped without releasing the handle, as in a crash.
         leaked.ino
     };
 

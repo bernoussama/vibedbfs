@@ -508,16 +508,18 @@ fn setattr_round_trips_nanosecond_timestamps() {
 }
 
 #[test]
-fn opens_regular_file_with_inode_file_handle() {
+fn open_returns_a_handle_that_reads_the_file() {
     let db = Db::open_in_memory().expect("open in-memory database");
     let file = db
         .create_file(1, b"notes.txt", 0o644, 1000, 1000)
         .expect("create file");
+    db.write_file(file.ino, 0, b"hello").expect("write file");
     let fs = Dbfs::new(db);
 
     let handle = fs.open(file.ino).expect("open file");
 
-    assert_eq!(handle, file.ino);
+    assert_eq!(fs.read_fh(handle, 0, 5).expect("read through handle"), b"hello");
+    assert_eq!(fs.open(9_999), Err(libc::ENOENT));
 }
 
 #[test]
@@ -607,9 +609,9 @@ fn release_flushes_buffered_fuse_writes() {
         .expect("create file");
     let fs = Dbfs::new(db);
 
-    fs.open(file.ino).expect("open file");
+    let fh = fs.open(file.ino).expect("open file");
     fs.write(file.ino, 0, b"hello").expect("write file");
-    fs.release_file(file.ino).expect("release file");
+    fs.release_file(fh).expect("release file");
 
     assert_eq!(raw_inode_size(&path, file.ino), 5);
 
@@ -683,19 +685,21 @@ fn read_with_dirty_size_past_4gib_returns_the_marker() {
 }
 
 #[test]
-fn release_after_failed_flush_deletes_inode_unlinked_while_open() {
+fn releasing_a_file_unlinked_while_open_needs_no_flush_and_deletes_it() {
     let path = disk_db_path("release-flush-fail");
     let db = Db::open(&path).expect("open file-backed database");
     let file = db
         .create_file(1, b"notes.txt", 0o644, 1000, 1000)
         .expect("create file");
     let ino = file.ino;
-    db.open_file(ino, FileKind::RegularFile);
-    db.open_file(ino, FileKind::RegularFile);
     let fs = Dbfs::new(db);
+    let first = fs.open(ino).expect("open first handle");
+    let second = fs.open(ino).expect("open second handle");
 
     fs.unlink(1, b"notes.txt").expect("unlink while open");
     fs.write(ino, 0, b"dirty").expect("buffer a write");
+    // Any chunk write would now fail. Releasing must not need one: the data of an
+    // unlinked file dies with its last handle.
     exec_sql(
         &path,
         "CREATE TRIGGER reject_chunk_insert
@@ -705,26 +709,18 @@ fn release_after_failed_flush_deletes_inode_unlinked_while_open() {
          END;",
     );
 
-    assert!(
-        fs.release_file(ino).is_err(),
-        "first release reports the flush error"
+    assert_eq!(fs.release_file(first), Ok(()), "first release");
+    assert_eq!(
+        fs.read(ino, 0, 5).expect("read through the open inode"),
+        b"dirty",
+        "the other handle still sees the buffered data"
     );
-    assert!(
-        fs.getattr(ino).is_ok(),
-        "the other handle still keeps the inode"
-    );
+    assert_eq!(fs.getattr(ino).expect("still open").nlink, 0);
 
-    assert!(
-        fs.release_file(ino).is_err(),
-        "last release still reports the flush error"
-    );
+    assert_eq!(fs.release_file(second), Ok(()), "last release");
     assert_eq!(fs.getattr(ino), Err(libc::ENOENT));
-
-    exec_sql(&path, "DROP TRIGGER reject_chunk_insert;");
-    assert!(
-        fs.release_file(ino).is_ok(),
-        "a later release finishes with the dirty buffer gone"
-    );
+    assert_eq!(fs.release_file(second), Err(libc::EBADF), "double release");
+    assert_eq!(fs.flush_all(), Ok(()), "nothing is left dirty");
     remove_db(&path);
 }
 
@@ -845,4 +841,152 @@ fn renames_entry_through_fuse_helper() {
 
     assert_eq!(fs.lookup(1, b"old.txt"), Err(libc::ENOENT));
     assert_eq!(fs.lookup(1, b"new.txt").expect("lookup new").ino, file.ino);
+}
+
+#[test]
+fn rename_while_open_keeps_the_handle_on_the_inode() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"old.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write_fh(fh, 0, b"before").expect("write before rename");
+
+    fs.rename(1, b"old.txt", 1, b"new.txt", 0).expect("rename");
+    fs.write_fh(fh, 6, b"-after").expect("write after rename");
+    fs.release_file(fh).expect("release");
+
+    let attr = fs.lookup(1, b"new.txt").expect("lookup new name");
+    assert_eq!(attr.ino, file.ino);
+    assert_eq!(fs.read(file.ino, 0, 32).expect("read"), b"before-after");
+}
+
+#[test]
+fn rename_over_an_open_file_keeps_it_until_its_last_release() {
+    let path = disk_db_path("rename-over-open");
+    let db = Db::open(&path).expect("open database");
+    let victim = db
+        .create_file(1, b"victim.txt", 0o644, 1000, 1000)
+        .expect("create victim");
+    db.create_file(1, b"source.txt", 0o644, 1000, 1000)
+        .expect("create source");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(victim.ino).expect("open victim");
+    fs.write_fh(fh, 0, b"still readable").expect("write victim");
+
+    fs.rename(1, b"source.txt", 1, b"victim.txt", 0)
+        .expect("rename over the open file");
+
+    assert_eq!(fs.getattr(victim.ino).expect("victim kept").nlink, 0);
+    assert_eq!(fs.read_fh(fh, 0, 14).expect("read victim"), b"still readable");
+    fs.release_file(fh).expect("release victim");
+    assert_eq!(fs.getattr(victim.ino), Err(libc::ENOENT));
+    assert_eq!(
+        count_chunk_rows(&path, victim.ino),
+        0,
+        "no chunk of the replaced file is left"
+    );
+    remove_db(&path);
+}
+
+#[test]
+fn rename_over_a_dirty_closed_file_drops_its_buffer() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let victim = db
+        .create_file(1, b"victim.txt", 0o644, 1000, 1000)
+        .expect("create victim");
+    db.create_file(1, b"source.txt", 0o644, 1000, 1000)
+        .expect("create source");
+    let fs = Dbfs::new(db);
+    fs.write(victim.ino, 0, b"unflushed").expect("buffer a write");
+
+    fs.rename(1, b"source.txt", 1, b"victim.txt", 0)
+        .expect("rename over the dirty file");
+
+    assert_eq!(fs.getattr(victim.ino), Err(libc::ENOENT));
+    assert_eq!(
+        fs.flush_all(),
+        Ok(()),
+        "the dropped inode's buffer is not flushed into a missing inode"
+    );
+}
+
+#[test]
+fn truncate_through_setattr_updates_the_open_size() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"t.bin", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write_fh(fh, 0, &[7u8; 100_000]).expect("write");
+
+    fs.setattr(file.ino, None, None, None, Some(10), None, None)
+        .expect("truncate");
+    assert_eq!(fs.getattr(file.ino).expect("attr").size, 10);
+    assert_eq!(fs.read_fh(fh, 0, 64).expect("read").len(), 10);
+
+    fs.write_fh(fh, 20, b"x").expect("write past the new end");
+    let data = fs.read_fh(fh, 0, 64).expect("read");
+    assert_eq!(data.len(), 21);
+    assert_eq!(&data[..10], &[7u8; 10]);
+    assert!(data[10..20].iter().all(|&b| b == 0));
+    fs.release_file(fh).expect("release");
+    assert_eq!(fs.getattr(file.ino).expect("attr").size, 21);
+}
+
+#[test]
+fn two_handles_share_one_inode_until_both_are_released() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"shared.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let a = fs.open(file.ino).expect("open a");
+    let b = fs.open(file.ino).expect("open b");
+    assert_ne!(a, b);
+
+    fs.write_fh(a, 0, b"from a").expect("write a");
+    assert_eq!(fs.read_fh(b, 0, 6).expect("read b"), b"from a");
+    fs.release_file(a).expect("release a");
+    assert_eq!(fs.read_fh(b, 0, 6).expect("read b after a"), b"from a");
+    assert_eq!(fs.read_fh(a, 0, 6), Err(libc::EBADF));
+    fs.release_file(b).expect("release b");
+    assert_eq!(fs.read(file.ino, 0, 6).expect("read stored"), b"from a");
+}
+
+fn count_chunk_rows(path: &Path, ino: u64) -> i64 {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    conn.query_row(
+        "SELECT COUNT(*) FROM file_chunks WHERE ino = ?1",
+        params![ino as i64],
+        |row| row.get(0),
+    )
+    .expect("count chunk rows")
+}
+
+#[test]
+fn setattr_after_a_buffered_write_reports_and_keeps_both() {
+    // `cp -a`: write, then utimensat, then close.
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"copy.txt", 0o600, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write_fh(fh, 0, b"hello\n").expect("write");
+    let mtime = UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+    let attr = fs
+        .setattr(file.ino, None, None, None, None, None, Some(mtime))
+        .expect("set mtime");
+    assert_eq!(attr.size, 6, "setattr reports the buffered size");
+    assert_eq!(attr.mtime, mtime);
+
+    fs.release_file(fh).expect("release");
+    let attr = fs.getattr(file.ino).expect("attr after close");
+    assert_eq!(attr.size, 6);
+    assert_eq!(attr.mtime, mtime, "closing does not overwrite the set mtime");
+    assert_eq!(fs.read(file.ino, 0, 16).expect("read"), b"hello\n");
 }

@@ -1,10 +1,8 @@
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -13,6 +11,7 @@ use fuser::{
 };
 
 use crate::db::{CHUNK_SIZE, ChunkSpan};
+use crate::open_table::{OpenTable, Slot};
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
@@ -36,15 +35,15 @@ pub struct Dbfs {
     shared: Arc<Shared>,
 }
 
-/// State shared by the FUSE session and the shutdown path. `Dbfs` derefs to it, so
-/// methods reach `self.db` and `self.dirty_files` directly. The `fuse` module is
-/// private, so this type is not reachable outside the crate.
+/// State shared by the FUSE session and the shutdown path. `Dbfs` derefs to it. The
+/// `fuse` module is private, so this type is not reachable outside the crate.
+///
+/// Lock order: `table`, then the database connection (taken inside `Db` methods).
+/// Nothing takes `table` while holding the connection.
 pub struct Shared {
     db: Db,
-    dirty_files: Mutex<HashMap<u64, DirtyFile>>,
-    /// Set by `refuse_writes` when shutdown starts. Read and set under the
-    /// `dirty_files` lock, so a write cannot slip in during the final flush.
-    closing: AtomicBool,
+    /// Open handles, open inodes and their dirty data. One lock per operation.
+    table: Mutex<OpenTable>,
     /// Outcome of the latest flush on a shutdown path (`destroy` or a signal).
     last_flush: Mutex<Result<(), i32>>,
 }
@@ -57,24 +56,65 @@ impl Deref for Dbfs {
     }
 }
 
+/// Whether a flush also persists an inode that was unlinked while open. Its data
+/// dies with the last handle, so closing never needs to write it; only the memory
+/// budget and `ftruncate` do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unlinked {
+    Skip,
+    Persist,
+}
+
 impl Shared {
+    fn table(&self) -> MutexGuard<'_, OpenTable> {
+        self.table.lock().unwrap()
+    }
+
+    /// Writes the dirty chunks of `slot` to the database. On failure they stay
+    /// buffered, so a later flush can retry.
+    fn flush_slot(&self, t: &mut OpenTable, slot: Slot, unlinked: Unlinked) -> Result<(), i32> {
+        let i = slot as usize;
+        let inodes = &mut t.inodes;
+        if inodes.dirty[i].is_empty() || (inodes.unlinked[i] && unlinked == Unlinked::Skip) {
+            return Ok(());
+        }
+        self.db
+            .replace_chunks(inodes.ino[i], inodes.size[i], &inodes.dirty[i], inodes.mtime[i])
+            .map_err(errno_from_db_error)?;
+        inodes.dirty[i].clear();
+        Ok(())
+    }
+
+    /// Frees `slot` if nothing needs it any more: no handles and no dirty data.
+    fn free_if_idle(t: &mut OpenTable, slot: Slot) {
+        let i = slot as usize;
+        if t.inodes.refs[i] == 0 && t.inodes.dirty[i].is_empty() {
+            t.inodes.remove(slot);
+        }
+    }
+
+    /// Drops `slot` and its dirty data without writing anything: its inode is gone.
+    fn discard_slot(t: &mut OpenTable, slot: Slot) {
+        t.inodes.dirty[slot as usize].clear();
+        t.inodes.remove(slot);
+    }
+
     /// Writes every dirty inode to the database and then makes the commit durable.
     /// A failing inode stays dirty and the loop moves on, so one bad inode does not
-    /// hold back the rest. Returns the first error.
+    /// hold back the rest. Returns the first error. Inodes unlinked while open are
+    /// skipped: the next start deletes them anyway.
     fn flush_all(&self) -> Result<(), i32> {
         let mut first_error = None;
-        self.dirty_files.lock().unwrap().retain(|&ino, dirty| {
-            match self
-                .db
-                .replace_chunks(ino, dirty.size, &dirty.chunks, dirty.mtime)
-            {
-                Ok(()) => false,
-                Err(error) => {
-                    first_error.get_or_insert(errno_from_db_error(error));
-                    true
+        let mut t = self.table();
+        for slot in t.inodes.live_slots() {
+            match self.flush_slot(&mut t, slot, Unlinked::Skip) {
+                Ok(()) => Self::free_if_idle(&mut t, slot),
+                Err(errno) => {
+                    first_error.get_or_insert(errno);
                 }
             }
-        });
+        }
+        drop(t);
         let synced = self.db.sync_durable().map_err(errno_from_db_error);
         match first_error {
             Some(errno) => Err(errno),
@@ -84,12 +124,143 @@ impl Shared {
 
     fn refuse_writes(&self) {
         // Holding the lock means no write is half-way through when the flag changes.
-        let _dirty_files = self.dirty_files.lock().unwrap();
-        self.closing.store(true, Ordering::SeqCst);
+        self.table().closing = true;
     }
 
     fn record_flush(&self, result: Result<(), i32>) {
         *self.last_flush.lock().unwrap() = result;
+    }
+
+    /// The slot of `ino`, loading kind and size from the database if it has none.
+    fn slot_for(&self, t: &mut OpenTable, ino: u64) -> Result<Slot, i32> {
+        if let Some(slot) = t.inodes.find(ino) {
+            return Ok(slot);
+        }
+        let (kind, size) = self.db.inode_head(ino).map_err(errno_from_db_error)?;
+        Ok(t.inodes.insert(ino, kind, size))
+    }
+
+    /// Adds a handle to `slot` and returns it as the FUSE fh.
+    fn open_slot(t: &mut OpenTable, slot: Slot) -> u64 {
+        t.inodes.refs[slot as usize] += 1;
+        t.handles.alloc(slot)
+    }
+
+    fn read_slot(&self, t: &OpenTable, slot: Slot, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+        let i = slot as usize;
+        let inodes = &t.inodes;
+        if let Some(error) = inodes.kind[i].regular_file_error() {
+            return Err(errno_from_db_error(error));
+        }
+        let file_size = inodes.size[i];
+        if offset >= file_size || size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut output = vec![0; (size as u64).min(file_size - offset) as usize];
+        self.db
+            .read_into(inodes.ino[i], offset, &mut output)
+            .map_err(errno_from_db_error)?;
+        let span = ChunkSpan::new(offset, output.len()).expect("non-empty read");
+        for (&chunk_index, data) in inodes.dirty[i].range(span.first..=span.last) {
+            span.copy_out(chunk_index, data, &mut output);
+        }
+        Ok(output)
+    }
+
+    fn write_slot(&self, t: &mut OpenTable, slot: Slot, offset: u64, data: &[u8]) -> Result<u32, i32> {
+        let i = slot as usize;
+        if let Some(error) = t.inodes.kind[i].regular_file_error() {
+            return Err(errno_from_db_error(error));
+        }
+        if t.closing {
+            // Shutdown has already flushed the buffers. Accepting this data now would
+            // acknowledge a write that nothing will persist.
+            return Err(libc::EIO);
+        }
+        let Some(span) = ChunkSpan::new(offset, data.len()) else {
+            return Ok(0);
+        };
+        if t.inodes.dirty[i].len() * CHUNK_SIZE >= FLUSH_THRESHOLD {
+            self.flush_slot(t, slot, Unlinked::Persist)?;
+        }
+
+        let ino = t.inodes.ino[i];
+        let dirty = &mut t.inodes.dirty[i];
+        for chunk_index in span.first..=span.last {
+            let piece = span.piece(chunk_index);
+            let chunk = match dirty.entry(chunk_index) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) if piece.is_full_chunk() => entry.insert(Vec::new()),
+                Entry::Vacant(entry) => {
+                    let mut chunk = Vec::new();
+                    self.db
+                        .read_chunk_into(ino, chunk_index, &mut chunk)
+                        .map_err(errno_from_db_error)?;
+                    entry.insert(chunk)
+                }
+            };
+            if chunk.len() < piece.chunk.end {
+                chunk.resize(piece.chunk.end, 0);
+            }
+            chunk[piece.chunk].copy_from_slice(&data[piece.buf]);
+        }
+        t.inodes.size[i] = t.inodes.size[i].max(span.end);
+        t.inodes.mtime[i] = Timestamp::from_system_time(SystemTime::now());
+        Ok(data.len() as u32)
+    }
+
+    /// Drops one handle. The last handle of an inode unlinked while open deletes
+    /// it; otherwise the dirty data is flushed and an idle slot is freed. A failed
+    /// flush keeps the data for a later retry and reports the error.
+    fn release_fh(&self, fh: u64) -> Result<(), i32> {
+        let mut t = self.table();
+        let slot = t.handles.release(fh).ok_or(libc::EBADF)?;
+        let i = slot as usize;
+        t.inodes.refs[i] -= 1;
+        if t.inodes.refs[i] == 0 && t.inodes.unlinked[i] {
+            let ino = t.inodes.ino[i];
+            Self::discard_slot(&mut t, slot);
+            return self.db.delete_inode(ino).map_err(errno_from_db_error);
+        }
+        self.flush_slot(&mut t, slot, Unlinked::Skip)?;
+        Self::free_if_idle(&mut t, slot);
+        Ok(())
+    }
+
+    /// After the entry for `target` was removed: forget an inode the database
+    /// deleted, or mark one that stays because it is still open.
+    fn entry_removed(t: &mut OpenTable, target: &Inode) {
+        if target.kind == FileKind::Directory || target.nlink > 1 {
+            return;
+        }
+        let Some(slot) = t.inodes.find(target.ino) else {
+            return;
+        };
+        if t.inodes.is_open(slot) {
+            t.inodes.unlinked[slot as usize] = true;
+        } else {
+            Self::discard_slot(t, slot);
+        }
+    }
+
+    fn is_open(t: &OpenTable, ino: u64) -> bool {
+        t.inodes.find(ino).is_some_and(|slot| t.inodes.is_open(slot))
+    }
+
+    /// Size and mtime overlay for an inode with buffered writes.
+    fn overlay_attr(&self, attr: &mut FileAttr) {
+        let t = self.table();
+        let Some(slot) = t.inodes.find(attr.ino) else {
+            return;
+        };
+        let i = slot as usize;
+        attr.size = t.inodes.size[i];
+        attr.blocks = attr.size.div_ceil(512);
+        if !t.inodes.dirty[i].is_empty() {
+            let modified = t.inodes.mtime[i].to_system_time();
+            attr.mtime = modified;
+            attr.ctime = modified;
+        }
     }
 }
 
@@ -114,20 +285,12 @@ impl ShutdownHandle {
     }
 }
 
-#[derive(Debug, Clone)]
-struct DirtyFile {
-    size: u64,
-    chunks: BTreeMap<u64, Vec<u8>>,
-    mtime: Timestamp,
-}
-
 impl Dbfs {
     pub fn new(db: Db) -> Self {
         Self {
             shared: Arc::new(Shared {
                 db,
-                dirty_files: Mutex::new(HashMap::new()),
-                closing: AtomicBool::new(false),
+                table: Mutex::new(OpenTable::default()),
                 last_flush: Mutex::new(Ok(())),
             }),
         }
@@ -168,9 +331,7 @@ impl Dbfs {
             .get_inode(ino)
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
-        if let Some(dirty) = self.dirty_files.lock().unwrap().get(&ino) {
-            overlay_dirty(&mut attr, dirty);
-        }
+        self.overlay_attr(&mut attr);
         Ok(attr)
     }
 
@@ -180,9 +341,7 @@ impl Dbfs {
             .lookup(parent_ino, name)
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
-        if let Some(dirty) = self.dirty_files.lock().unwrap().get(&attr.ino) {
-            overlay_dirty(&mut attr, dirty);
-        }
+        self.overlay_attr(&mut attr);
         Ok(attr)
     }
 
@@ -300,11 +459,16 @@ impl Dbfs {
         atime: Option<SystemTime>,
         mtime: Option<SystemTime>,
     ) -> Result<FileAttr, i32> {
-        self.flush_file(ino)?;
+        // Persist buffered writes first: the returned attributes must include
+        // them, and a later flush must not overwrite the mtime set here (`cp -a`
+        // writes, then calls utimensat, then closes).
+        let mut t = self.table();
+        if let Some(slot) = t.inodes.find(ino) {
+            self.flush_slot(&mut t, slot, Unlinked::Persist)?;
+            Shared::free_if_idle(&mut t, slot);
+        }
         if let Some(size) = size {
-            self.db
-                .truncate_file(ino, size)
-                .map_err(errno_from_db_error)?;
+            self.truncate_locked(&mut t, ino, size)?;
         }
 
         self.db
@@ -347,106 +511,51 @@ impl Dbfs {
         Err(libc::ENODATA)
     }
 
+    /// Opens `ino` and returns a new file handle for it.
     pub fn open(&self, ino: u64) -> Result<u64, i32> {
-        self.db
-            .inode_kind_of(ino)
-            .map(|_| ino)
-            .map_err(errno_from_db_error)
+        let mut t = self.table();
+        let slot = self.slot_for(&mut t, ino)?;
+        Ok(Shared::open_slot(&mut t, slot))
     }
 
+    /// Reads through the open-inode table if `ino` has a slot, else from the database.
     pub fn read(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        let dirty_files = self.dirty_files.lock().unwrap();
-        let Some(dirty) = dirty_files.get(&ino) else {
-            return self
-                .db
-                .read_file(ino, offset, size)
-                .map_err(errno_from_db_error);
-        };
-
-        // A dirty entry exists only for a live regular file, and its size is
-        // authoritative: it is never below the stored size.
-        if offset >= dirty.size || size == 0 {
-            return Ok(Vec::new());
+        let t = self.table();
+        match t.inodes.find(ino) {
+            Some(slot) => self.read_slot(&t, slot, offset, size),
+            None => {
+                drop(t);
+                self.db
+                    .read_file(ino, offset, size)
+                    .map_err(errno_from_db_error)
+            }
         }
-        let mut output = vec![0; (size as u64).min(dirty.size - offset) as usize];
-        self.db
-            .read_into(ino, offset, &mut output)
-            .map_err(errno_from_db_error)?;
-
-        let span = ChunkSpan::new(offset, output.len()).expect("non-empty read");
-        for (&chunk_index, data) in dirty.chunks.range(span.first..=span.last) {
-            span.copy_out(chunk_index, data, &mut output);
-        }
-        Ok(output)
     }
 
+    /// Reads through file handle `fh`: no hashing and no inode query.
+    pub fn read_fh(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+        let t = self.table();
+        let slot = t.handles.get(fh).ok_or(libc::EBADF)?;
+        self.read_slot(&t, slot, offset, size)
+    }
+
+    /// Buffers a write to `ino`, whether or not it is open.
     pub fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
         if data.is_empty() {
             return Ok(0);
         }
+        let mut t = self.table();
+        let slot = self.slot_for(&mut t, ino)?;
+        let result = self.write_slot(&mut t, slot, offset, data);
+        Shared::free_if_idle(&mut t, slot);
+        result
+    }
 
-        let kind = match self.db.inode_kind(ino) {
-            Some(k) => k,
-            None => self.db.inode_kind_of(ino).map_err(errno_from_db_error)?,
-        };
-        if let Some(error) = kind.regular_file_error() {
-            return Err(errno_from_db_error(error));
-        }
-
-        let buffered = self
-            .dirty_files
-            .lock()
-            .unwrap()
-            .get(&ino)
-            .map_or(0, |dirty| dirty.chunks.len() * CHUNK_SIZE);
-        if buffered >= FLUSH_THRESHOLD {
-            self.flush_file(ino)?;
-        }
-
-        let modified = Timestamp::from_system_time(SystemTime::now());
-        let mut dirty_files = self.dirty_files.lock().unwrap();
-        if self.closing.load(Ordering::SeqCst) {
-            // Shutdown has already flushed the buffers. Accepting this data now would
-            // acknowledge a write that nothing will persist.
-            return Err(libc::EIO);
-        }
-        let dirty = dirty_files.entry(ino).or_insert_with(|| {
-            let size = self.db.inode_head(ino).map(|(_, size)| size).unwrap_or(0);
-            DirtyFile {
-                size,
-                chunks: BTreeMap::new(),
-                mtime: modified,
-            }
-        });
-
-        dirty.mtime = modified;
-        let mut written = 0;
-        while written < data.len() {
-            let position = offset + written as u64;
-            let chunk_index = position / CHUNK_SIZE as u64;
-            let chunk_offset = (position % CHUNK_SIZE as u64) as usize;
-            let len = (CHUNK_SIZE - chunk_offset).min(data.len() - written);
-            let chunk = match dirty.chunks.entry(chunk_index) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) if len == CHUNK_SIZE => entry.insert(Vec::new()),
-                Entry::Vacant(entry) => {
-                    let mut chunk = Vec::new();
-                    self.db
-                        .read_chunk_into(ino, chunk_index, &mut chunk)
-                        .map_err(errno_from_db_error)?;
-                    entry.insert(chunk)
-                }
-            };
-            let chunk_end = chunk_offset + len;
-            if chunk.len() < chunk_end {
-                chunk.resize(chunk_end, 0);
-            }
-            chunk[chunk_offset..chunk_end].copy_from_slice(&data[written..written + len]);
-            written += len;
-            dirty.size = dirty.size.max(offset + written as u64);
-        }
-
-        Ok(data.len() as u32)
+    /// Buffers a write through file handle `fh`.
+    pub fn write_fh(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
+        let mut t = self.table();
+        let slot = t.handles.get(fh).ok_or(libc::EBADF)?;
+        self.write_slot(&mut t, slot, offset, data)
     }
 
     /// `fallocate` for regular files. Checks run in the order of Linux's
@@ -464,48 +573,62 @@ impl Dbfs {
             return Err(libc::ENODEV);
         }
         // The end must fit in the i64 size that SQLite stores.
-        let end = offset.checked_add(length).ok_or(libc::EFBIG)?;
+        let end = offset.checked_add(length).ok_or(libc::EFBIG)? as u64;
         if mode & libc::FALLOC_FL_KEEP_SIZE != 0 {
             return Ok(());
         }
 
-        // Buffered writes can already extend the file, so persist them first.
-        self.flush_file(ino)?;
-        let (_, size) = self.db.inode_head(ino).map_err(errno_from_db_error)?;
-        if end as u64 <= size {
+        let mut t = self.table();
+        let size = match t.inodes.find(ino) {
+            Some(slot) => t.inodes.size[slot as usize],
+            None => self.db.inode_head(ino).map_err(errno_from_db_error)?.1,
+        };
+        if end <= size {
             return Ok(());
+        }
+        self.truncate_locked(&mut t, ino, end)
+    }
+
+    fn truncate_locked(&self, t: &mut OpenTable, ino: u64, size: u64) -> Result<(), i32> {
+        let slot = t.inodes.find(ino);
+        if let Some(slot) = slot {
+            self.flush_slot(t, slot, Unlinked::Persist)?;
         }
         self.db
-            .truncate_file(ino, end as u64)
-            .map_err(errno_from_db_error)
+            .truncate_file(ino, size)
+            .map_err(errno_from_db_error)?;
+        if let Some(slot) = slot {
+            t.inodes.size[slot as usize] = size;
+            Shared::free_if_idle(t, slot);
+        }
+        Ok(())
     }
 
+    /// Writes the buffered data of `ino` to the database (not yet durable).
     pub fn flush_file(&self, ino: u64) -> Result<(), i32> {
-        let Some(dirty) = self.dirty_files.lock().unwrap().remove(&ino) else {
+        let mut t = self.table();
+        let Some(slot) = t.inodes.find(ino) else {
             return Ok(());
         };
-
-        match self.db.replace_chunks(ino, dirty.size, &dirty.chunks, dirty.mtime) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.dirty_files.lock().unwrap().insert(ino, dirty);
-                Err(errno_from_db_error(error))
-            }
-        }
+        self.flush_slot(&mut t, slot, Unlinked::Skip)?;
+        Shared::free_if_idle(&mut t, slot);
+        Ok(())
     }
 
-    fn sync_file(&self, ino: u64) -> Result<(), i32> {
-        self.flush_file(ino)?;
+    fn flush_fh(&self, fh: u64) -> Result<(), i32> {
+        let mut t = self.table();
+        let slot = t.handles.get(fh).ok_or(libc::EBADF)?;
+        self.flush_slot(&mut t, slot, Unlinked::Skip)
+    }
+
+    fn sync_fh(&self, fh: u64) -> Result<(), i32> {
+        self.flush_fh(fh)?;
         self.db.sync_durable().map_err(errno_from_db_error)
     }
 
-    pub fn release_file(&self, ino: u64) -> Result<(), i32> {
-        let flushed = self.flush_file(ino);
-        self.db.release_file(ino);
-        if flushed.is_err() && self.db.get_inode(ino).is_err() {
-            self.dirty_files.lock().unwrap().remove(&ino);
-        }
-        flushed
+    /// Releases file handle `fh` (from `open` or `create`).
+    pub fn release_file(&self, fh: u64) -> Result<(), i32> {
+        self.release_fh(fh)
     }
 
     pub fn unlink(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
@@ -513,10 +636,12 @@ impl Dbfs {
             .db
             .lookup(parent_ino, name)
             .map_err(errno_from_db_error)?;
-        self.flush_file(inode.ino)?;
+        let mut t = self.table();
         self.db
-            .unlink_inode(parent_ino, name, &inode)
-            .map_err(errno_from_db_error)
+            .unlink_entry(parent_ino, name, &inode, Shared::is_open(&t, inode.ino))
+            .map_err(errno_from_db_error)?;
+        Shared::entry_removed(&mut t, &inode);
+        Ok(())
     }
 
     pub fn rmdir(&self, parent_ino: u64, name: &[u8]) -> Result<(), i32> {
@@ -525,6 +650,8 @@ impl Dbfs {
             .map_err(errno_from_db_error)
     }
 
+    /// Renames an entry. Open handles follow the inode, not the name, so nothing
+    /// is flushed; a replaced inode is handled like an unlink.
     pub fn rename(
         &self,
         parent_ino: u64,
@@ -537,20 +664,40 @@ impl Dbfs {
         if flags & !noreplace != 0 {
             return Err(libc::EINVAL);
         }
-        if let Ok(inode) = self.db.lookup(parent_ino, name) {
-            self.flush_file(inode.ino)?;
-        }
-        self.db
+        let mut t = self.table();
+        let replaced = self
+            .db
             .rename_entry(
                 parent_ino,
                 name,
                 new_parent_ino,
                 new_name,
                 flags & noreplace != 0,
+                |ino| Shared::is_open(&t, ino),
             )
-            .map_err(errno_from_db_error)
+            .map_err(errno_from_db_error)?;
+        if let Some(target) = replaced {
+            Shared::entry_removed(&mut t, &target);
+        }
+        Ok(())
     }
 
+    /// Creates a regular file and opens it, returning its attributes and handle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_open(
+        &self,
+        parent_ino: u64,
+        name: &[u8],
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(FileAttr, u64), i32> {
+        let attr = self.create(parent_ino, name, mode, umask, uid, gid)?;
+        let mut t = self.table();
+        let slot = t.inodes.insert(attr.ino, FileKind::RegularFile, 0);
+        Ok((attr, Shared::open_slot(&mut t, slot)))
+    }
 }
 
 impl Filesystem for Dbfs {
@@ -641,22 +788,10 @@ impl Filesystem for Dbfs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        match Dbfs::create(
-            self,
-            parent,
-            name.as_bytes(),
-            mode,
-            umask,
-            req.uid(),
-            req.gid(),
-        ) {
-            // FIX: Pass 0 for FOPEN flags (not syscall open flags).
-            // The kernel validates these against known FOPEN_* constants
-            // and rejects the reply with EIO for invalid values.
-            Ok(attr) => {
-                self.db.open_file(attr.ino, FileKind::RegularFile);
-                reply.created(&ATTR_TTL, &attr, 0, attr.ino, 0);
-            }
+        match self.create_open(parent, name.as_bytes(), mode, umask, req.uid(), req.gid()) {
+            // Pass 0 for FOPEN flags (not syscall open flags). The kernel validates
+            // these against known FOPEN_* constants and rejects other values with EIO.
+            Ok((attr, fh)) => reply.created(&ATTR_TTL, &attr, 0, fh, 0),
             Err(errno) => reply.error(errno),
         }
     }
@@ -782,26 +917,23 @@ impl Filesystem for Dbfs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        match self.db.inode_kind_of(ino) {
-            Ok(kind) => {
-                self.db.open_file(ino, kind);
-                reply.opened(ino, 0);
-            }
-            Err(e) => reply.error(errno_from_db_error(e)),
+        match Dbfs::open(self, ino) {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(errno) => reply.error(errno),
         }
     }
 
     fn release(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
+        _ino: u64,
+        fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        match self.release_file(ino) {
+        match self.release_fh(fh) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
@@ -810,12 +942,12 @@ impl Filesystem for Dbfs {
     fn flush(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
+        _ino: u64,
+        fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        match self.flush_file(ino) {
+        match self.flush_fh(fh) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
@@ -824,12 +956,12 @@ impl Filesystem for Dbfs {
     fn fsync(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
+        _ino: u64,
+        fh: u64,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.sync_file(ino) {
+        match self.sync_fh(fh) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
@@ -838,8 +970,8 @@ impl Filesystem for Dbfs {
     fn read(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
+        _ino: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
@@ -851,7 +983,7 @@ impl Filesystem for Dbfs {
             return;
         }
 
-        match Dbfs::read(self, ino, offset as u64, size) {
+        match self.read_fh(fh, offset as u64, size) {
             Ok(data) => reply.data(&data),
             Err(errno) => reply.error(errno),
         }
@@ -860,8 +992,8 @@ impl Filesystem for Dbfs {
     fn write(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
+        _ino: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
@@ -874,7 +1006,7 @@ impl Filesystem for Dbfs {
             return;
         }
 
-        match Dbfs::write(self, ino, offset as u64, data) {
+        match self.write_fh(fh, offset as u64, data) {
             Ok(written) => reply.written(written),
             Err(errno) => reply.error(errno),
         }
@@ -1020,14 +1152,6 @@ fn errno_from_db_error(error: DbError) -> i32 {
     }
 }
 
-fn overlay_dirty(attr: &mut FileAttr, dirty: &DirtyFile) {
-    attr.size = dirty.size;
-    attr.blocks = dirty.size.div_ceil(512);
-    let modified = dirty.mtime.to_system_time();
-    attr.mtime = modified;
-    attr.ctime = modified;
-}
-
 fn time_or_now(time: Option<TimeOrNow>) -> Option<SystemTime> {
     match time? {
         TimeOrNow::SpecificTime(time) => Some(time),
@@ -1044,6 +1168,25 @@ fn reply_xattr(value: &[u8], size: u32, reply: ReplyXattr) {
         reply.error(libc::ERANGE);
     } else {
         reply.data(value);
+    }
+}
+
+#[cfg(test)]
+impl Dbfs {
+    fn dirty_inodes(&self) -> usize {
+        let t = self.table();
+        t.inodes
+            .live_slots()
+            .into_iter()
+            .filter(|&slot| !t.inodes.dirty[slot as usize].is_empty())
+            .count()
+    }
+
+    fn is_dirty(&self, ino: u64) -> bool {
+        let t = self.table();
+        t.inodes
+            .find(ino)
+            .is_some_and(|slot| !t.inodes.dirty[slot as usize].is_empty())
     }
 }
 
@@ -1104,10 +1247,7 @@ mod tests {
 
         fs.flush_all().expect("flush_all");
 
-        assert!(
-            fs.dirty_files.lock().unwrap().is_empty(),
-            "no buffer stays dirty"
-        );
+        assert_eq!(fs.dirty_inodes(), 0, "no buffer stays dirty");
         assert_eq!(
             fs.db.read_file(small.ino, 0, 5).expect("read small"),
             b"alpha"
@@ -1151,10 +1291,7 @@ mod tests {
 
         assert_eq!(handle.flush_for_shutdown(), Err(libc::ENOSPC));
         assert_eq!(handle.flush_failure(), Some(libc::ENOSPC));
-        assert!(
-            fs.dirty_files.lock().unwrap().contains_key(&file.ino),
-            "failed data stays buffered"
-        );
+        assert!(fs.is_dirty(file.ino), "failed data stays buffered");
     }
 
     #[test]

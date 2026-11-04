@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -26,17 +26,11 @@ pub(crate) struct VolumeUsage {
     pub files: u64,
 }
 
+/// SQL storage. Holds no per-process file state: which inodes are open lives
+/// in the FUSE layer's open-inode table, and callers say so where it matters
+/// (`unlink_entry`, `rename_entry`).
 pub struct Db {
     conn: Mutex<Connection>,
-    /// Tracks how many open file handles reference each inode.
-    /// When unlink removes the last directory entry but the inode is still
-    /// open (open_count > 0), we defer deletion until the file is released.
-    open_counts: Mutex<HashMap<u64, u64>>,
-    /// Inodes pending deletion once all handles are closed.
-    pending_delete: Mutex<Vec<u64>>,
-    /// Cached inode kinds for open files (set on open, cleared on release).
-    /// Avoids redundant get_inode calls on every write/read.
-    inode_kinds: Mutex<HashMap<u64, FileKind>>,
 }
 
 #[derive(Clone, Copy)]
@@ -183,9 +177,6 @@ impl Db {
 
         Ok(Self {
             conn: Mutex::new(conn),
-            open_counts: Mutex::new(HashMap::new()),
-            pending_delete: Mutex::new(Vec::new()),
-            inode_kinds: Mutex::new(HashMap::new()),
         })
     }
 
@@ -365,43 +356,16 @@ impl Db {
             .map_err(Into::into)
     }
 
-    /// Track that a file handle has been opened for this inode.
-    pub fn open_file(&self, ino: u64, kind: FileKind) {
-        *self.open_counts.lock().unwrap().entry(ino).or_insert(0) += 1;
-        self.inode_kinds.lock().unwrap().insert(ino, kind);
-    }
-
-    /// Return the cached inode kind for an open file, if available.
-    pub fn inode_kind(&self, ino: u64) -> Option<FileKind> {
-        self.inode_kinds.lock().unwrap().get(&ino).copied()
-    }
-
-    /// Release a file handle. If this was the last handle and the inode
-    /// is pending deletion, delete it now.
-    pub fn release_file(&self, ino: u64) {
-        let mut open_counts = self.open_counts.lock().unwrap();
-        let count = open_counts.entry(ino).or_insert(0);
-        if *count > 0 {
-            *count -= 1;
-        }
-
-        if *count == 0 {
-            open_counts.remove(&ino);
-            self.inode_kinds.lock().unwrap().remove(&ino);
-            drop(open_counts);
-
-            let mut pending = self.pending_delete.lock().unwrap();
-            if let Some(pos) = pending.iter().position(|&p| p == ino) {
-                pending.swap_remove(pos);
-                drop(pending);
-                let _ = self
-                    .conn
-                    .lock()
-                    .unwrap()
-                    .prepare_cached("DELETE FROM inodes WHERE ino = ?1")
-                    .and_then(|mut s| s.execute(params![ino as i64]));
-            }
-        }
+    /// Deletes inode `ino` and, through the foreign-key cascade, its chunks,
+    /// symlink target and any remaining entries. Used when the last handle of an
+    /// inode unlinked while open is released.
+    pub(crate) fn delete_inode(&self, ino: u64) -> Result<(), DbError> {
+        self.conn
+            .lock()
+            .unwrap()
+            .prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
+            .execute(params![ino as i64])?;
+        Ok(())
     }
 
     pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &[u8]) -> Result<Inode, DbError> {
@@ -659,15 +623,19 @@ impl Db {
 
     pub fn unlink_file(&self, parent_ino: u64, name: &[u8]) -> Result<(), DbError> {
         let target = self.lookup(parent_ino, name)?;
-        self.unlink_inode(parent_ino, name, &target)
+        self.unlink_entry(parent_ino, name, &target, false)
     }
 
-    /// Unlink a file whose inode has already been resolved (avoids redundant lookup).
-    pub fn unlink_inode(
+    /// Removes entry `name` of an already resolved `target`. When this removes
+    /// the last name and `is_open` is set, the inode stays with `nlink = 0`
+    /// until the caller deletes it (`delete_inode`); a crash leaves it for the
+    /// startup sweep.
+    pub(crate) fn unlink_entry(
         &self,
         parent_ino: u64,
         name: &[u8],
         target: &Inode,
+        is_open: bool,
     ) -> Result<(), DbError> {
         if target.kind == FileKind::Directory {
             return Err(DbError::IsDirectory);
@@ -680,7 +648,7 @@ impl Db {
         tx.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
             .execute(params![parent_ino as i64, name])?;
 
-        self.drop_unlinked_inode(&tx, target, now)?;
+        drop_unlinked_inode(&tx, target, now, is_open)?;
 
         tx.prepare_cached(
             "UPDATE inodes SET mtime = ?1, mtime_nsec = ?2, ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
@@ -728,9 +696,13 @@ impl Db {
         new_parent_ino: u64,
         new_name: &[u8],
     ) -> Result<(), DbError> {
-        self.rename_entry(parent_ino, name, new_parent_ino, new_name, false)
+        self.rename_entry(parent_ino, name, new_parent_ino, new_name, false, |_| false)
+            .map(drop)
     }
 
+    /// Renames an entry. Returns the inode whose entry was replaced, if any.
+    /// `is_open(ino)` says whether the replaced inode has open handles, which
+    /// keeps it (with `nlink = 0`) when this was its last name.
     pub(crate) fn rename_entry(
         &self,
         parent_ino: u64,
@@ -738,7 +710,8 @@ impl Db {
         new_parent_ino: u64,
         new_name: &[u8],
         noreplace: bool,
-    ) -> Result<(), DbError> {
+        is_open: impl Fn(u64) -> bool,
+    ) -> Result<Option<Inode>, DbError> {
         check_name(new_name)?;
         let source = self.lookup(parent_ino, name)?;
         if self.inode_kind_of(new_parent_ino)? != FileKind::Directory {
@@ -749,7 +722,7 @@ impl Db {
         }
 
         if parent_ino == new_parent_ino && name == new_name {
-            return Ok(());
+            return Ok(None);
         }
 
         let existing_target = match self.lookup(new_parent_ino, new_name) {
@@ -786,10 +759,10 @@ impl Db {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        if let Some(target) = existing_target {
+        if let Some(target) = &existing_target {
             tx.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
                 .execute(params![new_parent_ino as i64, new_name])?;
-            self.drop_unlinked_inode(&tx, &target, now)?;
+            drop_unlinked_inode(&tx, target, now, is_open(target.ino))?;
         }
 
         tx.prepare_cached(
@@ -821,56 +794,9 @@ impl Db {
         }
         tx.commit()?;
 
-        Ok(())
+        Ok(existing_target)
     }
 
-    fn drop_unlinked_inode(
-        &self,
-        tx: &rusqlite::Transaction<'_>,
-        target: &Inode,
-        now: Timestamp,
-    ) -> Result<(), DbError> {
-        if target.kind == FileKind::Directory {
-            tx.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
-                .execute(params![target.ino as i64])?;
-            return Ok(());
-        }
-
-        if target.nlink > 1 {
-            tx.prepare_cached(
-                "UPDATE inodes SET nlink = ?1, ctime = ?2, ctime_nsec = ?3 WHERE ino = ?4",
-            )?
-            .execute(params![
-                (target.nlink - 1) as i64,
-                now.secs,
-                now.nsec as i64,
-                target.ino as i64
-            ])?;
-            return Ok(());
-        }
-
-        let open_count = self
-            .open_counts
-            .lock()
-            .unwrap()
-            .get(&target.ino)
-            .copied()
-            .unwrap_or(0);
-        if open_count > 0 {
-            tx.prepare_cached(
-                "UPDATE inodes SET nlink = 0, ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
-            )?
-            .execute(params![now.secs, now.nsec as i64, target.ino as i64])?;
-            if !self.pending_delete.lock().unwrap().contains(&target.ino) {
-                self.pending_delete.lock().unwrap().push(target.ino);
-            }
-        } else {
-            tx.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
-                .execute(params![target.ino as i64])?;
-        }
-
-        Ok(())
-    }
 
     pub fn update_metadata(&self, ino: u64, update: MetadataUpdate) -> Result<Inode, DbError> {
         let inode = self.get_inode(ino)?;
@@ -1079,6 +1005,47 @@ impl ChunkSpan {
         out[piece.buf.start..piece.buf.start + len]
             .copy_from_slice(&data[piece.chunk.start..avail]);
     }
+}
+
+/// Removes the inode behind a deleted entry: deletes directories and inodes
+/// whose last name went away, unless `is_open`, which keeps them with
+/// `nlink = 0`; otherwise drops one link.
+fn drop_unlinked_inode(
+    tx: &rusqlite::Transaction<'_>,
+    target: &Inode,
+    now: Timestamp,
+    is_open: bool,
+) -> Result<(), DbError> {
+    if target.kind == FileKind::Directory {
+        tx.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
+            .execute(params![target.ino as i64])?;
+        return Ok(());
+    }
+
+    if target.nlink > 1 {
+        tx.prepare_cached(
+            "UPDATE inodes SET nlink = ?1, ctime = ?2, ctime_nsec = ?3 WHERE ino = ?4",
+        )?
+        .execute(params![
+            (target.nlink - 1) as i64,
+            now.secs,
+            now.nsec as i64,
+            target.ino as i64
+        ])?;
+        return Ok(());
+    }
+
+    if is_open {
+        tx.prepare_cached(
+            "UPDATE inodes SET nlink = 0, ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
+        )?
+        .execute(params![now.secs, now.nsec as i64, target.ino as i64])?;
+    } else {
+        tx.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
+            .execute(params![target.ino as i64])?;
+    }
+
+    Ok(())
 }
 
 const NAME_MAX: usize = 255;

@@ -2,6 +2,7 @@ mod cli;
 mod db;
 mod fuse;
 mod model;
+mod open_table;
 mod run;
 
 pub use cli::{Cli, Command, MountConfig};
