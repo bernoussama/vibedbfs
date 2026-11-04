@@ -11,9 +11,8 @@
 # detail names the change that provides it) or XFAIL (a known, tracked bug).
 # The exit status is 1 if any row is FAIL.
 #
-# Known bug (C6): rm -rf of a directory with more than about 1,000 entries can
-# skip entries and fail with ENOTEMPTY, because readdir OFFSET cookies shift
-# while entries are deleted. Such steps are reported as XFAIL, not FAIL.
+# rm -rf of a large directory used to skip entries (C6, positional readdir
+# cookies). Phase 6 made cookies stable dirent ids, so any failure is now FAIL.
 #
 # Environment:
 #   DBFS_RUN_DOCKER_TESTS=1   required
@@ -42,7 +41,6 @@ BIN="${DBFS_COMPAT_BIN:-$ROOT/target/release/dbfs}"
 TREE_ENTRIES="${DBFS_COMPAT_TREE_ENTRIES:-2000}"
 S6_MIB="${DBFS_COMPAT_S6_MIB:-16}"
 S6_STOP_LIMIT_MS=5000
-XFAIL_MIN_ENTRIES=1000
 IMAGE_SIZE_LIMIT=20000000
 FUSE_FLAGS=(--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined)
 
@@ -195,9 +193,6 @@ judge_rm() {
   if [[ "$rc" == 0 && "$left" == 0 ]]; then
     note "rm -rf removed all $TREE_ENTRIES entries"
     return 0
-  fi
-  if (( TREE_ENTRIES > XFAIL_MIN_ENTRIES )); then
-    xfail "known C6: rm -rf of a $TREE_ENTRIES-entry directory returned $rc with $left entries left${errs:+ ($errs)}; readdir OFFSET cookies skip entries while deleting"
   fi
   die "rm -rf of a $TREE_ENTRIES-entry directory returned $rc with $left entries left${errs:+ ($errs)}"
 }

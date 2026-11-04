@@ -142,3 +142,27 @@ all data lost before.
 
 Docker compatibility matrix on the merged tree: PASS 12, FAIL 0, SKIP 3 (S2 needs
 `user_allow_other`; S4 needs a shared host mount), XFAIL 1 (`rm -rf`, needs Phase 6).
+
+## After Phase 6 (stable dirent ids as readdir cookies)
+
+Binary `.bench/bin/dbfs-phase6-0c40b3c`, interleaved with the baseline and Phase C
+binaries (3 runs each with `scripts/bench.sh`), seconds (median):
+
+| Stage | Baseline | Phase C | Phase 6 |
+|---|---|---|---|
+| metadata: create 5,000 | 1.23 | 1.38 | 1.48 |
+| metadata: unlink 5,000 | 2.67 | 0.957 | 1.03 |
+| metadata: total | 4.06 | 2.55 | 2.68 |
+| bigdir: create 20,000 | 2.79 | 3.19 | 3.26 |
+| bigdir: list | 0.093 | 0.100 | **0.014** (7× faster, streamed into the reply) |
+| bigdir: delete-while-listing | 17.36 | 1.46 | 2.90 |
+| bigdir: **`rm -rf` succeeds** | no (9,826 left) | no (9,826 left) | **yes (0 left)** |
+
+Phase 6 delete-while-listing is slower than Phase C only because it now deletes all
+20,000 entries instead of about half. The schema moves to version 3 (`dirents.id`
+as the cookie; `dirents_name`, `dirents_child`, `dirents_scan` indexes); older
+databases are rebuilt in place on first mount.
+
+Docker compatibility matrix: PASS 13, FAIL 0, SKIP 3, XFAIL 0. S3 `rm -rf` of a
+2,000-entry tree now passes, and `tests/compat/run.sh` reports any `rm -rf`
+failure as FAIL instead of XFAIL.
