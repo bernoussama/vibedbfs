@@ -201,6 +201,27 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Kind and size of `ino`: the two columns the data paths need, without
+    /// decoding the rest of the row.
+    pub fn inode_head(&self, ino: u64) -> Result<(FileKind, u64), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let (kind, size) = conn
+            .prepare_cached("SELECT kind, size FROM inodes WHERE ino = ?1")?
+            .query_row(params![ino as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+        Ok((FileKind::from_i64(kind)?, size as u64))
+    }
+
+    /// Kind of `ino` only, for "is this a directory?" checks.
+    pub fn inode_kind_of(&self, ino: u64) -> Result<FileKind, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let kind = conn
+            .prepare_cached("SELECT kind FROM inodes WHERE ino = ?1")?
+            .query_row(params![ino as i64], |row| row.get::<_, i64>(0))?;
+        FileKind::from_i64(kind)
+    }
+
     pub fn lookup(&self, parent_ino: u64, name: &[u8]) -> Result<Inode, DbError> {
         check_name(name)?;
         let conn = self.conn.lock().unwrap();
@@ -216,7 +237,7 @@ impl Db {
     }
 
     pub fn list_dir(&self, ino: u64) -> Result<Vec<DirEntry>, DbError> {
-        if self.get_inode(ino)?.kind != FileKind::Directory {
+        if self.inode_kind_of(ino)? != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
 
@@ -263,7 +284,7 @@ impl Db {
         after_id: i64,
         mut emit: impl FnMut(i64, &[u8], u64, FileKind) -> bool,
     ) -> Result<(), DbError> {
-        if self.get_inode(ino)?.kind != FileKind::Directory {
+        if self.inode_kind_of(ino)? != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
 
@@ -334,8 +355,7 @@ impl Db {
     }
 
     pub fn read_symlink(&self, ino: u64) -> Result<Vec<u8>, DbError> {
-        let inode = self.get_inode(ino)?;
-        if inode.kind != FileKind::Symlink {
+        if self.inode_kind_of(ino)? != FileKind::Symlink {
             return Err(DbError::InvalidInput);
         }
 
@@ -390,7 +410,7 @@ impl Db {
         if inode.kind == FileKind::Directory {
             return Err(DbError::IsDirectory);
         }
-        if self.get_inode(new_parent_ino)?.kind != FileKind::Directory {
+        if self.inode_kind_of(new_parent_ino)? != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
 
@@ -424,78 +444,68 @@ impl Db {
     }
 
     pub fn read_file(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, DbError> {
-        let inode = self.get_inode(ino)?;
-        if let Some(error) = inode.kind.regular_file_error() {
+        let (kind, file_size) = self.inode_head(ino)?;
+        if let Some(error) = kind.regular_file_error() {
             return Err(error);
         }
-        if offset >= inode.size || size == 0 {
+        if offset >= file_size || size == 0 {
             return Ok(Vec::new());
         }
 
-        let read_len = (size as u64).min(inode.size - offset) as usize;
-        let mut output = vec![0; read_len];
-        let conn = self.conn.lock().unwrap();
-
-        let start = offset as usize;
-        let end = start + read_len;
-        let start_chunk = start / CHUNK_SIZE;
-        let end_chunk = (end - 1) / CHUNK_SIZE;
-
-        let mut stmt = conn
-            .prepare_cached("SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2")?;
-
-        for chunk_index in start_chunk..=end_chunk {
-            let chunk = stmt
-                .query_row(params![ino as i64, chunk_index as i64], |row| {
-                    row.get::<_, Vec<u8>>(0)
-                })
-                .optional()?;
-
-            let Some(chunk) = chunk else {
-                continue;
-            };
-
-            let chunk_start = chunk_index * CHUNK_SIZE;
-            let copy_start = start.max(chunk_start);
-            let copy_end = end.min(chunk_start + chunk.len());
-            if copy_start >= copy_end {
-                continue;
-            }
-
-            let output_start = copy_start - start;
-            let chunk_copy_start = copy_start - chunk_start;
-            let copy_len = copy_end - copy_start;
-            output[output_start..output_start + copy_len]
-                .copy_from_slice(&chunk[chunk_copy_start..chunk_copy_start + copy_len]);
-        }
-
+        let mut output = vec![0; (size as u64).min(file_size - offset) as usize];
+        self.read_into(ino, offset, &mut output)?;
         Ok(output)
     }
 
-    pub fn write_file(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32, DbError> {
-        self.write_file_batch(ino, &[(offset, data.to_vec())])
+    /// Copies the stored bytes of `ino` at `offset..offset + out.len()` into
+    /// `out`, with one range query. Blobs are borrowed from SQLite, not copied
+    /// into a `Vec` first. Holes (missing chunks, or short trailing chunks) are
+    /// left as they are, so the caller passes a zeroed buffer. Does not check
+    /// the inode kind or size.
+    pub(crate) fn read_into(&self, ino: u64, offset: u64, out: &mut [u8]) -> Result<(), DbError> {
+        let Some(span) = ChunkSpan::new(offset, out.len()) else {
+            return Ok(());
+        };
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT chunk_index, data FROM file_chunks
+             WHERE ino = ?1 AND chunk_index BETWEEN ?2 AND ?3
+             ORDER BY chunk_index",
+        )?;
+        let mut rows = stmt.query(params![ino as i64, span.first as i64, span.last as i64])?;
+        while let Some(row) = rows.next()? {
+            let chunk_index = row.get::<_, i64>(0)? as u64;
+            let data = row.get_ref(1)?.as_blob().map_err(SqlError::from)?;
+            span.copy_out(chunk_index, data, out);
+        }
+        Ok(())
     }
 
-    pub fn write_file_batch(&self, ino: u64, writes: &[(u64, Vec<u8>)]) -> Result<u32, DbError> {
+    pub fn write_file(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32, DbError> {
+        self.write_file_batch(ino, &[(offset, data)])
+    }
+
+    pub fn write_file_batch(&self, ino: u64, writes: &[(u64, &[u8])]) -> Result<u32, DbError> {
         self.write_file_batch_at(ino, writes, now_ts())
     }
 
     pub(crate) fn write_file_batch_at(
         &self,
         ino: u64,
-        writes: &[(u64, Vec<u8>)],
+        writes: &[(u64, &[u8])],
         modified: Timestamp,
     ) -> Result<u32, DbError> {
-        let inode = self.get_inode(ino)?;
-        if let Some(error) = inode.kind.regular_file_error() {
+        let (kind, mut new_size) = self.inode_head(ino)?;
+        if let Some(error) = kind.regular_file_error() {
             return Err(error);
         }
         if writes.iter().all(|(_, data)| data.is_empty()) {
             return Ok(0);
         }
 
-        let mut new_size = inode.size;
         let mut written = 0usize;
+        // One scratch buffer per call, reused for every partial chunk.
+        let mut scratch = Vec::with_capacity(CHUNK_SIZE);
 
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -509,51 +519,37 @@ impl Db {
                  ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
             )?;
 
-            for (offset, data) in writes {
-                if data.is_empty() {
+            for &(offset, data) in writes {
+                let Some(span) = ChunkSpan::new(offset, data.len()) else {
                     continue;
+                };
+
+                for chunk_index in span.first..=span.last {
+                    let piece = span.piece(chunk_index);
+                    let input = &data[piece.buf.clone()];
+
+                    if piece.is_full_chunk() {
+                        write_stmt.execute(params![ino as i64, chunk_index as i64, input])?;
+                        continue;
+                    }
+
+                    scratch.clear();
+                    let mut rows = read_stmt.query(params![ino as i64, chunk_index as i64])?;
+                    if let Some(row) = rows.next()? {
+                        scratch.extend_from_slice(
+                            row.get_ref(0)?.as_blob().map_err(SqlError::from)?,
+                        );
+                    }
+                    drop(rows);
+                    let required_len = piece.chunk.end;
+                    if scratch.len() < required_len {
+                        scratch.resize(required_len, 0);
+                    }
+                    scratch[piece.chunk.clone()].copy_from_slice(input);
+                    write_stmt.execute(params![ino as i64, chunk_index as i64, &scratch[..]])?;
                 }
 
-                let start = *offset as usize;
-                let end = start + data.len();
-                let start_chunk = start / CHUNK_SIZE;
-                let end_chunk = (end - 1) / CHUNK_SIZE;
-
-                for chunk_index in start_chunk..=end_chunk {
-                    let chunk_start = chunk_index * CHUNK_SIZE;
-                    let write_start = start.max(chunk_start);
-                    let write_end = end.min(chunk_start + CHUNK_SIZE);
-                    let chunk_write_start = write_start - chunk_start;
-                    let input_start = write_start - start;
-                    let input_end = write_end - start;
-                    let write_len = input_end - input_start;
-
-                    let is_full_chunk = chunk_write_start == 0 && write_len == CHUNK_SIZE;
-
-                    let chunk_data: Vec<u8> = if is_full_chunk {
-                        data[input_start..input_end].to_vec()
-                    } else {
-                        let mut chunk = read_stmt
-                            .query_row(params![ino as i64, chunk_index as i64], |row| {
-                                row.get::<_, Vec<u8>>(0)
-                            })
-                            .optional()?
-                            .unwrap_or_default();
-
-                        let required_len = chunk_write_start + write_len;
-                        if chunk.len() < required_len {
-                            chunk.resize(required_len, 0);
-                        }
-
-                        chunk[chunk_write_start..required_len]
-                            .copy_from_slice(&data[input_start..input_end]);
-                        chunk
-                    };
-
-                    write_stmt.execute(params![ino as i64, chunk_index as i64, chunk_data])?;
-                }
-
-                new_size = new_size.max(*offset + data.len() as u64);
+                new_size = new_size.max(offset + data.len() as u64);
                 written += data.len();
             }
         }
@@ -573,14 +569,23 @@ impl Db {
         Ok(written as u32)
     }
 
-    pub(crate) fn read_chunk(&self, ino: u64, chunk_index: u64) -> Result<Vec<u8>, DbError> {
+    /// Replaces `dst` with the stored bytes of chunk `chunk_index` (empty for a
+    /// hole), reusing `dst`'s capacity.
+    pub(crate) fn read_chunk_into(
+        &self,
+        ino: u64,
+        chunk_index: u64,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), DbError> {
+        dst.clear();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached("SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2")?;
-        let chunk = stmt
-            .query_row(params![ino as i64, chunk_index as i64], |row| row.get(0))
-            .optional()?;
-        Ok(chunk.unwrap_or_default())
+        let mut rows = stmt.query(params![ino as i64, chunk_index as i64])?;
+        if let Some(row) = rows.next()? {
+            dst.extend_from_slice(row.get_ref(0)?.as_blob().map_err(SqlError::from)?);
+        }
+        Ok(())
     }
 
     pub(crate) fn replace_chunks(
@@ -612,8 +617,7 @@ impl Db {
     }
 
     pub fn truncate_file(&self, ino: u64, size: u64) -> Result<(), DbError> {
-        let inode = self.get_inode(ino)?;
-        if let Some(error) = inode.kind.regular_file_error() {
+        if let Some(error) = self.inode_kind_of(ino)?.regular_file_error() {
             return Err(error);
         }
 
@@ -631,24 +635,16 @@ impl Db {
             tx.prepare_cached("DELETE FROM file_chunks WHERE ino = ?1 AND chunk_index > ?2")?
                 .execute(params![ino as i64, final_chunk_index as i64])?;
 
-            let final_chunk = tx
-                .prepare_cached("SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2")?
-                .query_row(params![ino as i64, final_chunk_index as i64], |row| {
-                    row.get::<_, Vec<u8>>(0)
-                })
-                .optional()?;
-
-            if let Some(mut final_chunk) = final_chunk {
-                final_chunk.truncate(final_chunk_len);
-                tx.prepare_cached(
-                    "UPDATE file_chunks SET data = ?1 WHERE ino = ?2 AND chunk_index = ?3",
-                )?
-                .execute(params![
-                    final_chunk,
-                    ino as i64,
-                    final_chunk_index as i64
-                ])?;
-            }
+            // Cut the final chunk in SQL; the blob never leaves SQLite.
+            tx.prepare_cached(
+                "UPDATE file_chunks SET data = substr(data, 1, ?1)
+                 WHERE ino = ?2 AND chunk_index = ?3 AND length(data) > ?1",
+            )?
+            .execute(params![
+                final_chunk_len as i64,
+                ino as i64,
+                final_chunk_index as i64
+            ])?;
         }
 
         tx.prepare_cached(
@@ -745,7 +741,7 @@ impl Db {
     ) -> Result<(), DbError> {
         check_name(new_name)?;
         let source = self.lookup(parent_ino, name)?;
-        if self.get_inode(new_parent_ino)?.kind != FileKind::Directory {
+        if self.inode_kind_of(new_parent_ino)? != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
         if source.kind == FileKind::Directory && self.is_descendant(new_parent_ino, source.ino)? {
@@ -920,7 +916,7 @@ impl Db {
         gid: u32,
     ) -> Result<Inode, DbError> {
         check_name(name)?;
-        if self.get_inode(parent_ino)?.kind != FileKind::Directory {
+        if self.inode_kind_of(parent_ino)? != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
 
@@ -1016,6 +1012,72 @@ impl Db {
         }
 
         Ok(false)
+    }
+}
+
+/// The chunks covered by the byte range `offset..offset + len` (`len > 0`).
+/// The one place that does chunk boundary arithmetic for reads, writes and the
+/// dirty overlay.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChunkSpan {
+    pub start: u64,
+    pub end: u64,
+    pub first: u64,
+    pub last: u64,
+}
+
+/// The part of one chunk that a span touches.
+#[derive(Debug, Clone)]
+pub(crate) struct ChunkPiece {
+    /// Byte range within the chunk.
+    pub chunk: std::ops::Range<usize>,
+    /// The same bytes as a range within the caller's buffer.
+    pub buf: std::ops::Range<usize>,
+}
+
+impl ChunkPiece {
+    pub fn is_full_chunk(&self) -> bool {
+        self.chunk.start == 0 && self.chunk.end == CHUNK_SIZE
+    }
+}
+
+impl ChunkSpan {
+    pub fn new(offset: u64, len: usize) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+        let end = offset + len as u64;
+        let chunk = CHUNK_SIZE as u64;
+        Some(Self {
+            start: offset,
+            end,
+            first: offset / chunk,
+            last: (end - 1) / chunk,
+        })
+    }
+
+    /// The piece of chunk `chunk_index` (which must be in `first..=last`).
+    pub fn piece(&self, chunk_index: u64) -> ChunkPiece {
+        let chunk_start = chunk_index * CHUNK_SIZE as u64;
+        let from = self.start.max(chunk_start);
+        let to = self.end.min(chunk_start + CHUNK_SIZE as u64);
+        ChunkPiece {
+            chunk: (from - chunk_start) as usize..(to - chunk_start) as usize,
+            buf: (from - self.start) as usize..(to - self.start) as usize,
+        }
+    }
+
+    /// Copies the bytes of a stored chunk that fall in this span into `out`
+    /// (the span's buffer). Bytes past the end of a short chunk are untouched.
+    pub fn copy_out(&self, chunk_index: u64, data: &[u8], out: &mut [u8]) {
+        let piece = self.piece(chunk_index);
+        let avail = data.len().min(piece.chunk.end);
+        if avail <= piece.chunk.start {
+            return;
+        }
+        let len = avail - piece.chunk.start;
+        out[piece.buf.start..piece.buf.start + len]
+            .copy_from_slice(&data[piece.chunk.start..avail]);
     }
 }
 

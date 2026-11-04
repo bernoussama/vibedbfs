@@ -12,7 +12,7 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
-use crate::db::CHUNK_SIZE;
+use crate::db::{CHUNK_SIZE, ChunkSpan};
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
@@ -349,7 +349,7 @@ impl Dbfs {
 
     pub fn open(&self, ino: u64) -> Result<u64, i32> {
         self.db
-            .get_inode(ino)
+            .inode_kind_of(ino)
             .map(|_| ino)
             .map_err(errno_from_db_error)
     }
@@ -363,39 +363,20 @@ impl Dbfs {
                 .map_err(errno_from_db_error);
         };
 
-        self.db.get_inode(ino).map_err(errno_from_db_error)?;
+        // A dirty entry exists only for a live regular file, and its size is
+        // authoritative: it is never below the stored size.
         if offset >= dirty.size || size == 0 {
             return Ok(Vec::new());
         }
-
-        let read_len = (size as u64).min(dirty.size - offset) as usize;
-        let mut output = vec![0; read_len];
-        let persisted = self
-            .db
-            .read_file(ino, offset, read_len as u32)
+        let mut output = vec![0; (size as u64).min(dirty.size - offset) as usize];
+        self.db
+            .read_into(ino, offset, &mut output)
             .map_err(errno_from_db_error)?;
-        output[..persisted.len()].copy_from_slice(&persisted);
 
-        let read_start = offset;
-        let read_end = offset + read_len as u64;
-        let chunk_size = CHUNK_SIZE as u64;
-        let chunk_range = read_start / chunk_size..read_end.div_ceil(chunk_size);
-        for (chunk_index, data) in dirty.chunks.range(chunk_range) {
-            let chunk_start = chunk_index * chunk_size;
-            let chunk_end = chunk_start + data.len() as u64;
-            let copy_start = read_start.max(chunk_start);
-            let copy_end = read_end.min(chunk_end);
-            if copy_start >= copy_end {
-                continue;
-            }
-
-            let output_start = (copy_start - read_start) as usize;
-            let data_start = (copy_start - chunk_start) as usize;
-            let copy_len = (copy_end - copy_start) as usize;
-            output[output_start..output_start + copy_len]
-                .copy_from_slice(&data[data_start..data_start + copy_len]);
+        let span = ChunkSpan::new(offset, output.len()).expect("non-empty read");
+        for (&chunk_index, data) in dirty.chunks.range(span.first..=span.last) {
+            span.copy_out(chunk_index, data, &mut output);
         }
-
         Ok(output)
     }
 
@@ -406,7 +387,7 @@ impl Dbfs {
 
         let kind = match self.db.inode_kind(ino) {
             Some(k) => k,
-            None => self.db.get_inode(ino).map_err(errno_from_db_error)?.kind,
+            None => self.db.inode_kind_of(ino).map_err(errno_from_db_error)?,
         };
         if let Some(error) = kind.regular_file_error() {
             return Err(errno_from_db_error(error));
@@ -430,7 +411,7 @@ impl Dbfs {
             return Err(libc::EIO);
         }
         let dirty = dirty_files.entry(ino).or_insert_with(|| {
-            let size = self.db.get_inode(ino).map(|i| i.size).unwrap_or(0);
+            let size = self.db.inode_head(ino).map(|(_, size)| size).unwrap_or(0);
             DirtyFile {
                 size,
                 chunks: BTreeMap::new(),
@@ -448,11 +429,13 @@ impl Dbfs {
             let chunk = match dirty.chunks.entry(chunk_index) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) if len == CHUNK_SIZE => entry.insert(Vec::new()),
-                Entry::Vacant(entry) => entry.insert(
+                Entry::Vacant(entry) => {
+                    let mut chunk = Vec::new();
                     self.db
-                        .read_chunk(ino, chunk_index)
-                        .map_err(errno_from_db_error)?,
-                ),
+                        .read_chunk_into(ino, chunk_index, &mut chunk)
+                        .map_err(errno_from_db_error)?;
+                    entry.insert(chunk)
+                }
             };
             let chunk_end = chunk_offset + len;
             if chunk.len() < chunk_end {
@@ -477,8 +460,7 @@ impl Dbfs {
         if mode & !libc::FALLOC_FL_KEEP_SIZE != 0 {
             return Err(libc::EOPNOTSUPP);
         }
-        let inode = self.db.get_inode(ino).map_err(errno_from_db_error)?;
-        if inode.kind != FileKind::RegularFile {
+        if self.db.inode_kind_of(ino).map_err(errno_from_db_error)? != FileKind::RegularFile {
             return Err(libc::ENODEV);
         }
         // The end must fit in the i64 size that SQLite stores.
@@ -489,7 +471,7 @@ impl Dbfs {
 
         // Buffered writes can already extend the file, so persist them first.
         self.flush_file(ino)?;
-        let size = self.db.get_inode(ino).map_err(errno_from_db_error)?.size;
+        let (_, size) = self.db.inode_head(ino).map_err(errno_from_db_error)?;
         if end as u64 <= size {
             return Ok(());
         }
@@ -800,9 +782,9 @@ impl Filesystem for Dbfs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        match self.db.get_inode(ino) {
-            Ok(inode) => {
-                self.db.open_file(ino, inode.kind);
+        match self.db.inode_kind_of(ino) {
+            Ok(kind) => {
+                self.db.open_file(ino, kind);
                 reply.opened(ino, 0);
             }
             Err(e) => reply.error(errno_from_db_error(e)),

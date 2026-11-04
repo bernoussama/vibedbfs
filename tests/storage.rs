@@ -304,7 +304,7 @@ fn batches_multiple_file_writes_in_one_call() {
         .expect("create file");
 
     let written = db
-        .write_file_batch(file.ino, &[(0, b"hello".to_vec()), (6, b"dbfs".to_vec())])
+        .write_file_batch(file.ino, &[(0, &b"hello"[..]), (6, &b"dbfs"[..])])
         .expect("write batch");
 
     assert_eq!(written, 9);
@@ -325,8 +325,8 @@ fn batched_overlapping_writes_preserve_write_order() {
     db.write_file_batch(
         file.ino,
         &[
-            (10, b"BBBB".to_vec()),
-            (0, b"abcdefghijklmnopqrst".to_vec()),
+            (10, &b"BBBB"[..]),
+            (0, &b"abcdefghijklmnopqrst"[..]),
         ],
     )
     .expect("write batch");
@@ -1028,4 +1028,94 @@ fn exec_sql(path: &Path, sql: &str) {
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .expect("set busy timeout");
     conn.execute_batch(sql).expect("execute sql");
+}
+
+#[test]
+fn inode_head_reports_kind_and_size() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"head.bin", 0o644, 1000, 1000)
+        .expect("create file");
+    db.write_file(file.ino, 0, b"twelve bytes").expect("write");
+
+    assert_eq!(db.inode_head(file.ino), Ok((FileKind::RegularFile, 12)));
+    assert_eq!(db.inode_kind_of(1), Ok(FileKind::Directory));
+    assert_eq!(db.inode_head(9_999), Err(DbError::NotFound));
+    assert_eq!(db.inode_kind_of(9_999), Err(DbError::NotFound));
+}
+
+#[test]
+fn inode_head_reports_corrupt_kind() {
+    let path = disk_db_path("inode-head-corrupt");
+    let ino = {
+        let db = Db::open(&path).expect("open database");
+        db.create_file(1, b"bad.bin", 0o644, 1000, 1000)
+            .expect("create file")
+            .ino
+    };
+    Connection::open(&path)
+        .expect("open raw sqlite")
+        .execute("UPDATE inodes SET kind = 9 WHERE ino = ?1", params![ino as i64])
+        .expect("corrupt kind");
+
+    let db = Db::open(&path).expect("reopen database");
+    assert_eq!(db.inode_head(ino), Err(DbError::Corrupt));
+    assert_eq!(db.inode_kind_of(ino), Err(DbError::Corrupt));
+    drop(db);
+    remove_db(&path);
+}
+
+#[test]
+fn read_across_a_missing_chunk_returns_zeros_for_the_hole() {
+    const CHUNK: usize = 65_536;
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"holey.bin", 0o644, 1000, 1000)
+        .expect("create file");
+    db.write_file(file.ino, (CHUNK - 3) as u64, b"abc").expect("chunk 0 tail");
+    db.write_file(file.ino, (2 * CHUNK) as u64, b"xyz").expect("chunk 2 head");
+
+    let data = db
+        .read_file(file.ino, (CHUNK - 3) as u64, (CHUNK + 6) as u32)
+        .expect("read across hole");
+
+    let mut expected = b"abc".to_vec();
+    expected.extend(std::iter::repeat_n(0u8, CHUNK));
+    expected.extend_from_slice(b"xyz");
+    assert_eq!(data, expected);
+}
+
+#[test]
+fn read_over_a_short_chunk_returns_zeros_up_to_size() {
+    const CHUNK: usize = 65_536;
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"short.bin", 0o644, 1000, 1000)
+        .expect("create file");
+    // Chunk 0 is stored with 4 bytes only; chunk 1 sets the size past it.
+    db.write_file(file.ino, 0, b"head").expect("short chunk");
+    db.write_file(file.ino, (CHUNK + 1) as u64, b"!").expect("next chunk");
+
+    let data = db
+        .read_file(file.ino, 2, CHUNK as u32)
+        .expect("read over short chunk");
+
+    let mut expected = b"ad".to_vec();
+    expected.resize(CHUNK - 1, 0);
+    expected.push(b'!');
+    assert_eq!(data, expected);
+}
+
+#[test]
+fn truncating_inside_a_chunk_keeps_the_prefix_and_extends_with_zeros() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"cut.bin", 0o644, 1000, 1000)
+        .expect("create file");
+    db.write_file(file.ino, 0, b"0123456789").expect("write");
+
+    db.truncate_file(file.ino, 4).expect("truncate smaller");
+    db.truncate_file(file.ino, 8).expect("truncate larger");
+
+    assert_eq!(db.read_file(file.ino, 0, 16).expect("read"), b"0123\0\0\0\0");
 }
