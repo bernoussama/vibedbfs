@@ -169,8 +169,9 @@ memory, so a clean shutdown must exist first.
 **C4: Explicit xattr behaviour**
 - `getxattr` and `listxattr` return `ENODATA` and an empty list, and `setxattr` returns `EOPNOTSUPP`.
   Tools treat these as "no xattrs on this filesystem" and carry on. Document that SELinux
-  `:z`/`:Z` relabel isn't supported, and to use `--security-opt label=disable` or the
-  `context=` mount option instead (expose it through `-o`).
+  `:z`/`:Z` relabel isn't supported, and to use `--security-opt label=disable` instead.
+  (Implemented. `-o context=` was considered, but `fusermount3` rejects it as an unknown
+  option for non-root mounts, so the docs recommend `label=disable` only.)
 - Real xattr storage (an `xattrs(ino, name, value)` table) is a follow-up if a workload
   needs it, such as `security.capability` on binaries installed into dbfs.
 
