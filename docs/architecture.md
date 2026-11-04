@@ -345,6 +345,74 @@ Step 2 runs on the signal path, not only in `destroy`, because a process that st
    └─────────────────────────────────────────────┘
 ```
 
+## Extended Attributes and fallocate
+
+dbfs stores no extended attributes and reserves no space. Both are answered
+explicitly, so tools see "no xattrs on this filesystem" rather than the `ENOSYS`
+that fuser returns for unimplemented operations.
+
+### Extended attributes
+
+| Call | Existing inode | Missing inode |
+|---|---|---|
+| `getxattr` | `ENODATA` (size probe and buffer alike) | `ENOENT` |
+| `listxattr` | empty list (size probe returns 0) | `ENOENT` |
+| `setxattr` | `EOPNOTSUPP` | `ENOENT` |
+| `removexattr` | `ENODATA` | `ENOENT` |
+
+On a real mount, `cp -a`, `cp --preserve=all`, `tar --xattrs` (create and extract),
+and `rsync -aX` all succeed on trees without xattrs. Python's `os.listxattr` returns
+`[]`, and an explicit `os.setxattr` fails with `EOPNOTSUPP` (errno 95, also
+`ENOTSUP` on Linux).
+
+Trees that do carry xattrs (for example a host file with `user.k`) behave as follows:
+
+| Tool | Result on the mount |
+|---|---|
+| `cp -a` | exit 0, xattr dropped without a message (observed) |
+| `cp --preserve=xattr` | exit 1, `setting attributes ...: Operation not supported` |
+| `tar --xattrs -xf` | `Cannot set 'user.k' extended attribute ...: Operation not supported`, exit 0 |
+| `rsync -aX` | exit 23, `lsetxattr(...) failed: Operation not supported` |
+
+Those errors come from the explicit `setxattr` refusal. Accepting and discarding
+writes would make the tools quieter, but it would also report success for data that
+was not stored.
+
+SELinux relabelling (`:z` / `:Z` on a volume) writes `security.selinux` through
+`setxattr`, which is refused. Relabelling is therefore unsupported. Use
+`--security-opt label=disable` on the container instead. Real attribute storage
+(an `xattrs(ino, name, value)` table) is a follow-up, needed only by workloads
+such as `security.capability` on installed binaries.
+
+### fallocate
+
+```
+fallocate(ino, offset, length, mode)
+  ├─ offset < 0 or length <= 0 ─────────────► EINVAL
+  ├─ mode has bits other than KEEP_SIZE ────► EOPNOTSUPP
+  ├─ inode missing ─────────────────────────► ENOENT
+  ├─ not a regular file ────────────────────► ENODEV
+  ├─ offset + length overflows i64 ─────────► EFBIG
+  ├─ mode == KEEP_SIZE ─────────────────────► OK, nothing changes
+  └─ flush_file(ino)        persist buffered writes first
+       end = offset + length
+       end <= size ─────────────────────────► OK, nothing changes (never shrinks)
+       end >  size ─► truncate_file(ino, end)
+                       size = end, mtime and ctime = now
+                       holes are sparse and read as zeros
+```
+
+| Mode | Result |
+|---|---|
+| `0` | Extends the file to `offset + length` when that is past the end. Otherwise no change. |
+| `FALLOC_FL_KEEP_SIZE` alone | Succeeds without changing anything. |
+| Any other bit (`PUNCH_HOLE`, `ZERO_RANGE`, `COLLAPSE_RANGE`, `INSERT_RANGE`, `UNSHARE_RANGE`) | `EOPNOTSUPP` |
+
+Space is not reserved. SQLite allocates pages when chunks are written, so a
+`fallocate` that succeeds can still be followed by `ENOSPC` on write. The `ENODEV`
+check mirrors Linux's `vfs_fallocate`, which refuses non-regular files before the
+call reaches FUSE, so user space should not normally see it.
+
 ## Optimization Points
 
 ```

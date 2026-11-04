@@ -26,6 +26,7 @@ if __name__ == "__main__":
 
     sys.exit(pytest.main([__file__] + sys.argv[1:]))
 
+import ctypes
 import filecmp
 import logging
 import os
@@ -47,6 +48,8 @@ import pytest
 
 DBFS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DBFS_BIN = os.path.join(DBFS_ROOT, "target", "release", "dbfs")
+# Disk-backed scratch space for mounts that copy real data (never /tmp: tmpfs).
+BENCH_ROOT = os.path.join(DBFS_ROOT, ".bench")
 LIBFUSE_ROOT = os.path.abspath(
     os.path.join(DBFS_ROOT, "..", "..", "clones", "libfuse")
 )
@@ -317,6 +320,36 @@ def dbfs_mount(tmp_path, output_checker):
             umount(mount_process, mnt_dir)
         except Exception:
             cleanup(mount_process, mnt_dir)
+
+
+@pytest.fixture
+def dbfs_bench_mount(output_checker):
+    """Like dbfs_mount, but the database and mountpoint live under .bench/.
+
+    Yields the mountpoint. Its parent directory is host-side scratch space
+    for source trees that the tests copy onto the mount.
+    """
+    os.makedirs(BENCH_ROOT, exist_ok=True)
+    base = tempfile.mkdtemp(prefix="pytest-xattr-", dir=BENCH_ROOT)
+    db_path = os.path.join(base, "test.sqlite")
+    mnt_dir = os.path.join(base, "mnt")
+    os.makedirs(mnt_dir)
+
+    mount_process = subprocess.Popen(
+        [DBFS_BIN, "mount", db_path, mnt_dir],
+        stdout=output_checker.fd,
+        stderr=output_checker.fd,
+    )
+    try:
+        wait_for_mount(mount_process, mnt_dir)
+        yield mnt_dir
+    finally:
+        try:
+            umount(mount_process, mnt_dir)
+        except Exception:
+            cleanup(mount_process, mnt_dir)
+        if not os.path.ismount(mnt_dir):
+            shutil.rmtree(base, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +774,155 @@ class TestBasicFileOps:
 
     def test_hardlink(self, dbfs_mount):
         tst_hardlink(dbfs_mount)
+
+
+def make_source_tree(base):
+    """Host-side tree with nested dirs, a 0640 file, a large file, a symlink and an empty dir."""
+    src = os.path.join(base, "src")
+    os.makedirs(os.path.join(src, "a", "b"))
+    os.makedirs(os.path.join(src, "empty"))
+    small = os.path.join(src, "a", "b", "file.txt")
+    with open(small, "wb") as fh:
+        fh.write(b"hello")
+    os.chmod(small, 0o640)
+    with open(os.path.join(src, "a", "big.bin"), "wb") as fh:
+        fh.write(bytes(i % 251 for i in range(200 * 1024)))
+    os.symlink("b/file.txt", os.path.join(src, "a", "link"))
+    return src
+
+
+def assert_same_tree(src, dst):
+    """Names, types, symlink targets and file bytes match. Mode of the 0640 file too."""
+    for dirpath, dirnames, filenames in os.walk(src):
+        rel = os.path.relpath(dirpath, src)
+        target_dir = os.path.normpath(os.path.join(dst, rel))
+        assert sorted(os.listdir(target_dir)) == sorted(os.listdir(dirpath)), rel
+        for name in dirnames + filenames:
+            s = os.path.join(dirpath, name)
+            d = os.path.join(target_dir, name)
+            if os.path.islink(s):
+                assert os.readlink(d) == os.readlink(s), s
+            elif os.path.isdir(s):
+                assert os.path.isdir(d) and not os.path.islink(d), s
+            else:
+                assert filecmp.cmp(s, d, shallow=False), s
+    file_mode = os.stat(os.path.join(dst, "a", "b", "file.txt")).st_mode & 0o777
+    assert file_mode == 0o640, oct(file_mode)
+
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64]
+libc.fallocate.restype = ctypes.c_int
+FALLOC_FL_KEEP_SIZE = 0x01
+FALLOC_FL_PUNCH_HOLE = 0x02
+FALLOC_FL_ZERO_RANGE = 0x10
+
+
+def call_fallocate(fd, mode, offset, length):
+    """Return 0 on success, else the errno from fallocate(2)."""
+    if libc.fallocate(fd, mode, offset, length) == 0:
+        return 0
+    return ctypes.get_errno()
+
+
+class TestXattrAndFallocate:
+    """Explicit xattr behaviour (C4) and fallocate (C5), checked with real tools."""
+
+    def test_listxattr_is_empty_on_files_and_root(self, dbfs_bench_mount):
+        path = os.path.join(dbfs_bench_mount, "f.txt")
+        with open(path, "wb"):
+            pass
+        assert os.listxattr(path) == []
+        assert os.listxattr(dbfs_bench_mount) == []
+
+    def test_getxattr_reports_enodata(self, dbfs_bench_mount):
+        path = os.path.join(dbfs_bench_mount, "f.txt")
+        with open(path, "wb"):
+            pass
+        with pytest.raises(OSError) as exc_info:
+            os.getxattr(path, "user.x")
+        assert exc_info.value.errno == errno.ENODATA
+
+    def test_setxattr_reports_eopnotsupp(self, dbfs_bench_mount):
+        path = os.path.join(dbfs_bench_mount, "f.txt")
+        with open(path, "wb"):
+            pass
+        with pytest.raises(OSError) as exc_info:
+            os.setxattr(path, "user.x", b"1")
+        assert exc_info.value.errno == errno.EOPNOTSUPP
+
+    def test_removexattr_reports_enodata(self, dbfs_bench_mount):
+        path = os.path.join(dbfs_bench_mount, "f.txt")
+        with open(path, "wb"):
+            pass
+        with pytest.raises(OSError) as exc_info:
+            os.removexattr(path, "user.x")
+        assert exc_info.value.errno == errno.ENODATA
+
+    def test_cp_a_copies_a_tree(self, dbfs_bench_mount):
+        src = make_source_tree(os.path.dirname(dbfs_bench_mount))
+        dst = os.path.join(dbfs_bench_mount, "copy")
+        subprocess.run(["cp", "-a", src, dst], check=True)
+        assert_same_tree(src, dst)
+
+    def test_cp_preserve_all_copies_a_tree(self, dbfs_bench_mount):
+        src = make_source_tree(os.path.dirname(dbfs_bench_mount))
+        dst = os.path.join(dbfs_bench_mount, "copy")
+        subprocess.run(["cp", "--preserve=all", "-r", src, dst], check=True)
+        assert_same_tree(src, dst)
+
+    def test_tar_xattrs_round_trip_through_the_mount(self, dbfs_bench_mount):
+        base = os.path.dirname(dbfs_bench_mount)
+        src = make_source_tree(base)
+        tree = os.path.join(dbfs_bench_mount, "tree")
+        subprocess.run(["cp", "-a", src, tree], check=True)
+        archive = os.path.join(base, "archive.tar")
+        subprocess.run(["tar", "--xattrs", "-cf", archive, "-C", dbfs_bench_mount, "tree"],
+                       check=True)
+        extracted = os.path.join(dbfs_bench_mount, "extracted")
+        os.makedirs(extracted)
+        subprocess.run(["tar", "--xattrs", "-xf", archive, "-C", extracted], check=True)
+        assert_same_tree(src, os.path.join(extracted, "tree"))
+
+    def test_rsync_xattrs_copies_a_tree(self, dbfs_bench_mount):
+        if shutil.which("rsync") is None:
+            pytest.skip("rsync not installed")
+        src = make_source_tree(os.path.dirname(dbfs_bench_mount))
+        dst = os.path.join(dbfs_bench_mount, "rsync")
+        subprocess.run(["rsync", "-aX", src + "/", dst + "/"], check=True)
+        assert_same_tree(src, dst)
+
+    def test_posix_fallocate_extends_and_reads_zeros(self, dbfs_bench_mount):
+        path = os.path.join(dbfs_bench_mount, "sparse.bin")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            os.pwrite(fd, b"head", 0)
+            os.posix_fallocate(fd, 0, 1 << 20)
+            assert os.fstat(fd).st_size == 1 << 20
+            data = os.pread(fd, 1 << 20, 0)
+            assert data[:4] == b"head"
+            assert data[4:] == bytes((1 << 20) - 4)
+        finally:
+            os.close(fd)
+
+    def test_fallocate_modes_and_errnos(self, dbfs_bench_mount):
+        path = os.path.join(dbfs_bench_mount, "modes.bin")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            os.pwrite(fd, b"abc", 0)
+            assert call_fallocate(fd, 0, 0, 4096) == 0
+            assert os.fstat(fd).st_size == 4096
+            assert call_fallocate(fd, FALLOC_FL_KEEP_SIZE, 1 << 20, 4096) == 0
+            assert os.fstat(fd).st_size == 4096
+            assert call_fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                  0, 4096) == errno.EOPNOTSUPP
+            assert call_fallocate(fd, FALLOC_FL_ZERO_RANGE, 0, 4096) == errno.EOPNOTSUPP
+            assert call_fallocate(fd, 0, -1, 16) == errno.EINVAL
+            assert call_fallocate(fd, 0, 0, 0) == errno.EINVAL
+            assert os.fstat(fd).st_size == 4096
+            assert os.pread(fd, 3, 0) == b"abc"
+        finally:
+            os.close(fd)
 
 
 class TestSyscalls:
