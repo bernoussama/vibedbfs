@@ -352,6 +352,19 @@ and `rsync -aX` all succeed on trees without xattrs. Python's `os.listxattr` ret
 `[]`, and an explicit `os.setxattr` fails with `EOPNOTSUPP` (errno 95, also
 `ENOTSUP` on Linux).
 
+Trees that do carry xattrs (for example a host file with `user.k`) behave as follows:
+
+| Tool | Result on the mount |
+|---|---|
+| `cp -a` | exit 0, xattr dropped without a message (observed) |
+| `cp --preserve=xattr` | exit 1, `setting attributes ...: Operation not supported` |
+| `tar --xattrs -xf` | `Cannot set 'user.k' extended attribute ...: Operation not supported`, exit 0 |
+| `rsync -aX` | exit 23, `lsetxattr(...) failed: Operation not supported` |
+
+Those errors come from the explicit `setxattr` refusal. Accepting and discarding
+writes would make the tools quieter, but it would also report success for data that
+was not stored.
+
 SELinux relabelling (`:z` / `:Z` on a volume) writes `security.selinux` through
 `setxattr`, which is refused. Relabelling is therefore unsupported. Use
 `--security-opt label=disable` on the container instead. Real attribute storage

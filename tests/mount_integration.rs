@@ -3,7 +3,7 @@ use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
@@ -224,6 +224,12 @@ fn mounted_xattr_calls_return_enodata_eopnotsupp_and_an_empty_list_when_enabled(
         let rc = unsafe { libc::listxattr(target.as_ptr(), std::ptr::null_mut(), 0) };
         assert_eq!(rc, 0, "listxattr size probe on {target:?}");
     }
+    let mut names = [0u8; 64];
+    let rc = unsafe { libc::listxattr(file.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    assert_eq!(
+        rc, 0,
+        "listxattr into a non-empty buffer returns zero bytes"
+    );
 
     // setxattr: refused with EOPNOTSUPP.
     let rc = unsafe {
@@ -287,6 +293,38 @@ fn mounted_cp_a_copies_a_directory_tree_when_enabled() {
             & 0o777,
         0o640,
         "cp -a preserves the mode"
+    );
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn mount_teardown_detaches_a_busy_mount_instead_of_hanging_when_enabled() {
+    let mount = BenchMount::start("busy-teardown");
+    let mountpoint = mount.mountpoint().to_path_buf();
+    // A process whose working directory is inside the mount makes the first
+    // umount fail with EBUSY.
+    let mut holder = Command::new("sleep")
+        .arg("600")
+        .current_dir(&mountpoint)
+        .spawn()
+        .expect("start a process inside the mount");
+
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(mount);
+        let _ = done.send(());
+    });
+    let teardown = finished.recv_timeout(Duration::from_secs(60));
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    assert!(teardown.is_ok(), "teardown of a busy mount did not finish");
+    let mounts = fs::read_to_string("/proc/mounts").expect("read /proc/mounts");
+    assert!(
+        !mounts
+            .lines()
+            .any(|line| line.split(' ').nth(1) == mountpoint.to_str()),
+        "mount is still attached after teardown"
     );
 }
 
@@ -671,11 +709,56 @@ fn wait_for_mount(mountpoint: &Path) {
     panic!("mount did not become ready");
 }
 
+/// Unmounts `mountpoint` and waits for the daemon to exit. It never blocks
+/// indefinitely: a plain umount can fail with EBUSY while a transient reference
+/// to the mount exists, so it is retried, then detached lazily, and a daemon
+/// that still does not exit is killed.
 fn unmount(mountpoint: &Path, child: &mut Child) {
-    let _ = Command::new("fusermount3")
-        .arg("-u")
+    if !fusermount_unmount(mountpoint, false) {
+        let retried = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            fusermount_unmount(mountpoint, false)
+        });
+        if !retried {
+            eprintln!(
+                "{} could not be unmounted; detaching it lazily",
+                mountpoint.display()
+            );
+            fusermount_unmount(mountpoint, true);
+        }
+    }
+    wait_for_exit(child);
+}
+
+fn fusermount_unmount(mountpoint: &Path, lazy: bool) -> bool {
+    let mut command = Command::new("fusermount3");
+    command.arg("-u");
+    if lazy {
+        command.arg("-z");
+    }
+    command
         .arg(mountpoint)
-        .status();
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn wait_for_exit(child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => break,
+            _ => return,
+        }
+    }
+    eprintln!(
+        "dbfs pid {} did not exit after unmount; killing it",
+        child.id()
+    );
+    let _ = child.kill();
     let _ = child.wait();
 }
 
