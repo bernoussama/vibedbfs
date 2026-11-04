@@ -10,13 +10,38 @@ use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
 
 pub(crate) const CHUNK_SIZE: usize = 65_536;
 
+/// Chunk rows are keyed by `(ino << CHUNK_BITS) | chunk_index`.
+const CHUNK_BITS: u32 = 24;
+const MAX_CHUNKS: u64 = 1 << CHUNK_BITS;
+/// 2^24 chunks of 64 KiB: 1 TiB. Larger files get `EFBIG`.
+pub(crate) const MAX_FILE_SIZE: u64 = MAX_CHUNKS * CHUNK_SIZE as u64;
+/// Largest inode number whose chunk keys fit in a positive i64.
+const MAX_INO: u64 = (1 << (63 - CHUNK_BITS)) - 1;
+
+/// Row id of chunk `chunk_index` of `ino`.
+fn chunk_key(ino: u64, chunk_index: u64) -> i64 {
+    debug_assert!(ino <= MAX_INO && chunk_index < MAX_CHUNKS);
+    ((ino << CHUNK_BITS) | chunk_index) as i64
+}
+
+/// Inclusive row id range of every chunk of `ino`.
+fn chunk_keys(ino: u64) -> (i64, i64) {
+    (chunk_key(ino, 0), chunk_key(ino, MAX_CHUNKS - 1))
+}
+
+fn chunk_index_of(key: i64) -> u64 {
+    key as u64 & (MAX_CHUNKS - 1)
+}
+
 /// On-disk schema version, stored in `PRAGMA user_version`.
 ///
 /// - 0: databases created before versioning existed (may lack `*_nsec` columns)
 /// - 1: `inodes` has `atime_nsec`, `mtime_nsec`, `ctime_nsec`
 /// - 2: index `dirents_child` on `dirents(child_ino)`
 /// - 3: `dirents.id` is a stable per-entry id, used as the readdir cookie
-pub const SCHEMA_VERSION: i64 = 3;
+/// - 4: `file_chunks` keyed by one integer, `(ino << 24) | chunk_index`; one
+///   `*_ns` column per timestamp
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub(crate) struct VolumeUsage {
     pub page_size: u64,
@@ -113,12 +138,9 @@ impl Db {
               uid INTEGER NOT NULL,
               gid INTEGER NOT NULL,
               size INTEGER NOT NULL,
-              atime INTEGER NOT NULL,
-              mtime INTEGER NOT NULL,
-              ctime INTEGER NOT NULL,
-              atime_nsec INTEGER NOT NULL DEFAULT 0,
-              mtime_nsec INTEGER NOT NULL DEFAULT 0,
-              ctime_nsec INTEGER NOT NULL DEFAULT 0,
+              atime_ns INTEGER NOT NULL,
+              mtime_ns INTEGER NOT NULL,
+              ctime_ns INTEGER NOT NULL,
               nlink INTEGER NOT NULL
             );
 
@@ -131,12 +153,11 @@ impl Db {
               FOREIGN KEY (child_ino) REFERENCES inodes(ino) ON DELETE CASCADE
             );
 
+            -- id = (ino << 24) | chunk_index. No foreign key: deleting an inode
+            -- deletes its chunk range explicitly (delete_inode_rows).
             CREATE TABLE IF NOT EXISTS file_chunks (
-              ino INTEGER NOT NULL,
-              chunk_index INTEGER NOT NULL,
-              data BLOB NOT NULL,
-              PRIMARY KEY (ino, chunk_index),
-              FOREIGN KEY (ino) REFERENCES inodes(ino) ON DELETE CASCADE
+              id INTEGER PRIMARY KEY,
+              data BLOB NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS symlink_targets (
@@ -153,26 +174,31 @@ impl Db {
         let mount_gid = unsafe { libc::getgid() } as i64;
         conn.execute(
             "INSERT OR IGNORE INTO inodes
-             (ino, kind, mode, uid, gid, size, atime, mtime, ctime,
-              atime_nsec, mtime_nsec, ctime_nsec, nlink)
-             VALUES (1, ?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, ?6, ?6, ?6, 2)",
+             (ino, kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink)
+             VALUES (1, ?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, 2)",
             params![
                 FileKind::Directory.as_i64(),
                 0o755_i64,
                 mount_uid,
                 mount_gid,
-                now.secs,
-                now.nsec as i64,
+                now.to_ns(),
             ],
         )?;
         conn.execute(
             "UPDATE inodes
-             SET uid = ?1, gid = ?2, ctime = ?3, ctime_nsec = ?4
+             SET uid = ?1, gid = ?2, ctime_ns = ?3
              WHERE ino = 1 AND uid = 0 AND gid = 0",
-            params![mount_uid, mount_gid, now.secs, now.nsec as i64],
+            params![mount_uid, mount_gid, now.to_ns()],
         )?;
         recompute_directory_nlink(&conn)?;
-        conn.execute("DELETE FROM inodes WHERE nlink = 0 AND ino != 1", [])?;
+        // Inodes unlinked while open, left by a crash.
+        let orphans: Vec<i64> = conn
+            .prepare("SELECT ino FROM inodes WHERE nlink = 0 AND ino != 1")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for ino in orphans {
+            delete_inode_rows(&conn, ino as u64)?;
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -182,8 +208,7 @@ impl Db {
     pub fn get_inode(&self, ino: u64) -> Result<Inode, DbError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
-            "SELECT ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink,
-                    atime_nsec, mtime_nsec, ctime_nsec
+            "SELECT ino, kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink
              FROM inodes
              WHERE ino = ?1",
         )?;
@@ -216,8 +241,8 @@ impl Db {
         check_name(name)?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
-            "SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.nlink,
-                    i.atime_nsec, i.mtime_nsec, i.ctime_nsec
+            "SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size,
+                    i.atime_ns, i.mtime_ns, i.ctime_ns, i.nlink
              FROM dirents d
              JOIN inodes i ON i.ino = d.child_ino
              WHERE d.parent_ino = ?1 AND d.name = ?2",
@@ -359,11 +384,10 @@ impl Db {
     /// symlink target and any remaining entries. Used when the last handle of an
     /// inode unlinked while open is released.
     pub(crate) fn delete_inode(&self, ino: u64) -> Result<(), DbError> {
-        self.conn
-            .lock()
-            .unwrap()
-            .prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
-            .execute(params![ino as i64])?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        delete_inode_rows(&tx, ino)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -385,18 +409,9 @@ impl Db {
             .execute(params![new_parent_ino as i64, new_name, ino as i64])?;
 
         let new_nlink = inode.nlink + 1;
-        tx.prepare_cached(
-            "UPDATE inodes SET nlink = ?1, ctime = ?2, ctime_nsec = ?3 WHERE ino = ?4",
-        )?
-        .execute(params![
-            new_nlink as i64,
-            now.secs,
-            now.nsec as i64,
-            ino as i64
-        ])?;
-        tx.prepare_cached(
-            "UPDATE inodes SET mtime = ?1, mtime_nsec = ?2, ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
-        )?.execute(params![now.secs, now.nsec as i64, new_parent_ino as i64])?;
+        tx.prepare_cached("UPDATE inodes SET nlink = ?1, ctime_ns = ?2 WHERE ino = ?3")?
+            .execute(params![new_nlink as i64, now.to_ns(), ino as i64])?;
+        touch_dir(&tx, new_parent_ino, now)?;
         tx.commit()?;
 
         Ok(Inode {
@@ -429,15 +444,17 @@ impl Db {
         let Some(span) = ChunkSpan::new(offset, out.len()) else {
             return Ok(());
         };
+        if span.first >= MAX_CHUNKS {
+            return Ok(());
+        }
+        let last = span.last.min(MAX_CHUNKS - 1);
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
-            "SELECT chunk_index, data FROM file_chunks
-             WHERE ino = ?1 AND chunk_index BETWEEN ?2 AND ?3
-             ORDER BY chunk_index",
+            "SELECT id, data FROM file_chunks WHERE id BETWEEN ?1 AND ?2 ORDER BY id",
         )?;
-        let mut rows = stmt.query(params![ino as i64, span.first as i64, span.last as i64])?;
+        let mut rows = stmt.query(params![chunk_key(ino, span.first), chunk_key(ino, last)])?;
         while let Some(row) = rows.next()? {
-            let chunk_index = row.get::<_, i64>(0)? as u64;
+            let chunk_index = chunk_index_of(row.get(0)?);
             let data = row.get_ref(1)?.as_blob().map_err(SqlError::from)?;
             span.copy_out(chunk_index, data, out);
         }
@@ -465,6 +482,12 @@ impl Db {
         if writes.iter().all(|(_, data)| data.is_empty()) {
             return Ok(0);
         }
+        if writes
+            .iter()
+            .any(|&(offset, data)| offset.saturating_add(data.len() as u64) > MAX_FILE_SIZE)
+        {
+            return Err(DbError::FileTooLarge);
+        }
 
         let mut written = 0usize;
         // One scratch buffer per call, reused for every partial chunk.
@@ -474,13 +497,8 @@ impl Db {
         let tx = conn.transaction()?;
 
         {
-            let mut read_stmt = tx.prepare_cached(
-                "SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2",
-            )?;
-            let mut write_stmt = tx.prepare_cached(
-                "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
-            )?;
+            let mut read_stmt = tx.prepare_cached("SELECT data FROM file_chunks WHERE id = ?1")?;
+            let mut write_stmt = tx.prepare_cached(UPSERT_CHUNK)?;
 
             for &(offset, data) in writes {
                 let Some(span) = ChunkSpan::new(offset, data.len()) else {
@@ -491,13 +509,14 @@ impl Db {
                     let piece = span.piece(chunk_index);
                     let input = &data[piece.buf.clone()];
 
+                    let key = chunk_key(ino, chunk_index);
                     if piece.is_full_chunk() {
-                        write_stmt.execute(params![ino as i64, chunk_index as i64, input])?;
+                        write_stmt.execute(params![key, input])?;
                         continue;
                     }
 
                     scratch.clear();
-                    let mut rows = read_stmt.query(params![ino as i64, chunk_index as i64])?;
+                    let mut rows = read_stmt.query(params![key])?;
                     if let Some(row) = rows.next()? {
                         scratch.extend_from_slice(
                             row.get_ref(0)?.as_blob().map_err(SqlError::from)?,
@@ -509,7 +528,7 @@ impl Db {
                         scratch.resize(required_len, 0);
                     }
                     scratch[piece.chunk.clone()].copy_from_slice(input);
-                    write_stmt.execute(params![ino as i64, chunk_index as i64, &scratch[..]])?;
+                    write_stmt.execute(params![key, &scratch[..]])?;
                 }
 
                 new_size = new_size.max(offset + data.len() as u64);
@@ -517,16 +536,7 @@ impl Db {
             }
         }
 
-        tx.prepare_cached(
-            "UPDATE inodes SET size = ?1, mtime = ?2, mtime_nsec = ?3, ctime = ?2, ctime_nsec = ?3
-             WHERE ino = ?4",
-        )?
-        .execute(params![
-            new_size as i64,
-            modified.secs,
-            modified.nsec as i64,
-            ino as i64
-        ])?;
+        set_size(&tx, ino, new_size, modified)?;
         tx.commit()?;
 
         Ok(written as u32)
@@ -541,9 +551,8 @@ impl Db {
         dst: &mut [u8],
     ) -> Result<usize, DbError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached("SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2")?;
-        let mut rows = stmt.query(params![ino as i64, chunk_index as i64])?;
+        let mut stmt = conn.prepare_cached("SELECT data FROM file_chunks WHERE id = ?1")?;
+        let mut rows = stmt.query(params![chunk_key(ino, chunk_index)])?;
         let Some(row) = rows.next()? else {
             return Ok(0);
         };
@@ -566,18 +575,13 @@ impl Db {
         let tx = conn.transaction()?;
 
         {
-            let mut write_stmt = tx.prepare_cached(
-                "INSERT INTO file_chunks (ino, chunk_index, data) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
-            )?;
+            let mut write_stmt = tx.prepare_cached(UPSERT_CHUNK)?;
             for (chunk_index, data) in chunks {
-                write_stmt.execute(params![ino as i64, chunk_index as i64, data])?;
+                write_stmt.execute(params![chunk_key(ino, chunk_index), data])?;
             }
         }
 
-        tx.prepare_cached(
-            "UPDATE inodes SET size = ?1, mtime = ?2, mtime_nsec = ?3, ctime = ?2, ctime_nsec = ?3 WHERE ino = ?4",
-        )?.execute(params![size as i64, now.secs, now.nsec as i64, ino as i64])?;
+        set_size(&tx, ino, size, now)?;
         tx.commit()?;
 
         Ok(())
@@ -587,38 +591,35 @@ impl Db {
         if let Some(error) = self.inode_kind_of(ino)?.regular_file_error() {
             return Err(error);
         }
+        if size > MAX_FILE_SIZE {
+            return Err(DbError::FileTooLarge);
+        }
 
         let now = now_ts();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let (first_key, last_key) = chunk_keys(ino);
 
         if size == 0 {
-            tx.prepare_cached("DELETE FROM file_chunks WHERE ino = ?1")?
-                .execute(params![ino as i64])?;
+            tx.prepare_cached("DELETE FROM file_chunks WHERE id BETWEEN ?1 AND ?2")?
+                .execute(params![first_key, last_key])?;
         } else {
-            let final_chunk_index = ((size - 1) as usize) / CHUNK_SIZE;
+            let final_chunk_index = (size - 1) / CHUNK_SIZE as u64;
             let final_chunk_len = ((size - 1) as usize % CHUNK_SIZE) + 1;
+            let final_key = chunk_key(ino, final_chunk_index);
 
-            tx.prepare_cached("DELETE FROM file_chunks WHERE ino = ?1 AND chunk_index > ?2")?
-                .execute(params![ino as i64, final_chunk_index as i64])?;
+            tx.prepare_cached("DELETE FROM file_chunks WHERE id > ?1 AND id <= ?2")?
+                .execute(params![final_key, last_key])?;
 
             // Cut the final chunk in SQL; the blob never leaves SQLite.
             tx.prepare_cached(
                 "UPDATE file_chunks SET data = substr(data, 1, ?1)
-                 WHERE ino = ?2 AND chunk_index = ?3 AND length(data) > ?1",
+                 WHERE id = ?2 AND length(data) > ?1",
             )?
-            .execute(params![
-                final_chunk_len as i64,
-                ino as i64,
-                final_chunk_index as i64
-            ])?;
+            .execute(params![final_chunk_len as i64, final_key])?;
         }
 
-        tx.prepare_cached(
-            "UPDATE inodes SET size = ?1, mtime = ?2, mtime_nsec = ?3, ctime = ?2, ctime_nsec = ?3
-             WHERE ino = ?4",
-        )?
-        .execute(params![size as i64, now.secs, now.nsec as i64, ino as i64])?;
+        set_size(&tx, ino, size, now)?;
         tx.commit()?;
 
         Ok(())
@@ -652,10 +653,7 @@ impl Db {
             .execute(params![parent_ino as i64, name])?;
 
         drop_unlinked_inode(&tx, target, now, is_open)?;
-
-        tx.prepare_cached(
-            "UPDATE inodes SET mtime = ?1, mtime_nsec = ?2, ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
-        )?.execute(params![now.secs, now.nsec as i64, parent_ino as i64])?;
+        touch_dir(&tx, parent_ino, now)?;
         tx.commit()?;
 
         Ok(())
@@ -679,14 +677,9 @@ impl Db {
 
         tx.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
             .execute(params![parent_ino as i64, name])?;
-        tx.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
-            .execute(params![target.ino as i64])?;
-        tx.prepare_cached(
-            "UPDATE inodes
-             SET mtime = ?1, mtime_nsec = ?2, ctime = ?1, ctime_nsec = ?2, nlink = nlink - 1
-             WHERE ino = ?3",
-        )?
-        .execute(params![now.secs, now.nsec as i64, parent_ino as i64])?;
+        delete_inode_rows(&tx, target.ino)?;
+        touch_dir(&tx, parent_ino, now)?;
+        add_directory_nlink(&tx, parent_ino, -1)?;
         tx.commit()?;
 
         Ok(())
@@ -777,17 +770,10 @@ impl Db {
             parent_ino as i64,
             name
         ])?;
-        tx.prepare_cached(
-            "UPDATE inodes
-             SET mtime = ?1, mtime_nsec = ?2, ctime = ?1, ctime_nsec = ?2
-             WHERE ino = ?3 OR ino = ?4",
-        )?
-        .execute(params![
-            now.secs,
-            now.nsec as i64,
-            parent_ino as i64,
-            new_parent_ino as i64
-        ])?;
+        touch_dir(&tx, parent_ino, now)?;
+        if new_parent_ino != parent_ino {
+            touch_dir(&tx, new_parent_ino, now)?;
+        }
         if source_is_dir && parent_ino != new_parent_ino {
             add_directory_nlink(&tx, parent_ino, -1)?;
             add_directory_nlink(&tx, new_parent_ino, 1)?;
@@ -813,22 +799,16 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.prepare_cached(
             "UPDATE inodes
-             SET mode = ?1, uid = ?2, gid = ?3,
-                 atime = ?4, atime_nsec = ?5,
-                 mtime = ?6, mtime_nsec = ?7,
-                 ctime = ?8, ctime_nsec = ?9
-             WHERE ino = ?10",
+             SET mode = ?1, uid = ?2, gid = ?3, atime_ns = ?4, mtime_ns = ?5, ctime_ns = ?6
+             WHERE ino = ?7",
         )?
         .execute(params![
             mode as i64,
             uid as i64,
             gid as i64,
-            atime.secs,
-            atime.nsec as i64,
-            mtime.secs,
-            mtime.nsec as i64,
-            now.secs,
-            now.nsec as i64,
+            atime.to_ns(),
+            mtime.to_ns(),
+            now.to_ns(),
             ino as i64
         ])?;
         drop(conn);
@@ -861,20 +841,23 @@ impl Db {
         let tx = conn.transaction()?;
 
         tx.prepare_cached(
-            "INSERT INTO inodes
-             (kind, mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec, nlink)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, ?7, ?7, ?7, ?8)",
-        )?.execute(params![
+            "INSERT INTO inodes (kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, ?7)",
+        )?
+        .execute(params![
             kind.as_i64(),
             mode as i64,
             uid as i64,
             gid as i64,
             size as i64,
-            now.secs,
-            now.nsec as i64,
+            now.to_ns(),
             nlink
         ])?;
         let ino = tx.last_insert_rowid() as u64;
+        if ino > MAX_INO {
+            // Chunk keys need the inode number to fit in 39 bits.
+            return Err(DbError::NoSpace);
+        }
 
         if let Err(error) = tx
             .prepare_cached("INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)")
@@ -888,17 +871,10 @@ impl Db {
                 .execute(params![ino as i64, target])?;
         }
 
-        tx.prepare_cached(
-            "UPDATE inodes
-             SET mtime = ?1, mtime_nsec = ?2, ctime = ?1, ctime_nsec = ?2, nlink = nlink + ?3
-             WHERE ino = ?4",
-        )?
-        .execute(params![
-            now.secs,
-            now.nsec as i64,
-            parent_delta,
-            parent_ino as i64
-        ])?;
+        touch_dir(&tx, parent_ino, now)?;
+        if parent_delta != 0 {
+            add_directory_nlink(&tx, parent_ino, parent_delta)?;
+        }
         tx.commit()?;
 
         Ok(Inode {
@@ -1020,34 +996,44 @@ fn drop_unlinked_inode(
     is_open: bool,
 ) -> Result<(), DbError> {
     if target.kind == FileKind::Directory {
-        tx.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
-            .execute(params![target.ino as i64])?;
+        return delete_inode_rows(tx, target.ino);
+    }
+
+    if target.nlink > 1 || is_open {
+        let nlink = target.nlink.saturating_sub(1);
+        tx.prepare_cached("UPDATE inodes SET nlink = ?1, ctime_ns = ?2 WHERE ino = ?3")?
+            .execute(params![nlink as i64, now.to_ns(), target.ino as i64])?;
         return Ok(());
     }
 
-    if target.nlink > 1 {
-        tx.prepare_cached(
-            "UPDATE inodes SET nlink = ?1, ctime = ?2, ctime_nsec = ?3 WHERE ino = ?4",
-        )?
-        .execute(params![
-            (target.nlink - 1) as i64,
-            now.secs,
-            now.nsec as i64,
-            target.ino as i64
-        ])?;
-        return Ok(());
-    }
+    delete_inode_rows(tx, target.ino)
+}
 
-    if is_open {
-        tx.prepare_cached(
-            "UPDATE inodes SET nlink = 0, ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
-        )?
-        .execute(params![now.secs, now.nsec as i64, target.ino as i64])?;
-    } else {
-        tx.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
-            .execute(params![target.ino as i64])?;
-    }
+const UPSERT_CHUNK: &str = "INSERT INTO file_chunks (id, data) VALUES (?1, ?2)
+     ON CONFLICT (id) DO UPDATE SET data = excluded.data";
 
+/// Deletes inode `ino` and its chunk range. Entries and the symlink target go
+/// through their foreign-key cascades; chunks have no foreign key.
+fn delete_inode_rows(conn: &Connection, ino: u64) -> Result<(), DbError> {
+    let (first, last) = chunk_keys(ino);
+    conn.prepare_cached("DELETE FROM file_chunks WHERE id BETWEEN ?1 AND ?2")?
+        .execute(params![first, last])?;
+    conn.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?
+        .execute(params![ino as i64])?;
+    Ok(())
+}
+
+/// Sets size, mtime and ctime of `ino` after a data change.
+fn set_size(conn: &Connection, ino: u64, size: u64, modified: Timestamp) -> Result<(), DbError> {
+    conn.prepare_cached("UPDATE inodes SET size = ?1, mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?3")?
+        .execute(params![size as i64, modified.to_ns(), ino as i64])?;
+    Ok(())
+}
+
+/// Sets mtime and ctime of directory `ino` after an entry change.
+fn touch_dir(conn: &Connection, ino: u64, now: Timestamp) -> Result<(), DbError> {
+    conn.prepare_cached("UPDATE inodes SET mtime_ns = ?1, ctime_ns = ?1 WHERE ino = ?2")?
+        .execute(params![now.to_ns(), ino as i64])?;
     Ok(())
 }
 
@@ -1102,30 +1088,10 @@ fn inode_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Inode> {
         uid: row.get::<_, i64>(3)? as u32,
         gid: row.get::<_, i64>(4)? as u32,
         size: row.get::<_, i64>(5)? as u64,
-        atime: timestamp_from_row(row, 6, 10)?,
-        mtime: timestamp_from_row(row, 7, 11)?,
-        ctime: timestamp_from_row(row, 8, 12)?,
+        atime: Timestamp::from_ns(row.get(6)?),
+        mtime: Timestamp::from_ns(row.get(7)?),
+        ctime: Timestamp::from_ns(row.get(8)?),
         nlink: row.get::<_, i64>(9)? as u32,
-    })
-}
-
-fn timestamp_from_row(
-    row: &rusqlite::Row<'_>,
-    secs_idx: usize,
-    nsec_idx: usize,
-) -> rusqlite::Result<Timestamp> {
-    let secs: i64 = row.get(secs_idx)?;
-    let nsec: i64 = row.get(nsec_idx)?;
-    if !(0..1_000_000_000).contains(&nsec) {
-        return Err(SqlError::FromSqlConversionFailure(
-            nsec_idx,
-            rusqlite::types::Type::Integer,
-            Box::new(std::io::Error::other("timestamp nsec out of range")),
-        ));
-    }
-    Ok(Timestamp {
-        secs,
-        nsec: nsec as u32,
     })
 }
 
@@ -1157,6 +1123,10 @@ fn add_directory_nlink(
 
 /// Bring an existing database up to `SCHEMA_VERSION`, one step at a time,
 /// in a single transaction. A failure leaves the database at its old version.
+///
+/// Steps look at the actual table layout, not only at the version number: a
+/// database created by this dbfs starts at version 0 with the current layout
+/// (from `CREATE TABLE IF NOT EXISTS`), and must not be "upgraded" again.
 fn migrate(conn: &Connection) -> Result<(), DbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -1166,8 +1136,20 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
         return Ok(());
     }
 
+    // Rebuilding `inodes` drops the old table. With foreign keys on, that would
+    // cascade into `dirents` and `symlink_targets`. SQLite ignores this pragma
+    // inside a transaction, so it is set around it.
+    let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", 0)?;
+    let result = migrate_steps(conn, version);
+    conn.pragma_update(None, "foreign_keys", foreign_keys)?;
+    result
+}
+
+fn migrate_steps(conn: &Connection, version: i64) -> Result<(), DbError> {
     let tx = conn.unchecked_transaction()?;
-    if version < 1 {
+    let split_timestamps = !table_has_column(&tx, "inodes", "mtime_ns")?;
+    if version < 1 && split_timestamps {
         ensure_nsec_columns(&tx)?;
     }
     if version < 2 {
@@ -1204,8 +1186,86 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
              CREATE INDEX IF NOT EXISTS dirents_scan ON dirents(parent_ino);",
         )?;
     }
+    if version < 4 {
+        if split_timestamps {
+            merge_timestamp_columns(&tx)?;
+        }
+        if table_has_column(&tx, "file_chunks", "chunk_index")? {
+            rekey_file_chunks(&tx)?;
+        }
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Version 4: one i64 nanosecond column per timestamp instead of a
+/// (seconds, nanoseconds) pair. Out-of-range times are clamped.
+fn merge_timestamp_columns(conn: &Connection) -> Result<(), DbError> {
+    fn ns(secs: &str, nsec: &str) -> String {
+        format!(
+            "CASE WHEN {secs} > 9223372035 THEN 9223372036854775807
+                  WHEN {secs} < -9223372035 THEN (-9223372036854775807 - 1)
+                  WHEN {secs} < 0 THEN {secs} * 1000000000 - {nsec}
+                  ELSE {secs} * 1000000000 + {nsec} END"
+        )
+    }
+    conn.execute_batch(&format!(
+        "CREATE TABLE inodes_v4 (
+           ino INTEGER PRIMARY KEY,
+           kind INTEGER NOT NULL,
+           mode INTEGER NOT NULL,
+           uid INTEGER NOT NULL,
+           gid INTEGER NOT NULL,
+           size INTEGER NOT NULL,
+           atime_ns INTEGER NOT NULL,
+           mtime_ns INTEGER NOT NULL,
+           ctime_ns INTEGER NOT NULL,
+           nlink INTEGER NOT NULL
+         );
+         INSERT INTO inodes_v4
+           SELECT ino, kind, mode, uid, gid, size, {}, {}, {}, nlink FROM inodes;
+         DROP TABLE inodes;
+         ALTER TABLE inodes_v4 RENAME TO inodes;",
+        ns("atime", "atime_nsec"),
+        ns("mtime", "mtime_nsec"),
+        ns("ctime", "ctime_nsec"),
+    ))?;
+    Ok(())
+}
+
+/// Version 4: chunks in one B-tree keyed by `(ino << 24) | chunk_index`,
+/// instead of a rowid table plus a (ino, chunk_index) primary-key index.
+/// Rewrites every chunk, so large databases print a note first.
+fn rekey_file_chunks(conn: &Connection) -> Result<(), DbError> {
+    let too_large: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM file_chunks WHERE chunk_index >= ?1 OR ino > ?2",
+        params![MAX_CHUNKS as i64, MAX_INO as i64],
+        |row| row.get(0),
+    )?;
+    if too_large > 0 {
+        return Err(DbError::Sqlite(format!(
+            "cannot upgrade to schema version {SCHEMA_VERSION}: {too_large} chunks belong to \
+             data past the 1 TiB file size limit"
+        )));
+    }
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM file_chunks", [], |row| row.get(0))?;
+    if chunks > 4_096 {
+        eprintln!(
+            "dbfs: upgrading {chunks} data chunks ({} MiB) to schema version {SCHEMA_VERSION}; \
+             this runs once and leaves the old pages free for reuse",
+            chunks * CHUNK_SIZE as i64 / (1 << 20)
+        );
+    }
+    conn.execute_batch(&format!(
+        "CREATE TABLE file_chunks_v4 (id INTEGER PRIMARY KEY, data BLOB NOT NULL);
+         INSERT INTO file_chunks_v4 (id, data)
+           SELECT (ino << {CHUNK_BITS}) | chunk_index, data FROM file_chunks
+           WHERE ino IN (SELECT ino FROM inodes)
+           ORDER BY ino, chunk_index;
+         DROP TABLE file_chunks;
+         ALTER TABLE file_chunks_v4 RENAME TO file_chunks;"
+    ))?;
     Ok(())
 }
 

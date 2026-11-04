@@ -26,6 +26,25 @@ impl Timestamp {
         }
     }
 
+    /// Nanoseconds since the epoch, as stored on disk. Times outside the i64
+    /// range (years 1677 to 2262) are clamped to its ends, as ext4 clamps to its
+    /// own range, so `utimensat` with an odd time never fails.
+    pub fn to_ns(self) -> i64 {
+        let magnitude = (self.secs.unsigned_abs() as i128) * 1_000_000_000 + self.nsec as i128;
+        let ns = if self.secs < 0 { -magnitude } else { magnitude };
+        ns.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    }
+
+    /// Inverse of [`Timestamp::to_ns`].
+    pub fn from_ns(ns: i64) -> Self {
+        let magnitude = ns.unsigned_abs();
+        let secs = (magnitude / 1_000_000_000) as i64;
+        Self {
+            secs: if ns < 0 { -secs } else { secs },
+            nsec: (magnitude % 1_000_000_000) as u32,
+        }
+    }
+
     pub fn to_system_time(self) -> SystemTime {
         if self.secs >= 0 {
             UNIX_EPOCH + Duration::new(self.secs as u64, self.nsec)
@@ -112,6 +131,8 @@ pub enum DbError {
     Corrupt,
     /// The database was written by a newer dbfs with this schema version.
     UnsupportedSchema(i64),
+    /// The file would grow past the 1 TiB limit (`EFBIG`).
+    FileTooLarge,
     Sqlite(String),
 }
 

@@ -9,7 +9,7 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
-use crate::db::{CHUNK_SIZE, ChunkSpan};
+use crate::db::{CHUNK_SIZE, ChunkSpan, MAX_FILE_SIZE};
 use crate::open_table::{OpenTable, Slot};
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
@@ -202,6 +202,9 @@ impl Shared {
         let Some(span) = ChunkSpan::new(offset, data.len()) else {
             return Ok(0);
         };
+        if span.end > MAX_FILE_SIZE {
+            return Err(libc::EFBIG);
+        }
         t.inodes.mtime[i] = Timestamp::from_system_time(SystemTime::now());
 
         let ino = t.inodes.ino[i];
@@ -607,6 +610,9 @@ impl Dbfs {
         }
         // The end must fit in the i64 size that SQLite stores.
         let end = offset.checked_add(length).ok_or(libc::EFBIG)? as u64;
+        if end > MAX_FILE_SIZE {
+            return Err(libc::EFBIG);
+        }
         if mode & libc::FALLOC_FL_KEEP_SIZE != 0 {
             return Ok(());
         }
@@ -1181,6 +1187,7 @@ fn errno_from_db_error(error: DbError) -> i32 {
         DbError::NameTooLong => libc::ENAMETOOLONG,
         DbError::NoSpace => libc::ENOSPC,
         DbError::NotDirectory => libc::ENOTDIR,
+        DbError::FileTooLarge => libc::EFBIG,
         DbError::Corrupt | DbError::UnsupportedSchema(_) | DbError::Sqlite(_) => libc::EIO,
     }
 }

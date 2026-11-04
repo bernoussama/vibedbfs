@@ -303,13 +303,13 @@ fn check_constraint_is_not_reported_as_eexist() {
               uid INTEGER NOT NULL CHECK (uid = 1),
               gid INTEGER NOT NULL,
               size INTEGER NOT NULL,
-              atime INTEGER NOT NULL,
-              mtime INTEGER NOT NULL,
-              ctime INTEGER NOT NULL,
+              atime_ns INTEGER NOT NULL,
+              mtime_ns INTEGER NOT NULL,
+              ctime_ns INTEGER NOT NULL,
               nlink INTEGER NOT NULL
             );
             INSERT INTO inodes
-              (ino, kind, mode, uid, gid, size, atime, mtime, ctime, nlink)
+              (ino, kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink)
               VALUES (1, 2, 493, 1, 1, 0, 1, 1, 1, 2);
             ",
         )
@@ -956,10 +956,11 @@ fn two_handles_share_one_inode_until_both_are_released() {
     assert_eq!(fs.read(file.ino, 0, 6).expect("read stored"), b"from a");
 }
 
+/// Chunk rows stored for `ino` (keys are `(ino << 24) | chunk_index`).
 fn count_chunk_rows(path: &Path, ino: u64) -> i64 {
     let conn = Connection::open(path).expect("open raw sqlite");
     conn.query_row(
-        "SELECT COUNT(*) FROM file_chunks WHERE ino = ?1",
+        "SELECT COUNT(*) FROM file_chunks WHERE id BETWEEN ?1 << 24 AND (?1 << 24) | 16777215",
         params![ino as i64],
         |row| row.get(0),
     )

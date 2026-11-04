@@ -734,11 +734,7 @@ fn reopen_drops_inodes_left_unlinked_while_open() {
         );
     }
     assert_eq!(
-        count_rows(
-            &path,
-            "SELECT COUNT(*) FROM file_chunks WHERE ino = ?1",
-            leaked_ino
-        ),
+        count_chunks(&path, leaked_ino),
         0
     );
     assert_eq!(
@@ -764,11 +760,7 @@ fn reopen_drops_inodes_left_unlinked_while_open() {
         );
     }
     assert_eq!(
-        count_rows(
-            &path,
-            "SELECT COUNT(*) FROM file_chunks WHERE ino = ?1",
-            leaked_ino
-        ),
+        count_chunks(&path, leaked_ino),
         0
     );
     remove_db(&path);
@@ -866,9 +858,18 @@ fn unversioned_legacy_database_migrates_to_current_schema() {
     assert_eq!(
         query_i64(
             &path,
-            "SELECT COUNT(*) FROM pragma_table_info('inodes') WHERE name LIKE '%_nsec'"
+            "SELECT COUNT(*) FROM pragma_table_info('inodes')
+             WHERE name IN ('atime_ns', 'mtime_ns', 'ctime_ns')"
         ),
         3
+    );
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM pragma_table_info('inodes') WHERE name GLOB '*_nsec'"
+        ),
+        0,
+        "the split seconds/nanoseconds columns are gone"
     );
     assert_eq!(
         query_i64(
@@ -1014,6 +1015,15 @@ fn remove_db(path: &Path) {
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }
 
+/// Chunk rows stored for `ino` (keys are `(ino << 24) | chunk_index`).
+fn count_chunks(path: &Path, ino: u64) -> i64 {
+    count_rows(
+        path,
+        "SELECT COUNT(*) FROM file_chunks WHERE id BETWEEN ?1 << 24 AND (?1 << 24) | 16777215",
+        ino,
+    )
+}
+
 fn count_rows(path: &Path, sql: &str, ino: u64) -> i64 {
     let conn = Connection::open(path).expect("open raw sqlite");
     conn.query_row(sql, params![ino as i64], |row| row.get(0))
@@ -1121,4 +1131,163 @@ fn truncating_inside_a_chunk_keeps_the_prefix_and_extends_with_zeros() {
     db.truncate_file(file.ino, 8).expect("truncate larger");
 
     assert_eq!(db.read_file(file.ino, 0, 16).expect("read"), b"0123\0\0\0\0");
+}
+
+#[test]
+fn files_cannot_grow_past_one_tib() {
+    const MAX_FILE_SIZE: u64 = 1 << 40;
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"huge.bin", 0o644, 1000, 1000)
+        .expect("create file");
+
+    db.write_file(file.ino, MAX_FILE_SIZE - 4, b"last")
+        .expect("the final four bytes fit");
+    assert_eq!(
+        db.read_file(file.ino, MAX_FILE_SIZE - 4, 4).expect("read"),
+        b"last"
+    );
+    assert_eq!(
+        db.write_file(file.ino, MAX_FILE_SIZE - 4, b"five!"),
+        Err(DbError::FileTooLarge)
+    );
+    assert_eq!(
+        db.truncate_file(file.ino, MAX_FILE_SIZE + 1),
+        Err(DbError::FileTooLarge)
+    );
+    assert_eq!(db.get_inode(file.ino).expect("inode").size, MAX_FILE_SIZE);
+}
+
+#[test]
+fn the_last_chunk_of_one_file_does_not_touch_the_next_inode() {
+    const MAX_FILE_SIZE: u64 = 1 << 40;
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let a = db.create_file(1, b"a", 0o644, 1, 1).expect("create a");
+    let b = db.create_file(1, b"b", 0o644, 1, 1).expect("create b");
+    db.write_file(b.ino, 0, b"bbbb").expect("write b");
+    db.write_file(a.ino, MAX_FILE_SIZE - 1, b"a").expect("write a's last byte");
+
+    db.truncate_file(a.ino, 0).expect("truncate a");
+    assert_eq!(db.read_file(b.ino, 0, 4).expect("read b"), b"bbbb");
+    db.unlink_file(1, b"a").expect("unlink a");
+    assert_eq!(db.read_file(b.ino, 0, 4).expect("read b"), b"bbbb");
+}
+
+#[test]
+fn timestamps_outside_the_nanosecond_range_are_clamped_not_rejected() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"times", 0o644, 1000, 1000)
+        .expect("create file");
+    let set = |atime: Timestamp, mtime: Timestamp| {
+        db.update_metadata(
+            file.ino,
+            MetadataUpdate {
+                atime: Some(atime),
+                mtime: Some(mtime),
+                ..MetadataUpdate::default()
+            },
+        )
+        .expect("utimensat never fails on odd times")
+    };
+
+    let epoch = set(Timestamp { secs: -1, nsec: 0 }, Timestamp { secs: 0, nsec: 0 });
+    assert_eq!(epoch.atime, Timestamp { secs: -1, nsec: 0 });
+    assert_eq!(epoch.mtime, Timestamp { secs: 0, nsec: 0 });
+
+    let precise = set(
+        Timestamp { secs: 1_700_000_000, nsec: 123_456_789 },
+        Timestamp { secs: -86_400, nsec: 5 },
+    );
+    assert_eq!(precise.atime, Timestamp { secs: 1_700_000_000, nsec: 123_456_789 });
+    assert_eq!(precise.mtime, Timestamp { secs: -86_400, nsec: 5 });
+
+    // Year 5138 and year -1000: clamped to the ends of 1677..2262.
+    let far = set(
+        Timestamp { secs: 99_999_999_999, nsec: 0 },
+        Timestamp { secs: -99_999_999_999, nsec: 0 },
+    );
+    assert_eq!(far.atime, Timestamp::from_ns(i64::MAX));
+    assert_eq!(far.mtime, Timestamp::from_ns(i64::MIN));
+    assert_eq!(far.atime.secs, 9_223_372_036, "about 2262-04-11");
+}
+
+#[test]
+fn version_3_database_is_rekeyed_with_contents_intact() {
+    let path = disk_db_path("schema-v3-chunks");
+    // Build a version 3 database by hand: split timestamps, composite chunk key.
+    exec_sql(
+        &path,
+        "CREATE TABLE inodes (
+           ino INTEGER PRIMARY KEY, kind INTEGER NOT NULL, mode INTEGER NOT NULL,
+           uid INTEGER NOT NULL, gid INTEGER NOT NULL, size INTEGER NOT NULL,
+           atime INTEGER NOT NULL, mtime INTEGER NOT NULL, ctime INTEGER NOT NULL,
+           atime_nsec INTEGER NOT NULL DEFAULT 0, mtime_nsec INTEGER NOT NULL DEFAULT 0,
+           ctime_nsec INTEGER NOT NULL DEFAULT 0, nlink INTEGER NOT NULL
+         );
+         CREATE TABLE dirents (
+           id INTEGER PRIMARY KEY, parent_ino INTEGER NOT NULL, name BLOB NOT NULL,
+           child_ino INTEGER NOT NULL,
+           FOREIGN KEY (parent_ino) REFERENCES inodes(ino) ON DELETE CASCADE,
+           FOREIGN KEY (child_ino) REFERENCES inodes(ino) ON DELETE CASCADE
+         );
+         CREATE UNIQUE INDEX dirents_name ON dirents(parent_ino, name);
+         CREATE INDEX dirents_child ON dirents(child_ino);
+         CREATE INDEX dirents_scan ON dirents(parent_ino);
+         CREATE TABLE file_chunks (
+           ino INTEGER NOT NULL, chunk_index INTEGER NOT NULL, data BLOB NOT NULL,
+           PRIMARY KEY (ino, chunk_index),
+           FOREIGN KEY (ino) REFERENCES inodes(ino) ON DELETE CASCADE
+         );
+         CREATE TABLE symlink_targets (
+           ino INTEGER PRIMARY KEY, target BLOB NOT NULL,
+           FOREIGN KEY (ino) REFERENCES inodes(ino) ON DELETE CASCADE
+         );
+         INSERT INTO inodes VALUES (1, 2, 493, 1, 1, 0, 10, 10, 10, 0, 0, 0, 3);
+         INSERT INTO inodes VALUES (2, 1, 420, 1, 1, 131077, 1700000000, -5, 30,
+                                    123456789, 7, 0, 1);
+         INSERT INTO inodes VALUES (3, 3, 511, 1, 1, 6, 1, 1, 1, 0, 0, 0, 1);
+         INSERT INTO inodes VALUES (4, 2, 493, 1, 1, 0, 1, 1, 1, 0, 0, 0, 2);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, CAST('data.bin' AS BLOB), 2);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, CAST('link' AS BLOB), 3);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, CAST('sub' AS BLOB), 4);
+         INSERT INTO symlink_targets VALUES (3, CAST('target' AS BLOB));
+         INSERT INTO file_chunks VALUES (2, 0, zeroblob(65536));
+         INSERT INTO file_chunks VALUES (2, 2, X'414243444546');
+         UPDATE file_chunks SET data = CAST(X'7878' || substr(data, 3) AS BLOB) WHERE chunk_index = 0;
+         PRAGMA user_version = 3;",
+    );
+    {
+        let db = Db::open(&path).expect("migrate version 3 database");
+        let data = db.lookup(1, b"data.bin").expect("file kept");
+        assert_eq!(data.ino, 2);
+        assert_eq!(data.size, 131_077);
+        assert_eq!(data.atime, Timestamp { secs: 1_700_000_000, nsec: 123_456_789 });
+        assert_eq!(data.mtime, Timestamp { secs: -5, nsec: 7 });
+        let bytes = db.read_file(2, 0, 200_000).expect("read file");
+        assert_eq!(bytes.len(), 131_077);
+        assert_eq!(&bytes[..2], b"xx");
+        assert!(bytes[2..131_072].iter().all(|&b| b == 0), "hole in chunk 1");
+        assert_eq!(&bytes[131_072..], b"ABCDE");
+        assert_eq!(db.read_symlink(3).expect("symlink kept"), b"target");
+        assert_eq!(db.lookup(1, b"sub").expect("dir kept").nlink, 2);
+        assert_eq!(db.get_inode(1).expect("root").nlink, 3);
+        assert_eq!(
+            db.list_dir(1).expect("list root").len(),
+            3,
+            "no entry was cascaded away by the table rebuild"
+        );
+        assert_eq!(db.pragma_i64("foreign_keys").expect("pragma"), 1, "foreign keys back on");
+        db.unlink_file(1, b"data.bin").expect("unlink after migration");
+    }
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    assert_eq!(count_chunks(&path, 2), 0, "unlink deletes the chunk range");
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM pragma_table_info('file_chunks') WHERE name = 'chunk_index'"
+        ),
+        0
+    );
+    remove_db(&path);
 }
