@@ -145,6 +145,189 @@ fn rename_noreplace_does_not_replace_an_existing_target_when_enabled() {
     assert_eq!(fs::read(&fresh).expect("fresh kept"), b"source");
 }
 
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn mounted_fallocate_extends_size_and_reads_zeros_when_enabled() {
+    const MIB: u64 = 1 << 20;
+    let mount = BenchMount::start("fallocate");
+    let path = mount.mountpoint().join("sparse.bin");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("create file through mount");
+    file.write_at(b"head", 0).expect("write through mount");
+
+    fallocate_fd(&file, 0, 0, MIB as i64).expect("fallocate mode 0 through mount");
+    assert_eq!(
+        file.metadata().expect("stat").len(),
+        MIB,
+        "size after fallocate"
+    );
+    assert_head_then_zeros(&file, b"head", MIB);
+
+    posix_fallocate_fd(&file, MIB as i64, 4096).expect("posix_fallocate through mount");
+    assert_eq!(file.metadata().expect("stat").len(), MIB + 4096);
+    assert_head_then_zeros(&file, b"head", MIB + 4096);
+
+    fallocate_fd(&file, libc::FALLOC_FL_KEEP_SIZE, 8 * MIB as i64, 4096)
+        .expect("keep-size fallocate beyond EOF");
+    assert_eq!(
+        file.metadata().expect("stat").len(),
+        MIB + 4096,
+        "KEEP_SIZE leaves the size alone"
+    );
+
+    assert_eq!(
+        fallocate_fd(
+            &file,
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            0,
+            4096
+        )
+        .expect_err("punch hole through mount"),
+        libc::EOPNOTSUPP
+    );
+    assert_eq!(
+        fallocate_fd(&file, libc::FALLOC_FL_ZERO_RANGE, 0, 4096).expect_err("zero range"),
+        libc::EOPNOTSUPP
+    );
+    assert_eq!(file.metadata().expect("stat").len(), MIB + 4096);
+    assert_head_then_zeros(&file, b"head", MIB + 4096);
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn mounted_xattr_calls_return_enodata_eopnotsupp_and_an_empty_list_when_enabled() {
+    let mount = BenchMount::start("xattr");
+    let path = mount.mountpoint().join("notes.txt");
+    fs::write(&path, b"hello").expect("create file through mount");
+
+    let file = c_string(&path);
+    let root = c_string(mount.mountpoint());
+    let name = CString::new("user.x").expect("attribute name");
+    let value = b"1";
+
+    // getxattr: the size probe and a real buffer both report ENODATA.
+    for size in [0usize, 64] {
+        let mut buf = vec![0u8; size];
+        let rc =
+            unsafe { libc::getxattr(file.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), size) };
+        assert_eq!(rc, -1, "getxattr with size {size} must fail");
+        assert_eq!(libc_errno(), libc::ENODATA, "getxattr with size {size}");
+    }
+
+    // listxattr: the size probe returns 0 (an empty list) on files and the root.
+    for target in [&file, &root] {
+        let rc = unsafe { libc::listxattr(target.as_ptr(), std::ptr::null_mut(), 0) };
+        assert_eq!(rc, 0, "listxattr size probe on {target:?}");
+    }
+
+    // setxattr: refused with EOPNOTSUPP.
+    let rc = unsafe {
+        libc::setxattr(
+            file.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    assert_eq!(rc, -1, "setxattr must fail");
+    assert_eq!(libc_errno(), libc::EOPNOTSUPP, "setxattr errno");
+
+    // removexattr: the attribute does not exist, so ENODATA.
+    let rc = unsafe { libc::removexattr(file.as_ptr(), name.as_ptr()) };
+    assert_eq!(rc, -1, "removexattr must fail");
+    assert_eq!(libc_errno(), libc::ENODATA, "removexattr errno");
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn mounted_cp_a_copies_a_directory_tree_when_enabled() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mount = BenchMount::start("cp-a");
+    let src = mount.base().join("src");
+    fs::create_dir_all(src.join("a/b")).expect("create source tree");
+    fs::create_dir(src.join("empty")).expect("create empty directory");
+    fs::write(src.join("a/b/file.txt"), b"hello").expect("write small file");
+    fs::set_permissions(src.join("a/b/file.txt"), fs::Permissions::from_mode(0o640))
+        .expect("chmod source file");
+    let big: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+    fs::write(src.join("a/big.bin"), &big).expect("write big file");
+    std::os::unix::fs::symlink("b/file.txt", src.join("a/link")).expect("create symlink");
+
+    let dst = mount.mountpoint().join("dst");
+    let status = Command::new("cp")
+        .arg("-a")
+        .arg(&src)
+        .arg(&dst)
+        .status()
+        .expect("run cp -a");
+    assert!(status.success(), "cp -a onto dbfs failed: {status}");
+
+    assert_eq!(
+        fs::read(dst.join("a/b/file.txt")).expect("read copy"),
+        b"hello"
+    );
+    assert_eq!(fs::read(dst.join("a/big.bin")).expect("read big copy"), big);
+    assert_eq!(
+        fs::read_link(dst.join("a/link")).expect("readlink copy"),
+        Path::new("b/file.txt")
+    );
+    assert!(dst.join("empty").is_dir());
+    assert_eq!(
+        fs::metadata(dst.join("a/b/file.txt"))
+            .expect("stat copy")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640,
+        "cp -a preserves the mode"
+    );
+}
+
+/// Calls `fallocate(2)` on an open file and maps failure to its errno.
+fn fallocate_fd(file: &File, mode: i32, offset: i64, len: i64) -> Result<(), i32> {
+    use std::os::unix::io::AsRawFd;
+
+    let rc = unsafe { libc::fallocate(file.as_raw_fd(), mode, offset, len) };
+    if rc == 0 { Ok(()) } else { Err(libc_errno()) }
+}
+
+/// Calls `posix_fallocate(3)`, which returns the errno directly.
+fn posix_fallocate_fd(file: &File, offset: i64, len: i64) -> Result<(), i32> {
+    use std::os::unix::io::AsRawFd;
+
+    let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), offset, len) };
+    if rc == 0 { Ok(()) } else { Err(rc) }
+}
+
+/// Reads `len` bytes from the start and checks that they are `head`, then zeros.
+fn assert_head_then_zeros(file: &File, head: &[u8], len: u64) {
+    let mut data = vec![0u8; len as usize];
+    file.read_exact_at(&mut data, 0)
+        .expect("read whole file through mount");
+    assert_eq!(&data[..head.len()], head);
+    assert!(
+        data[head.len()..].iter().all(|&byte| byte == 0),
+        "bytes past the written head must read as zeros"
+    );
+}
+
+fn c_string(path: &Path) -> CString {
+    use std::os::unix::ffi::OsStrExt;
+
+    CString::new(path.as_os_str().as_bytes()).expect("path without NUL bytes")
+}
+
+fn libc_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
 fn rename_at(from: &Path, to: &Path, flags: libc::c_uint) -> i32 {
     let from = CString::new(from.to_str().expect("utf-8 source")).unwrap();
     let to = CString::new(to.to_str().expect("utf-8 target")).unwrap();
@@ -391,6 +574,53 @@ impl FuseMount {
 impl Drop for FuseMount {
     fn drop(&mut self) {
         self.unmount();
+    }
+}
+
+/// A dbfs mount whose database and mountpoint live under `.bench/`. Drop
+/// unmounts it, then deletes its files unless the unmount failed.
+struct BenchMount {
+    base: PathBuf,
+    mount: FuseMount,
+}
+
+impl BenchMount {
+    fn start(name: &str) -> Self {
+        if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none()
+            || command_path("fusermount3").is_none()
+        {
+            panic!("FUSE mount tests require DBFS_RUN_FUSE_TESTS=1 and fusermount3");
+        }
+
+        let base = bench_dir(name);
+        let mountpoint = base.join("mnt");
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let mount = FuseMount::start(&base.join("fs.sqlite"), &mountpoint);
+        Self { base, mount }
+    }
+
+    /// Host-side scratch directory next to the database, outside the mount.
+    fn base(&self) -> &Path {
+        &self.base
+    }
+
+    fn mountpoint(&self) -> &Path {
+        &self.mount.mountpoint
+    }
+}
+
+impl Drop for BenchMount {
+    fn drop(&mut self) {
+        self.mount.unmount();
+        // While the mount is still up, its mountpoint shows dbfs contents, not host files.
+        let still_mounted = Command::new("mountpoint")
+            .arg("-q")
+            .arg(&self.mount.mountpoint)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !still_mounted {
+            let _ = fs::remove_dir_all(&self.base);
+        }
     }
 }
 

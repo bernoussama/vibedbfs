@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
 use crate::db::CHUNK_SIZE;
@@ -210,6 +210,31 @@ impl Dbfs {
             .map_err(errno_from_db_error)
     }
 
+    /// Extended attributes are not stored, so no name exists on any inode. An
+    /// existing inode answers `ENODATA`, which tools read as "no such attribute".
+    pub fn getxattr(&self, ino: u64, _name: &[u8]) -> Result<Vec<u8>, i32> {
+        self.getattr(ino)?;
+        Err(libc::ENODATA)
+    }
+
+    /// The name list is always empty: there are no extended attributes to list.
+    pub fn listxattr(&self, ino: u64) -> Result<Vec<u8>, i32> {
+        self.getattr(ino)?;
+        Ok(Vec::new())
+    }
+
+    /// Attribute storage is not implemented, so setting one is refused.
+    pub fn setxattr(&self, ino: u64, _name: &[u8]) -> Result<(), i32> {
+        self.getattr(ino)?;
+        Err(libc::EOPNOTSUPP)
+    }
+
+    /// Nothing can be removed, because nothing is stored: `ENODATA`.
+    pub fn removexattr(&self, ino: u64, _name: &[u8]) -> Result<(), i32> {
+        self.getattr(ino)?;
+        Err(libc::ENODATA)
+    }
+
     pub fn open(&self, ino: u64) -> Result<u64, i32> {
         self.db
             .get_inode(ino)
@@ -321,6 +346,38 @@ impl Dbfs {
         }
 
         Ok(data.len() as u32)
+    }
+
+    /// `fallocate` for regular files. Checks run in the order of Linux's
+    /// `vfs_fallocate`. Holes already read as zeros, so mode 0 only extends
+    /// `size`. The file never shrinks, and no space is reserved: SQLite
+    /// allocates pages on write.
+    pub fn fallocate(&self, ino: u64, offset: i64, length: i64, mode: i32) -> Result<(), i32> {
+        if offset < 0 || length <= 0 {
+            return Err(libc::EINVAL);
+        }
+        if mode & !libc::FALLOC_FL_KEEP_SIZE != 0 {
+            return Err(libc::EOPNOTSUPP);
+        }
+        let inode = self.db.get_inode(ino).map_err(errno_from_db_error)?;
+        if inode.kind != FileKind::RegularFile {
+            return Err(libc::ENODEV);
+        }
+        // The end must fit in the i64 size that SQLite stores.
+        let end = offset.checked_add(length).ok_or(libc::EFBIG)?;
+        if mode & libc::FALLOC_FL_KEEP_SIZE != 0 {
+            return Ok(());
+        }
+
+        // Buffered writes can already extend the file, so persist them first.
+        self.flush_file(ino)?;
+        let size = self.db.get_inode(ino).map_err(errno_from_db_error)?.size;
+        if end as u64 <= size {
+            return Ok(());
+        }
+        self.db
+            .truncate_file(ino, end as u64)
+            .map_err(errno_from_db_error)
     }
 
     pub fn flush_file(&self, ino: u64) -> Result<(), i32> {
@@ -586,6 +643,50 @@ impl Filesystem for Dbfs {
         }
     }
 
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        match Dbfs::getxattr(self, ino, name.as_bytes()) {
+            Ok(value) => reply_xattr(&value, size, reply),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        match Dbfs::listxattr(self, ino) {
+            Ok(names) => reply_xattr(&names, size, reply),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        match Dbfs::setxattr(self, ino, name.as_bytes()) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        match Dbfs::removexattr(self, ino, name.as_bytes()) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         match self.db.get_inode(ino) {
             Ok(inode) => {
@@ -681,6 +782,22 @@ impl Filesystem for Dbfs {
 
         match Dbfs::write(self, ino, offset as u64, data) {
             Ok(written) => reply.written(written),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        match Dbfs::fallocate(self, ino, offset, length, mode) {
+            Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
     }
@@ -819,6 +936,18 @@ fn time_or_now(time: Option<TimeOrNow>) -> Option<SystemTime> {
     match time? {
         TimeOrNow::SpecificTime(time) => Some(time),
         TimeOrNow::Now => Some(SystemTime::now()),
+    }
+}
+
+/// Answers `getxattr` and `listxattr` with FUSE's size protocol. `size == 0`
+/// asks only for the length. A buffer that is too small gets `ERANGE`.
+fn reply_xattr(value: &[u8], size: u32, reply: ReplyXattr) {
+    if size == 0 {
+        reply.size(value.len() as u32);
+    } else if value.len() > size as usize {
+        reply.error(libc::ERANGE);
+    } else {
+        reply.data(value);
     }
 }
 
