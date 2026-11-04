@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
 use dbfs::Db;
+use rusqlite::Connection;
 
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]

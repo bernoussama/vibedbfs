@@ -197,16 +197,14 @@ fn fsync_of_dirty_data_fdatasyncs_the_wal() {
             .write(true)
             .open(&file)
             .expect("reopen file");
-        file.write_all(b"durable").expect("overwrite with durable bytes");
+        file.write_all(b"durable")
+            .expect("overwrite with durable bytes");
         file.sync_all().expect("fsync dirty file");
     });
 
     let log = fs::read_to_string(&log_path).expect("read strace log");
     assert_wal_synced(&log, &db);
-    assert_eq!(
-        fs::read(&file).expect("read file after fsync"),
-        b"durable"
-    );
+    assert_eq!(fs::read(&file).expect("read file after fsync"), b"durable");
 }
 
 #[test]
@@ -258,9 +256,7 @@ fn fsynced_bytes_survive_kill_and_remount() {
         .write(true)
         .open(&file)
         .expect("create file");
-    handle
-        .write_all(b"kept-across-kill")
-        .expect("write bytes");
+    handle.write_all(b"kept-across-kill").expect("write bytes");
     handle.sync_all().expect("fsync before kill");
 
     mounted.kill_and_unmount();

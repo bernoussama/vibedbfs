@@ -134,7 +134,9 @@ fn readdir_resumes_without_skipping_while_entries_are_deleted() {
 #[test]
 fn readdir_dotdot_points_at_the_parent_directory() {
     let db = Db::open_in_memory().expect("open in-memory database");
-    let outer = db.create_dir(1, b"outer", 0o755, 1000, 1000).expect("mkdir outer");
+    let outer = db
+        .create_dir(1, b"outer", 0o755, 1000, 1000)
+        .expect("mkdir outer");
     let inner = db
         .create_dir(outer.ino, b"inner", 0o755, 1000, 1000)
         .expect("mkdir inner");
@@ -154,7 +156,11 @@ fn readdir_cookie_survives_rename_within_the_directory() {
     let fs = Dbfs::new(db);
 
     let first = fs.readdir(1, 0).expect("readdir");
-    let after_a = first.iter().find(|e| e.name == b"a").expect("a listed").offset;
+    let after_a = first
+        .iter()
+        .find(|e| e.name == b"a")
+        .expect("a listed")
+        .offset;
     fs.rename(1, b"a", 1, b"z", 0).expect("rename a to z");
 
     let rest: Vec<_> = fs
@@ -518,7 +524,10 @@ fn open_returns_a_handle_that_reads_the_file() {
 
     let handle = fs.open(file.ino).expect("open file");
 
-    assert_eq!(fs.read_fh(handle, 0, 5).expect("read through handle"), b"hello");
+    assert_eq!(
+        fs.read_fh(handle, 0, 5).expect("read through handle"),
+        b"hello"
+    );
     assert_eq!(fs.open(9_999), Err(libc::ENOENT));
 }
 
@@ -879,7 +888,10 @@ fn rename_over_an_open_file_keeps_it_until_its_last_release() {
         .expect("rename over the open file");
 
     assert_eq!(fs.getattr(victim.ino).expect("victim kept").nlink, 0);
-    assert_eq!(fs.read_fh(fh, 0, 14).expect("read victim"), b"still readable");
+    assert_eq!(
+        fs.read_fh(fh, 0, 14).expect("read victim"),
+        b"still readable"
+    );
     fs.release_file(fh).expect("release victim");
     assert_eq!(fs.getattr(victim.ino), Err(libc::ENOENT));
     assert_eq!(
@@ -899,7 +911,8 @@ fn rename_over_a_dirty_closed_file_drops_its_buffer() {
     db.create_file(1, b"source.txt", 0o644, 1000, 1000)
         .expect("create source");
     let fs = Dbfs::new(db);
-    fs.write(victim.ino, 0, b"unflushed").expect("buffer a write");
+    fs.write(victim.ino, 0, b"unflushed")
+        .expect("buffer a write");
 
     fs.rename(1, b"source.txt", 1, b"victim.txt", 0)
         .expect("rename over the dirty file");
@@ -988,6 +1001,9 @@ fn setattr_after_a_buffered_write_reports_and_keeps_both() {
     fs.release_file(fh).expect("release");
     let attr = fs.getattr(file.ino).expect("attr after close");
     assert_eq!(attr.size, 6);
-    assert_eq!(attr.mtime, mtime, "closing does not overwrite the set mtime");
+    assert_eq!(
+        attr.mtime, mtime,
+        "closing does not overwrite the set mtime"
+    );
     assert_eq!(fs.read(file.ino, 0, 16).expect("read"), b"hello\n");
 }

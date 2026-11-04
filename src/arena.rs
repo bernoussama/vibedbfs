@@ -114,7 +114,9 @@ impl DirtyIdx {
             None => Err(0),
             Some(&(last, _)) if last == chunk_index => Ok(self.0.len() - 1),
             Some(&(last, _)) if last < chunk_index => Err(self.0.len()),
-            Some(_) => self.0.binary_search_by_key(&chunk_index, |&(index, _)| index),
+            Some(_) => self
+                .0
+                .binary_search_by_key(&chunk_index, |&(index, _)| index),
         }
     }
 
