@@ -1,12 +1,14 @@
 use std::ffi::OsStr;
 use std::ops::Deref;
+use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow,
 };
 
 use crate::db::{CHUNK_SIZE, ChunkSpan, MAX_FILE_SIZE};
@@ -14,6 +16,14 @@ use crate::open_table::{OpenTable, Slot};
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
+/// Attribute and entry TTL with `--kernel-cache`. dbfs is the only writer of its
+/// database, so the kernel's cached attributes cannot go stale behind its back.
+const KERNEL_CACHE_TTL: Duration = Duration::from_secs(86_400);
+/// Largest read or write request without `--kernel-cache`: the kernel default
+/// before FUSE_MAX_PAGES, kept so the default mount behaves as it always has.
+const DEFAULT_MAX_REQUEST: u32 = 128 * 1024;
+/// Largest request with `--kernel-cache` (the kernel caps FUSE_MAX_PAGES at 256 pages).
+const KERNEL_CACHE_MAX_REQUEST: u32 = 1024 * 1024;
 
 /// Default budget for buffered writes, shared by all open files. When it is used
 /// up, the file with the most dirty chunks is flushed.
@@ -48,6 +58,8 @@ pub struct Shared {
     table: Mutex<OpenTable>,
     /// Outcome of the latest flush on a shutdown path (`destroy` or a signal).
     last_flush: Mutex<Result<(), i32>>,
+    /// `--kernel-cache`: kernel writeback cache, long TTLs, kept page cache.
+    kernel_cache: bool,
 }
 
 impl Deref for Dbfs {
@@ -189,7 +201,13 @@ impl Shared {
         }
     }
 
-    fn write_slot(&self, t: &mut OpenTable, slot: Slot, offset: u64, data: &[u8]) -> Result<u32, i32> {
+    fn write_slot(
+        &self,
+        t: &mut OpenTable,
+        slot: Slot,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32, i32> {
         let i = slot as usize;
         if let Some(error) = t.inodes.kind[i].regular_file_error() {
             return Err(errno_from_db_error(error));
@@ -274,7 +292,9 @@ impl Shared {
     }
 
     fn is_open(t: &OpenTable, ino: u64) -> bool {
-        t.inodes.find(ino).is_some_and(|slot| t.inodes.is_open(slot))
+        t.inodes
+            .find(ino)
+            .is_some_and(|slot| t.inodes.is_open(slot))
     }
 
     /// Size and mtime overlay for an inode with buffered writes.
@@ -328,7 +348,34 @@ impl Dbfs {
                 db,
                 table: Mutex::new(OpenTable::new(write_buffer)),
                 last_flush: Mutex::new(Ok(())),
+                kernel_cache: false,
             }),
+        }
+    }
+
+    /// Turns on the kernel-side caches (`--kernel-cache`). Must be called before
+    /// the filesystem is mounted.
+    pub fn with_kernel_cache(mut self, enabled: bool) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("kernel cache is set before the filesystem is shared")
+            .kernel_cache = enabled;
+        self
+    }
+
+    fn ttl(&self) -> Duration {
+        if self.kernel_cache {
+            KERNEL_CACHE_TTL
+        } else {
+            ATTR_TTL
+        }
+    }
+
+    /// FOPEN flags for `open` and `create` replies.
+    fn open_flags(&self) -> u32 {
+        if self.kernel_cache {
+            fuser::consts::FOPEN_KEEP_CACHE
+        } else {
+            0
         }
     }
 
@@ -740,6 +787,32 @@ impl Dbfs {
 }
 
 impl Filesystem for Dbfs {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
+        if !self.kernel_cache {
+            // fuser asks for FUSE_MAX_PAGES whenever the kernel offers it; keep the
+            // request size the kernel used before that, so defaults do not change.
+            let _ = config.set_max_write(DEFAULT_MAX_REQUEST);
+            return Ok(());
+        }
+        // Each capability is best effort: an older kernel without it still mounts.
+        use fuser::consts::{
+            FUSE_ASYNC_DIO, FUSE_CACHE_SYMLINKS, FUSE_PARALLEL_DIROPS, FUSE_WRITEBACK_CACHE,
+        };
+        for capability in [
+            FUSE_WRITEBACK_CACHE,
+            FUSE_PARALLEL_DIROPS,
+            FUSE_CACHE_SYMLINKS,
+            FUSE_ASYNC_DIO,
+        ] {
+            let _ = config.add_capabilities(capability);
+        }
+        let _ = config.set_max_write(KERNEL_CACHE_MAX_REQUEST);
+        let _ = config.set_max_readahead(KERNEL_CACHE_MAX_REQUEST);
+        let _ = config.set_max_background(64);
+        let _ = config.set_congestion_threshold(48);
+        Ok(())
+    }
+
     fn destroy(&mut self) {
         // Runs on unmount, or when the session is dropped. The outcome goes to
         // `ShutdownHandle::flush_failure`, which `run` checks before exiting.
@@ -749,14 +822,14 @@ impl Filesystem for Dbfs {
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match Dbfs::lookup(self, parent, name.as_bytes()) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+            Ok(attr) => reply.entry(&self.ttl(), &attr, 0),
             Err(errno) => reply.error(errno),
         }
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match Dbfs::getattr(self, ino) {
-            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+            Ok(attr) => reply.attr(&self.ttl(), &attr),
             Err(errno) => reply.error(errno),
         }
     }
@@ -812,7 +885,7 @@ impl Filesystem for Dbfs {
             req.uid(),
             req.gid(),
         ) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+            Ok(attr) => reply.entry(&self.ttl(), &attr, 0),
             Err(errno) => reply.error(errno),
         }
     }
@@ -830,7 +903,7 @@ impl Filesystem for Dbfs {
         match self.create_open(parent, name.as_bytes(), mode, umask, req.uid(), req.gid()) {
             // Pass 0 for FOPEN flags (not syscall open flags). The kernel validates
             // these against known FOPEN_* constants and rejects other values with EIO.
-            Ok((attr, fh)) => reply.created(&ATTR_TTL, &attr, 0, fh, 0),
+            Ok((attr, fh)) => reply.created(&self.ttl(), &attr, 0, fh, self.open_flags()),
             Err(errno) => reply.error(errno),
         }
     }
@@ -851,7 +924,7 @@ impl Filesystem for Dbfs {
             req.uid(),
             req.gid(),
         ) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+            Ok(attr) => reply.entry(&self.ttl(), &attr, 0),
             Err(errno) => reply.error(errno),
         }
     }
@@ -872,7 +945,7 @@ impl Filesystem for Dbfs {
         reply: ReplyEntry,
     ) {
         match Dbfs::link(self, ino, newparent, newname.as_bytes()) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+            Ok(attr) => reply.entry(&self.ttl(), &attr, 0),
             Err(errno) => reply.error(errno),
         }
     }
@@ -906,7 +979,7 @@ impl Filesystem for Dbfs {
             time_or_now(atime),
             time_or_now(mtime),
         ) {
-            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+            Ok(attr) => reply.attr(&self.ttl(), &attr),
             Err(errno) => reply.error(errno),
         }
     }
@@ -957,7 +1030,7 @@ impl Filesystem for Dbfs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         match Dbfs::open(self, ino) {
-            Ok(fh) => reply.opened(fh, 0),
+            Ok(fh) => reply.opened(fh, self.open_flags()),
             Err(errno) => reply.error(errno),
         }
     }
@@ -1105,7 +1178,7 @@ impl Filesystem for Dbfs {
                     req.uid(),
                     req.gid(),
                 ) {
-                    Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+                    Ok(attr) => reply.entry(&self.ttl(), &attr, 0),
                     Err(errno) => reply.error(errno),
                 }
             }
@@ -1369,16 +1442,24 @@ mod tests {
             .collect();
         // Room for four chunks across all files.
         let fs = Dbfs::with_write_buffer(db, 4 * CHUNK_SIZE);
-        let handles: Vec<u64> = inos.iter().map(|&ino| fs.open(ino).expect("open")).collect();
+        let handles: Vec<u64> = inos
+            .iter()
+            .map(|&ino| fs.open(ino).expect("open"))
+            .collect();
         let pattern = |n: usize, len: usize| -> Vec<u8> {
             (0..len).map(|i| (i * 7 + n * 31) as u8).collect()
         };
         for (n, &fh) in handles.iter().enumerate() {
             // Unaligned, so partial chunks take the read-modify-write path.
-            fs.write_fh(fh, 100, &pattern(n, 3 * CHUNK_SIZE)).expect("buffer write");
+            fs.write_fh(fh, 100, &pattern(n, 3 * CHUNK_SIZE))
+                .expect("buffer write");
         }
         let (capacity, in_use) = fs.arena_stats();
-        assert_eq!(capacity, 4 * CHUNK_SIZE, "the arena never exceeds its budget");
+        assert_eq!(
+            capacity,
+            4 * CHUNK_SIZE,
+            "the arena never exceeds its budget"
+        );
         assert!(in_use <= 4);
 
         for (n, &fh) in handles.iter().enumerate() {
@@ -1408,14 +1489,18 @@ mod tests {
     #[test]
     fn write_flush_write_reuses_arena_memory() {
         let db = Db::open_in_memory().expect("open in-memory database");
-        let file = db.create_file(1, b"reuse.bin", 0o644, 1, 1).expect("create file");
+        let file = db
+            .create_file(1, b"reuse.bin", 0o644, 1, 1)
+            .expect("create file");
         let fs = Dbfs::new(db);
         let fh = fs.open(file.ino).expect("open");
-        fs.write_fh(fh, 0, &vec![1u8; 8 * CHUNK_SIZE]).expect("first write");
+        fs.write_fh(fh, 0, &vec![1u8; 8 * CHUNK_SIZE])
+            .expect("first write");
         let (capacity, _) = fs.arena_stats();
         fs.flush_fh(fh).expect("flush");
         assert_eq!(fs.arena_stats().1, 0, "a flush returns every slot");
-        fs.write_fh(fh, 0, &vec![2u8; 8 * CHUNK_SIZE]).expect("second write");
+        fs.write_fh(fh, 0, &vec![2u8; 8 * CHUNK_SIZE])
+            .expect("second write");
         assert_eq!(fs.arena_stats().0, capacity, "the arena did not grow");
         fs.release_file(fh).expect("release");
         assert_eq!(
@@ -1427,8 +1512,11 @@ mod tests {
     #[test]
     fn a_failed_eviction_keeps_the_buffered_data() {
         let db = Db::open_in_memory().expect("open in-memory database");
-        let file = db.create_file(1, b"full.bin", 0o644, 1, 1).expect("create file");
-        db.cap_page_count_at_current().expect("cap sqlite page count");
+        let file = db
+            .create_file(1, b"full.bin", 0o644, 1, 1)
+            .expect("create file");
+        db.cap_page_count_at_current()
+            .expect("cap sqlite page count");
         let fs = Dbfs::with_write_buffer(db, 2 * CHUNK_SIZE);
         let fh = fs.open(file.ino).expect("open");
         let first = vec![5u8; 2 * CHUNK_SIZE];

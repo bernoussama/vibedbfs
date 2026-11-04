@@ -10,6 +10,6 @@ bundled-sqlite = ["rusqlite/bundled"]
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
-fuser = { version = "0.16.0", features = ["abi-7-23"] }
+fuser = { version = "0.16.0", features = ["abi-7-28"] }
 libc = "0.2.186"
 rusqlite = "0.39.0"
