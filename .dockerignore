@@ -1,0 +1,33 @@
+# Keep the build context small: only Cargo.toml, Cargo.lock and src/ reach the builder.
+# Patterns without a trailing slash match both files and directories (a git
+# worktree has a `.git` file, not a directory).
+
+# Build output and local state
+target
+.bench
+*.log
+
+# Version control and CI
+.git
+.github
+.gitignore
+
+# Not needed to build the binary
+docs
+examples
+tests
+scripts
+README.md
+AGENTS.md
+
+# Python and editor artifacts
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.idea
+.vscode
+.DS_Store
+
+# Docker files themselves
+Dockerfile
+.dockerignore
