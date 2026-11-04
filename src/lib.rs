@@ -4,8 +4,8 @@ mod fuse;
 mod model;
 mod run;
 
-pub use cli::{Cli, Command};
+pub use cli::{Cli, Command, MountConfig};
 pub use db::{Db, SCHEMA_VERSION};
 pub use fuse::{Dbfs, DbfsDirEntry, FsStats, file_attr_from_inode};
 pub use model::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
-pub use run::{RunError, mount_options, run, run_with_mounter};
+pub use run::{RunError, mount_options, mount_options_for, run, run_with_mounter};

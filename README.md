@@ -38,6 +38,51 @@ Unmount when finished:
 fusermount3 -u /tmp/dbfs-mnt
 ```
 
+## Mount options
+
+```bash
+dbfs mount [--allow-other | --allow-root] [--auto-unmount] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
+```
+
+By default only the user who mounted dbfs can access the filesystem. `dbfs mount --help` lists every option.
+
+| Option | Effect |
+| --- | --- |
+| `--allow-other` | Lets every user access the mount, including root and the Docker daemon. Needed for bind mounts into containers. Mutually exclusive with `--allow-root`. |
+| `--allow-root` | Lets root access the mount, in addition to the mounting user. |
+| `--auto-unmount` | Unmounts the filesystem when dbfs exits, including after a crash or SIGKILL, so no stale mount is left behind. Requires `--allow-other` or `--allow-root`. |
+| `-o OPT[,OPT...]` | Extra options. Repeatable, and each value may be a comma-separated list. Known names map to typed FUSE options: `ro`, `rw`, `atime`, `noatime`, `suid`, `nosuid`, `dev`, `nodev`, `exec`, `noexec`, `dirsync`, `sync`, `async`, `fsname=NAME`, `subtype=NAME`. Any other option is passed to `fusermount3`, which accepts only the options it knows, such as `max_read=N`. An unknown option, such as `context=...`, makes the mount fail with `unknown option`. |
+
+`default_permissions` is always on and cannot be turned off. The kernel therefore enforces file mode bits and owners, even for other users.
+
+`--allow-other` as a non-root user needs one line in `/etc/fuse.conf`:
+
+```text
+user_allow_other
+```
+
+Without it, the mount fails with `allow_other requires 'user_allow_other' in /etc/fuse.conf`. Root does not need this line.
+
+Example: a mount that a Docker container can use, and that unmounts if dbfs crashes:
+
+```bash
+dbfs mount --allow-other --auto-unmount -o noatime /srv/dbfs.sqlite /srv/dbfs
+```
+
+### Using dbfs with Docker bind mounts
+
+The Docker daemon runs as root and needs access to the mount. Without `--allow-other`, `docker run -v /srv/dbfs:/data` fails with `EACCES`. `--allow-root` gives root access but not other users, so use `--allow-other` for containers.
+
+1. If dbfs runs as a non-root user, add `user_allow_other` to `/etc/fuse.conf` (see above).
+2. Mount with `--allow-other`. Add `--auto-unmount` so a crashed dbfs doesn't leave a stale mount on the host.
+3. Bind-mount the mountpoint into the container:
+
+   ```bash
+   docker run --rm -v /srv/dbfs:/data alpine sh -c 'echo hi > /data/hello && cat /data/hello'
+   ```
+
+`default_permissions` stays on, so the kernel checks file mode bits and owners for container users, as it does for host users.
+
 ## Storage
 
 The file-backed database is opened with:
@@ -66,6 +111,12 @@ The mount integration test is ignored unless you select ignored tests and FUSE i
 
 ```bash
 DBFS_RUN_FUSE_TESTS=1 cargo test --test mount_integration -- --ignored
+```
+
+The mount-option tests (`-o`, `--allow-other`, `--auto-unmount`) use the same gate. The `allow_other` tests are skipped, with a message, unless you run as root or `/etc/fuse.conf` contains `user_allow_other`:
+
+```bash
+DBFS_RUN_FUSE_TESTS=1 cargo test --test mount_options -- --ignored
 ```
 
 There is also a libfuse-oriented pytest test harness:
