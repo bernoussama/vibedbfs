@@ -117,3 +117,28 @@ Interleaved A/B with `scripts/bench.sh`, 3 runs per binary, seconds (median):
 
 fio data workloads are unchanged (table above), as expected: PR 1 only touches
 `dirents`.
+
+## After Phase C (shutdown, mount options, xattr/fallocate, Docker)
+
+Binary `.bench/bin/dbfs-phasec-56eba17`, interleaved with PR 1 (3 runs each with
+`scripts/bench.sh`, then `scripts/bench-fio-ab.sh --repeat 2`).
+
+| Workload | PR 1 | Phase C | Change |
+|---|---|---|---|
+| harness randwrite 4k (MiB/s, median) | 23.1 | 21.3 | −8% |
+| fio randwrite 4k, no fsync (MiB/s) | 22.9 / 24.0 | 22.1 / 22.2 | −6% |
+| fio seqwrite 128k (MiB/s) | 202 / 207 | 193 / 193 | −5% |
+| fio randread 4k (MiB/s) | 61.8 / 65.4 | 61.5 / 61.0 | −3% (overlapping) |
+| fio randwrite 4k, fsync (IOPS) | 220 / 226 | 217 / 216 | disk-bound, ≈ |
+| metadata total (s) | 2.49 | 2.48 | ≈ |
+| bigdir total (s) | 4.42 | 4.48 | ≈ |
+
+The 5–8% write-path cost comes from C1, where `RefCell` became `Mutex` so the signal thread
+can flush. Each write now takes several uncontended locks, plus a shutdown-flag check.
+Phase 4 (one open-inode table, indexed by file handle) removes most of those per-write
+lookups and should recover this. Compatibility gain from the same change: `docker stop`
+with 16 MiB unflushed exits 0 in 1.3 s with all data kept, against SIGKILL after 10.2 s with
+all data lost before.
+
+Docker compatibility matrix on the merged tree: PASS 12, FAIL 0, SKIP 3 (S2 needs
+`user_allow_other`; S4 needs a shared host mount), XFAIL 1 (`rm -rf`, needs Phase 6).
