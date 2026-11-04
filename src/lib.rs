@@ -1,11 +1,13 @@
 mod cli;
 mod db;
 mod fuse;
+mod arena;
 mod model;
+mod open_table;
 mod run;
 
-pub use cli::{Cli, Command};
-pub use db::Db;
-pub use fuse::{Dbfs, DbfsDirEntry, file_attr_from_inode};
-pub use model::{DbError, DirEntry, FileKind, Inode, MetadataUpdate};
-pub use run::{RunError, mount_options, run, run_with_mounter};
+pub use cli::{Cli, Command, MountConfig};
+pub use db::{Db, SCHEMA_VERSION};
+pub use fuse::{Dbfs, DbfsDirEntry, FsStats, file_attr_from_inode};
+pub use model::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
+pub use run::{RunError, mount_options, mount_options_for, run, run_with_mounter};

@@ -2,7 +2,7 @@
 
 ## Cursor Cloud specific instructions
 
-**dbfs** is a single-crate Rust project — a FUSE filesystem backed by SQLite. No network services, no Docker, no monorepo complexity.
+**dbfs** is a single-crate Rust project — a FUSE filesystem backed by SQLite. No network services, no monorepo complexity. Docker is used for the portable image (`Dockerfile`, see `docs/docker.md`), the Linux/Docker compat tests, and `scripts/cargo-docker.sh`; normal builds and tests do not need it.
 
 ### System dependencies (pre-installed on the Cloud VM)
 
@@ -21,10 +21,14 @@ See `README.md` for full details. Quick reference:
 | Build (dev) | `cargo build` |
 | Build (release) | `cargo build --release` |
 | Unit/integration tests | `cargo test` |
-| FUSE mount integration | `DBFS_RUN_FUSE_TESTS=1 cargo test --test mount_integration` |
+| FUSE mount integration | `DBFS_RUN_FUSE_TESTS=1 cargo test --test mount_integration -- --ignored` |
 | Python/libfuse tests | `pytest tests/test_with_libfuse.py -v -k "not syscall"` |
 | Run (mount) | `cargo run -- mount <db_path> <mount_dir>` |
 | Unmount | `fusermount3 -u <mount_dir>` |
+| Build (portable, bundled SQLite) | `cargo build --release --features bundled-sqlite` |
+| Docker image (see `docs/docker.md`) | `docker build -t dbfs:dev .` |
+| Cargo in a container (no host C toolchain) | `scripts/cargo-docker.sh test` |
+| Linux/Docker compat matrix (needs Docker, `/dev/fuse`, `fusermount3`) | `DBFS_RUN_DOCKER_TESTS=1 tests/compat/run.sh` |
 
 ### Non-obvious notes
 
@@ -37,3 +41,4 @@ See `README.md` for full details. Quick reference:
 - Do not use `/tmp` for filesystem benchmarks. On this machine `/tmp` is `tmpfs`
   and measures RAM-backed storage, not disk. Use a disk-backed directory under
   the repository, such as `.bench/`, unless the user explicitly asks for tmpfs.
+- The compat script (`tests/compat/run.sh`) needs sudo-only setup: `user_allow_other` in `/etc/fuse.conf`, and an rshared workspace (`sudo mount --bind` plus `sudo mount --make-rshared`). It skips the tests that need this setup when it is unavailable. Setup steps are in `docs/docker.md`.
