@@ -215,3 +215,70 @@ migrated by `dbfs-pr7` in 20.8 s.
 Docker compatibility matrix on `3c3a1bc`: PASS 13, FAIL 0, SKIP 3, XFAIL 0. S6
 (`docker stop` with 16 MiB unflushed) exits 0 after 1.29 s and the data is restored
 byte for byte. The image is 18.67 MB. The log is in `.bench/compat-final.log`.
+
+## dbfs Compared with ext4 and btrfs
+
+This compares dbfs at `3c3a1bc` (`.bench/bin/dbfs-pr7`) with three kernel
+filesystems:
+
+- **ext4 (native):** the host's ext4 on NVMe/LVM. dbfs keeps its SQLite database
+  on this same filesystem.
+- **ext4 (loop):** a 16 GiB image file on that disk, attached with `losetup
+  --direct-io=on`, freshly formatted for each run.
+- **btrfs (loop):** the same setup as ext4 (loop), with btrfs and its default
+  options (`ssd`, `discard=async`, `space_cache=v2`).
+
+sudo needs a password on this machine, so btrfs can't be mounted on the host. The
+two loop filesystems are mounted inside a privileged container
+(`docker run --privileged -v /:/host alpine chroot /host`) and benchmarked with the
+same host binaries. The ext4 loop run measures what the loop device itself costs,
+so compare btrfs with ext4 (loop), not with native ext4.
+
+Each filesystem ran 3 interleaved rounds of `bench_io`; the medians are below. fio
+ran 2 rounds of the same jobs used for the A/B runs. The driver script and raw
+results are in `.bench/fscmp/`.
+
+| Workload | dbfs | ext4 | ext4 (loop) | btrfs (loop) |
+|---|---|---|---|---|
+| seqwrite (MiB/s) | 206 | 4,110 | 3,148 | 1,490 |
+| randwrite (MiB/s) | 25.6 | 996 | 985 | 188 |
+| seqread (MiB/s) | 1,291 | 10,430 | 10,090 | 7,899 |
+| randread (MiB/s) | 101 | 3,097 | 3,056 | 2,758 |
+| metadata total (s) | 2.48 | 0.164 | 0.156 | 0.349 |
+| metadata: create 5,000 (s) | 1.31 | 0.090 | 0.085 | 0.182 |
+| metadata: unlink 5,000 (s) | 0.98 | 0.050 | 0.047 | 0.146 |
+| bigdir total (s) | 6.00 | 0.729 | 0.676 | 0.730 |
+| bigdir: list 20,000 (s) | 0.0145 | 0.0068 | 0.0068 | 0.0048 |
+| bigdir: `rm -rf` 20,000 (s) | 2.75 | 0.225 | 0.206 | 0.410 |
+
+| fio job (2 runs) | dbfs | ext4 | ext4 (loop) | btrfs (loop) |
+|---|---|---|---|---|
+| randwrite 4k, no fsync (MiB/s) | 23.2 / 25.5 | 905 / 905 | 1,024 / 938 | 228 / 241 |
+| randwrite 4k, fsync each write (IOPS) | 215 / 207 | 206 / 204 | 93 / 94 | 83 / 84 |
+| randread 4k (MiB/s) | 72.0 / 73.5 | 38.5 / 38.9 | 33.1 / 34.3 | 31.9 / 32.8 |
+| seqwrite 128k (MiB/s) | 205 / 221 | 4,571 / 3,969 | 4,830 / 4,741 | 1,373 / 1,395 |
+
+How to read these numbers:
+
+- **Durable writes.** With an fsync after every write, dbfs matches native ext4
+  (about 210 IOPS each). Both are bound by the disk's flush latency, and a dbfs
+  fsync is one `fdatasync` of the WAL on that same ext4.
+- **Buffered I/O.** Without fsync, ext4 and btrfs write into the kernel page cache
+  and read from it. They are 10–40× faster than dbfs, whose every operation is a
+  FUSE round trip into a single-threaded user-space process, followed by SQLite.
+- **Metadata.** Operations are 10–15× slower than ext4 and 4–7× slower than btrfs.
+  Each create or unlink is its own SQLite transaction.
+- **The fio randread result is not a dbfs win.** Before each job, fio drops the
+  page cache of the file it is about to test. On ext4 and btrfs, that forces cold
+  4 KiB reads from the NVMe disk. Under dbfs, it only drops the FUSE cache, while
+  SQLite's database file stays in the host page cache. The `bench_io` randread row,
+  where all four filesystems read with warm caches, is the like-for-like number.
+- **Loop overhead.** The loop device costs little for buffered I/O. It halves
+  durable-write IOPS (93 against 206), because each flush passes through two
+  filesystems.
+- **btrfs against ext4, both on loop.** btrfs is slower at buffered writes and
+  file creation, which is copy-on-write and checksum cost. It is faster at mkdir,
+  directory listing and creating files in a large directory.
+
+All four filesystems completed `rm -rf` of the 20,000-entry directory in every
+round.
