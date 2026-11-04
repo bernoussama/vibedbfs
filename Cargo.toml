@@ -3,6 +3,11 @@ name = "dbfs"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Compile SQLite from source and link it statically, instead of linking the
+# system libsqlite3. Used by the Docker image and portable release builds.
+bundled-sqlite = ["rusqlite/bundled"]
+
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
 fuser = { version = "0.16.0", features = ["abi-7-23"] }

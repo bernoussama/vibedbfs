@@ -1,0 +1,197 @@
+# CI for dbfs (FUSE filesystem backed by SQLite).
+#
+# Jobs:
+#   clippy         cargo clippy --all-targets with warnings denied.
+#   test           cargo test. FUSE mount tests stay ignored here.
+#   fuse-tests     FUSE mount tests (DBFS_RUN_FUSE_TESTS=1, --include-ignored).
+#                  The two strace-based durability tests are skipped when
+#                  /proc/sys/kernel/yama/ptrace_scope >= 1.
+#   pytest         libfuse-adapted harness run against target/release/dbfs.
+#   musl-bundled   Static x86_64-musl build with bundled SQLite; asserts no
+#                  shared library dependencies.
+#   docker-compat  Docker compatibility matrix (tests/compat/run.sh).
+#
+# NOT in this file yet: aarch64 runs and rootless Podman (S5). Both are nightly
+# items in docs/plans/2026-11-03-data-oriented-redesign.md.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libfuse3-dev fuse3 pkg-config
+      - name: Install clippy
+        run: rustup component add clippy
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        # strace is needed by the durability tests, which also run in plain `cargo test`.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libfuse3-dev fuse3 pkg-config strace
+      - name: Read ptrace policy
+        # A missing file means no Yama restriction, so treat it as 0.
+        run: |
+          scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)
+          echo "ptrace_scope=${scope}"
+          if [ "${scope}" -ge 1 ]; then
+            echo "DBFS_SKIP_PTRACE_TESTS=1" >> "$GITHUB_ENV"
+          else
+            echo "DBFS_SKIP_PTRACE_TESTS=0" >> "$GITHUB_ENV"
+          fi
+      - name: Test
+        run: |
+          skip_args=()
+          if [ "${DBFS_SKIP_PTRACE_TESTS}" = "1" ]; then
+            # These two tests attach strace, which Yama ptrace_scope >= 1 forbids.
+            skip_args=(--skip fsync_of_a_clean_file_fdatasyncs_the_wal --skip fsync_of_dirty_data_fdatasyncs_the_wal)
+          fi
+          cargo test -- "${skip_args[@]}"
+
+  fuse-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        # strace is needed by the durability tests; without it they skip silently.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libfuse3-dev fuse3 pkg-config strace
+      - name: Check FUSE device and helper
+        run: |
+          ls -l /dev/fuse
+          which fusermount3
+      - name: Allow user_allow_other for non-root mounts
+        run: |
+          sudo sed -i 's/^#\?user_allow_other/user_allow_other/' /etc/fuse.conf
+          grep -qx 'user_allow_other' /etc/fuse.conf
+      - name: Read ptrace policy
+        # A missing file means no Yama restriction, so treat it as 0.
+        run: |
+          scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)
+          echo "ptrace_scope=${scope}"
+          if [ "${scope}" -ge 1 ]; then
+            echo "DBFS_SKIP_PTRACE_TESTS=1" >> "$GITHUB_ENV"
+          else
+            echo "DBFS_SKIP_PTRACE_TESTS=0" >> "$GITHUB_ENV"
+          fi
+      - name: FUSE-enabled tests
+        env:
+          DBFS_RUN_FUSE_TESTS: "1"
+        run: |
+          skip_args=()
+          if [ "${DBFS_SKIP_PTRACE_TESTS}" = "1" ]; then
+            # These two tests attach strace, which Yama ptrace_scope >= 1 forbids.
+            skip_args=(--skip fsync_of_a_clean_file_fdatasyncs_the_wal --skip fsync_of_dirty_data_fdatasyncs_the_wal)
+          fi
+          cargo test -- --include-ignored "${skip_args[@]}"
+
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libfuse3-dev fuse3 pkg-config
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: pip install pytest
+      - name: Build release binary
+        run: cargo build --release
+      - name: libfuse-adapted tests
+        run: pytest tests/test_with_libfuse.py -v -k "not syscall"
+
+  musl-bundled:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl toolchain
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools file binutils
+      - name: Build static binary with bundled SQLite
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --features bundled-sqlite --target x86_64-unknown-linux-musl
+      - name: Assert static linkage
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/dbfs
+          file "$bin"
+          file "$bin" | grep -q 'static'
+          if readelf -d "$bin" | grep -q '(NEEDED)'; then
+            echo "Unexpected shared library dependencies:"
+            readelf -d "$bin"
+            exit 1
+          fi
+
+  docker-compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libfuse3-dev fuse3 pkg-config
+      - name: Build release binary
+        run: cargo build --release
+      - name: Create compat workspace
+        run: mkdir -p .bench/compat
+      - name: Allow user_allow_other (compat S2 test)
+        run: |
+          sudo sed -i 's/^#\?user_allow_other/user_allow_other/' /etc/fuse.conf
+          grep -qx 'user_allow_other' /etc/fuse.conf
+      - name: Make compat workspace a shared mount (compat S4 test)
+        # Bind-mount the directory onto itself so it can be made rshared.
+        run: |
+          ws="${GITHUB_WORKSPACE}/.bench/compat"
+          sudo mount --bind "$ws" "$ws"
+          sudo mount --make-rshared "$ws"
+      - name: Docker compatibility matrix
+        env:
+          DBFS_RUN_DOCKER_TESTS: "1"
+        run: tests/compat/run.sh
+      - name: Upload compat logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-logs
+          path: .bench/compat/**/*.log
+          include-hidden-files: true
+          if-no-files-found: ignore
