@@ -1,8 +1,10 @@
-use std::cell::RefCell;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
+use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -28,9 +30,88 @@ pub struct FsStats {
     pub frsize: u32,
 }
 
+/// The filesystem as the FUSE session sees it. Its state lives in [`Shared`] behind an
+/// `Arc`, so the shutdown path can reach the same dirty buffers from another thread.
 pub struct Dbfs {
+    shared: Arc<Shared>,
+}
+
+/// State shared by the FUSE session and the shutdown path. `Dbfs` derefs to it, so
+/// methods reach `self.db` and `self.dirty_files` directly. The `fuse` module is
+/// private, so this type is not reachable outside the crate.
+pub struct Shared {
     db: Db,
-    dirty_files: RefCell<HashMap<u64, DirtyFile>>,
+    dirty_files: Mutex<HashMap<u64, DirtyFile>>,
+    /// Set by `refuse_writes` when shutdown starts. Read and set under the
+    /// `dirty_files` lock, so a write cannot slip in during the final flush.
+    closing: AtomicBool,
+    /// Outcome of the latest flush on a shutdown path (`destroy` or a signal).
+    last_flush: Mutex<Result<(), i32>>,
+}
+
+impl Deref for Dbfs {
+    type Target = Shared;
+
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+impl Shared {
+    /// Writes every dirty inode to the database and then makes the commit durable.
+    /// A failing inode stays dirty and the loop moves on, so one bad inode does not
+    /// hold back the rest. Returns the first error.
+    fn flush_all(&self) -> Result<(), i32> {
+        let mut first_error = None;
+        self.dirty_files.lock().unwrap().retain(|&ino, dirty| {
+            match self
+                .db
+                .replace_chunks(ino, dirty.size, &dirty.chunks, dirty.mtime)
+            {
+                Ok(()) => false,
+                Err(error) => {
+                    first_error.get_or_insert(errno_from_db_error(error));
+                    true
+                }
+            }
+        });
+        let synced = self.db.sync_durable().map_err(errno_from_db_error);
+        match first_error {
+            Some(errno) => Err(errno),
+            None => synced,
+        }
+    }
+
+    fn refuse_writes(&self) {
+        // Holding the lock means no write is half-way through when the flag changes.
+        let _dirty_files = self.dirty_files.lock().unwrap();
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    fn record_flush(&self, result: Result<(), i32>) {
+        *self.last_flush.lock().unwrap() = result;
+    }
+}
+
+/// Lets `run.rs` flush and read back the outcome while the FUSE session owns the `Dbfs`.
+pub(crate) struct ShutdownHandle {
+    shared: Arc<Shared>,
+}
+
+impl ShutdownHandle {
+    /// Stops accepting buffered writes, then flushes every dirty inode. The outcome
+    /// is recorded, so `flush_failure` reports it later.
+    pub(crate) fn flush_for_shutdown(&self) -> Result<(), i32> {
+        self.shared.refuse_writes();
+        let result = self.shared.flush_all();
+        self.shared.record_flush(result);
+        result
+    }
+
+    /// The errno from the latest shutdown flush, or `None` if that flush succeeded.
+    pub(crate) fn flush_failure(&self) -> Option<i32> {
+        self.shared.last_flush.lock().unwrap().err()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -43,8 +124,26 @@ struct DirtyFile {
 impl Dbfs {
     pub fn new(db: Db) -> Self {
         Self {
-            db,
-            dirty_files: RefCell::new(HashMap::new()),
+            shared: Arc::new(Shared {
+                db,
+                dirty_files: Mutex::new(HashMap::new()),
+                closing: AtomicBool::new(false),
+                last_flush: Mutex::new(Ok(())),
+            }),
+        }
+    }
+
+    /// Writes every dirty buffer to the database and makes it durable. Keeps going
+    /// after a failure and returns the first error; a failed buffer stays dirty.
+    pub fn flush_all(&self) -> Result<(), i32> {
+        self.shared.flush_all()
+    }
+
+    /// A handle for the shutdown path in `run.rs`. It keeps working after this
+    /// `Dbfs` moves into the FUSE session.
+    pub(crate) fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            shared: Arc::clone(&self.shared),
         }
     }
 
@@ -69,7 +168,7 @@ impl Dbfs {
             .get_inode(ino)
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
-        if let Some(dirty) = self.dirty_files.borrow().get(&ino) {
+        if let Some(dirty) = self.dirty_files.lock().unwrap().get(&ino) {
             overlay_dirty(&mut attr, dirty);
         }
         Ok(attr)
@@ -81,7 +180,7 @@ impl Dbfs {
             .lookup(parent_ino, name)
             .map(|inode| file_attr_from_inode(&inode))
             .map_err(errno_from_db_error)?;
-        if let Some(dirty) = self.dirty_files.borrow().get(&attr.ino) {
+        if let Some(dirty) = self.dirty_files.lock().unwrap().get(&attr.ino) {
             overlay_dirty(&mut attr, dirty);
         }
         Ok(attr)
@@ -218,7 +317,7 @@ impl Dbfs {
     }
 
     pub fn read(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        let dirty_files = self.dirty_files.borrow();
+        let dirty_files = self.dirty_files.lock().unwrap();
         let Some(dirty) = dirty_files.get(&ino) else {
             return self
                 .db
@@ -277,7 +376,8 @@ impl Dbfs {
 
         let buffered = self
             .dirty_files
-            .borrow()
+            .lock()
+            .unwrap()
             .get(&ino)
             .map_or(0, |dirty| dirty.chunks.len() * CHUNK_SIZE);
         if buffered >= FLUSH_THRESHOLD {
@@ -285,7 +385,12 @@ impl Dbfs {
         }
 
         let modified = Timestamp::from_system_time(SystemTime::now());
-        let mut dirty_files = self.dirty_files.borrow_mut();
+        let mut dirty_files = self.dirty_files.lock().unwrap();
+        if self.closing.load(Ordering::SeqCst) {
+            // Shutdown has already flushed the buffers. Accepting this data now would
+            // acknowledge a write that nothing will persist.
+            return Err(libc::EIO);
+        }
         let dirty = dirty_files.entry(ino).or_insert_with(|| {
             let size = self.db.get_inode(ino).map(|i| i.size).unwrap_or(0);
             DirtyFile {
@@ -324,14 +429,14 @@ impl Dbfs {
     }
 
     pub fn flush_file(&self, ino: u64) -> Result<(), i32> {
-        let Some(dirty) = self.dirty_files.borrow_mut().remove(&ino) else {
+        let Some(dirty) = self.dirty_files.lock().unwrap().remove(&ino) else {
             return Ok(());
         };
 
         match self.db.replace_chunks(ino, dirty.size, &dirty.chunks, dirty.mtime) {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.dirty_files.borrow_mut().insert(ino, dirty);
+                self.dirty_files.lock().unwrap().insert(ino, dirty);
                 Err(errno_from_db_error(error))
             }
         }
@@ -346,7 +451,7 @@ impl Dbfs {
         let flushed = self.flush_file(ino);
         self.db.release_file(ino);
         if flushed.is_err() && self.db.get_inode(ino).is_err() {
-            self.dirty_files.borrow_mut().remove(&ino);
+            self.dirty_files.lock().unwrap().remove(&ino);
         }
         flushed
     }
@@ -400,6 +505,13 @@ impl Dbfs {
 }
 
 impl Filesystem for Dbfs {
+    fn destroy(&mut self) {
+        // Runs on unmount, or when the session is dropped. The outcome goes to
+        // `ShutdownHandle::flush_failure`, which `run` checks before exiting.
+        let result = self.flush_all();
+        self.shared.record_flush(result);
+    }
+
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match Dbfs::lookup(self, parent, name.as_bytes()) {
             Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
@@ -859,5 +971,94 @@ mod tests {
         fs.write(file.ino, 0, &payload).expect("buffer write");
         let error = fs.flush_file(file.ino).expect_err("flush full database");
         assert_eq!(error, libc::ENOSPC);
+    }
+
+    #[test]
+    fn flush_all_persists_dirty_data_for_every_inode() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let small = db
+            .create_file(1, b"small.txt", 0o644, 1, 1)
+            .expect("create small file");
+        let large = db
+            .create_file(1, b"large.bin", 0o644, 1, 1)
+            .expect("create large file");
+        let fs = Dbfs::new(db);
+        fs.write(small.ino, 0, b"alpha")
+            .expect("buffer small write");
+        let large_data = vec![9u8; CHUNK_SIZE + 10];
+        fs.write(large.ino, 0, &large_data)
+            .expect("buffer large write");
+
+        fs.flush_all().expect("flush_all");
+
+        assert!(
+            fs.dirty_files.lock().unwrap().is_empty(),
+            "no buffer stays dirty"
+        );
+        assert_eq!(
+            fs.db.read_file(small.ino, 0, 5).expect("read small"),
+            b"alpha"
+        );
+        assert_eq!(
+            fs.db
+                .read_file(large.ino, 0, large_data.len() as u32)
+                .expect("read large"),
+            large_data
+        );
+    }
+
+    #[test]
+    fn destroy_flushes_dirty_data_and_records_success() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"notes.txt", 0o644, 1, 1)
+            .expect("create file");
+        let mut fs = Dbfs::new(db);
+        let handle = fs.shutdown_handle();
+        fs.write(file.ino, 0, b"kept").expect("buffer write");
+
+        Filesystem::destroy(&mut fs);
+
+        assert_eq!(fs.db.read_file(file.ino, 0, 4).expect("read"), b"kept");
+        assert_eq!(handle.flush_failure(), None);
+    }
+
+    #[test]
+    fn shutdown_flush_failure_keeps_data_dirty_and_is_reported() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"big.bin", 0o644, 1, 1)
+            .expect("create file");
+        db.cap_page_count_at_current()
+            .expect("cap sqlite page count");
+        let fs = Dbfs::new(db);
+        let handle = fs.shutdown_handle();
+        fs.write(file.ino, 0, &vec![1u8; 256 * 1024])
+            .expect("buffer write");
+
+        assert_eq!(handle.flush_for_shutdown(), Err(libc::ENOSPC));
+        assert_eq!(handle.flush_failure(), Some(libc::ENOSPC));
+        assert!(
+            fs.dirty_files.lock().unwrap().contains_key(&file.ino),
+            "failed data stays buffered"
+        );
+    }
+
+    #[test]
+    fn writes_are_refused_once_shutdown_has_started() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"notes.txt", 0o644, 1, 1)
+            .expect("create file");
+        let fs = Dbfs::new(db);
+        let handle = fs.shutdown_handle();
+        fs.write(file.ino, 0, b"before")
+            .expect("write before shutdown");
+
+        handle.flush_for_shutdown().expect("shutdown flush");
+
+        assert_eq!(fs.write(file.ino, 0, b"after"), Err(libc::EIO));
+        assert_eq!(handle.flush_failure(), None);
+        assert_eq!(fs.db.read_file(file.ino, 0, 6).expect("read"), b"before");
     }
 }

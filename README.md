@@ -38,6 +38,8 @@ Unmount when finished:
 fusermount3 -u /tmp/dbfs-mnt
 ```
 
+Stopping dbfs with Ctrl-C, or sending it SIGTERM or SIGHUP, also unmounts cleanly. It writes out buffered data before it exits, with exit code 0. If that write fails, dbfs prints the error and exits 1. See [Shutdown](docs/architecture.md#shutdown).
+
 ## Storage
 
 The file-backed database is opened with:
@@ -66,6 +68,12 @@ The mount integration test is ignored unless you select ignored tests and FUSE i
 
 ```bash
 DBFS_RUN_FUSE_TESTS=1 cargo test --test mount_integration -- --ignored
+```
+
+The shutdown tests (signals and external unmount) use the same gate:
+
+```bash
+DBFS_RUN_FUSE_TESTS=1 cargo test --test shutdown -- --ignored
 ```
 
 There is also a libfuse-oriented pytest test harness:

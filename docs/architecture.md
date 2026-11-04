@@ -76,7 +76,8 @@
  src/
  ├── main.rs          Entry point: Cli::parse() → run()
  ├── cli.rs           Cli, Command::Mount { database, mountpoint }
- ├── run.rs           run() → Db::open() → Dbfs::new() → fuser::mount2()
+ ├── run.rs           run() → Db::open() → Dbfs::new() → fuser::Session on a thread;
+ │                    main thread waits for SIGTERM/SIGINT/SIGHUP or session end
  ├── fuse.rs          Dbfs: impl Filesystem, dirty write buffer, FUSE↔Db glue
  ├── db.rs            Db: SQLite storage layer, all SQL queries, chunk I/O
  └── model.rs         FileKind, Inode, DirEntry, MetadataUpdate, DbError
@@ -187,6 +188,18 @@ Close flushes dirty bytes into SQLite. `fsync` does that flush and then calls `f
  │     └──► SQLite appends WAL frames                      │
  └─────────────────────────────────────────────────────────┘
 ```
+
+## Shutdown
+
+Buffered writes exist only in memory until they are flushed, so shutdown has to flush them. On SIGTERM, SIGINT or SIGHUP, `run` does the following:
+
+1. Refuses new buffered writes. They fail with `EIO`, so nothing is acknowledged and then dropped.
+2. Calls `Dbfs::flush_all`, which writes every dirty inode to SQLite, then runs `sync_durable`.
+3. Detaches the mount with `fusermount -u -z`.
+4. Waits up to 1 s for the FUSE session to end. The session ends at once when nothing has a file open. The kernel then sends `FUSE_DESTROY`, and `Filesystem::destroy` flushes again (normally a no-op).
+5. Exits 0. If a flush failed, it prints the error to stderr and exits 1.
+
+Step 2 runs on the signal path, not only in `destroy`, because a process that still has a file open keeps the session alive after a lazy detach. An external `fusermount3 -u` skips steps 1–3: the session ends, `destroy` flushes, and dbfs exits 0.
 
 ## Read Data Flow
 
