@@ -2,6 +2,38 @@
 
 Date: 2026-11-03
 
+## Status (2026-11-04)
+
+Every phase is implemented on `refactor/data-oriented-design`:
+
+| PR | Phases | Commit |
+|---|---|---|
+| 1 | 0 + 1 | earlier commits on the branch |
+| 2 | C | earlier commits on the branch |
+| 3 | 6 | `0c40b3c`, results in `67a257e` |
+| 4 | 2 + 3 | `f8b9396` |
+| 5 | 4 | `441a607` |
+| 6 | 5 | `8548224` |
+| 7 | 7 | `3c3a1bc` |
+
+Decisions made during implementation:
+
+- **Open questions 1 and 2.** `readdir` is keyset-ordered by dirent id, not by
+  name. Files are capped at 1 TiB, with `EFBIG` from `write`, `truncate` and
+  `fallocate`. Timestamps outside 1677–2262 are clamped, not rejected.
+- **xattrs.** `setxattr` stays `EOPNOTSUPP` (open question 5 is unresolved).
+- **Unlinked while open.** These files are no longer flushed on close or fsync.
+  Their data dies with the last handle, which deletes the inode.
+- **`setattr`** flushes buffered data before applying a size or time change.
+  Without this, `cp -a` (write, then `utimensat`, then close) produced empty files,
+  because the kernel caches the size `setattr` returns.
+- **Write buffer.** The arena budget is configurable with `--write-buffer SIZE`
+  (default 64 MiB, minimum 64 KiB).
+- **Migration to version 4.** It rewrites the chunk table at about 20 s per GiB.
+  The database file keeps the freed pages afterwards; run `VACUUM` to reclaim them.
+
+Results are in [the benchmark doc](../2026-11-03-baseline-benchmark.md).
+
 ## Goal
 
 Reshape dbfs around how its data is actually accessed. The aim is fewer SQL

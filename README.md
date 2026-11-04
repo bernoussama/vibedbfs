@@ -43,7 +43,7 @@ Stopping dbfs with Ctrl-C, or sending it SIGTERM or SIGHUP, also unmounts cleanl
 ## Mount options
 
 ```bash
-dbfs mount [--allow-other | --allow-root] [--auto-unmount] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
+dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
 ```
 
 By default only the user who mounted dbfs can access the filesystem. `dbfs mount --help` lists every option.
@@ -53,6 +53,7 @@ By default only the user who mounted dbfs can access the filesystem. `dbfs mount
 | `--allow-other` | Lets every user access the mount, including root and the Docker daemon. Needed for bind mounts into containers. Mutually exclusive with `--allow-root`. |
 | `--allow-root` | Lets root access the mount, in addition to the mounting user. |
 | `--auto-unmount` | Unmounts the filesystem when dbfs exits, including after a crash or SIGKILL, so no stale mount is left behind. Requires `--allow-other` or `--allow-root`. |
+| `--write-buffer SIZE` | Memory for buffered writes, shared by all open files. Default `64M`, minimum `64K`; accepts `K`, `M` and `G` suffixes. Memory is reserved as it is used, so set `8M` in a container with a small memory limit. |
 | `-o OPT[,OPT...]` | Extra options. Repeatable, and each value may be a comma-separated list. Known names map to typed FUSE options: `ro`, `rw`, `atime`, `noatime`, `suid`, `nosuid`, `dev`, `nodev`, `exec`, `noexec`, `dirsync`, `sync`, `async`, `fsname=NAME`, `subtype=NAME`. Any other option is passed to `fusermount3`, which accepts only the options it knows, such as `max_read=N`. An unknown option, such as `context=...`, makes the mount fail with `unknown option`. |
 
 `default_permissions` is always on and cannot be turned off. The kernel therefore enforces file mode bits and owners, even for other users.
@@ -97,7 +98,11 @@ PRAGMA busy_timeout = 5000;
 PRAGMA wal_autocheckpoint = 10000;
 ```
 
-File data is stored in 64 KiB chunk rows in SQLite. FUSE writes are buffered in memory, one 64 KiB buffer per chunk, and flushed to SQLite on `flush`, `fsync`, or `release`, or once a file buffers 64 MiB. This lets buffered write workloads avoid one SQLite transaction per small write. Overlapping dirty writes merge in their chunk buffer, and full-chunk writes skip the read-modify-write cycle. All SQL queries use prepared statement caching to avoid re-parsing.
+File data is stored in 64 KiB chunk rows in SQLite, keyed by one integer, `(ino << 24) | chunk_index`. A file can hold up to 1 TiB (2^24 chunks); writing past that returns `EFBIG`. Timestamps are stored as i64 nanoseconds. Times outside 1677–2262 are clamped, never rejected, the way ext4 clamps to its own range.
+
+FUSE writes are buffered in memory and flushed to SQLite on `flush`, `fsync` or `release`. All open files share one write buffer of 64 KiB slots (`--write-buffer`, default 64 MiB). When it is full, the file with the most buffered data is flushed. This lets buffered write workloads avoid one SQLite transaction per small write. Overlapping dirty writes merge in their chunk buffer, and full-chunk writes skip the read-modify-write cycle. A file unlinked while open is never flushed on close: its data goes away with its last handle. All SQL queries use prepared statement caching to avoid re-parsing.
+
+The schema version is kept in `PRAGMA user_version` (currently 4). Older databases are upgraded in place on first mount, in one transaction, so a failed or interrupted upgrade leaves the old version intact. The upgrade from version 3 rewrites every data chunk: about 20 s per GiB on a laptop SSD. It prints a note for databases over 256 MiB. The old pages stay in the file as free pages, which SQLite reuses and `statfs` counts as free. A database written by a newer dbfs is refused, not modified.
 
 `flush` and `release` commit under `synchronous = NORMAL`. `fsync` also calls `fdatasync` on the WAL file, or on the main database file when no WAL file is present, so the committed bytes reach the host.
 

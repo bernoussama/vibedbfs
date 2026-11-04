@@ -166,3 +166,52 @@ databases are rebuilt in place on first mount.
 Docker compatibility matrix: PASS 13, FAIL 0, SKIP 3, XFAIL 0. S3 `rm -rf` of a
 2,000-entry tree now passes, and `tests/compat/run.sh` reports any `rm -rf`
 failure as FAIL instead of XFAIL.
+
+## After Phases 2–5 and 7 (data path and schema)
+
+Binaries `.bench/bin/dbfs-{phase6-0c40b3c,pr4,pr5,pr6,pr7}`, interleaved, 3 runs each
+with `scripts/bench.sh` on `.bench/` (disk, not tmpfs), median:
+
+| Workload | Phase 6 | PR 4 (2+3) | PR 5 (4) | PR 6 (5) | PR 7 (7) | Phase 6 → PR 7 |
+|---|---|---|---|---|---|---|
+| seqwrite (MiB/s) | 184.7 | 176.6 | 173.7 | 184.4 | **204.3** | +11% |
+| randwrite (MiB/s) | 21.3 | 22.1 | 21.1 | 23.3 | **24.8** | +16% |
+| seqread (MiB/s) | 1,168 | 1,146 | 1,288 | 1,369 | **1,452** | +24% |
+| randread (MiB/s) | 81.8 | 86.8 | 95.6 | 95.8 | **98.4** | +20% |
+| metadata total (s) | 2.62 | 2.60 | 2.54 | 2.60 | 2.51 | −4% |
+| metadata: unlink 5,000 (s) | 1.04 | 1.03 | 0.98 | 1.06 | 0.92 | −12% |
+| bigdir total (s) | 6.15 | 5.99 | 5.96 | 6.13 | 6.19 | ≈ |
+| bigdir: list 20,000 (s) | 0.014 | 0.014 | 0.014 | 0.013 | 0.013 | ≈ |
+| bigdir: `rm -rf` succeeds | yes | yes | yes | yes | yes | |
+
+fio, 2 runs each (Phase 6 / PR 7):
+
+| Job | Phase 6 | PR 7 | Change |
+|---|---|---|---|
+| randwrite 4k, no fsync (MiB/s) | 21.9 / 21.9 | 25.4 / 25.4 | +16% |
+| seqwrite 128k (MiB/s) | 188 / 204 | 217 / 215 | +10% |
+| randread 4k (MiB/s) | 62.2 / 64.2 | 73.4 / 73.3 | +16% |
+| randwrite 4k, fsync (IOPS) | 203 / 210 | 214 / 210 | disk-bound, ≈ |
+
+Where the gains come from:
+
+- **Reads.** These improve in PR 5 (`fh` indexes the open table, and the read path
+  makes no inode query) and in PR 7 (one range statement over the integer chunk keys).
+- **Writes.** These improve in PR 6 (shared arena, no allocation per chunk) and in
+  PR 7 (a rowid upsert instead of a composite-key B-tree plus its index). PR 4 and
+  PR 5 alone sit within noise of Phase 6 on writes.
+- **The C1 locking cost** recorded under Phase C (5–8%) is recovered and exceeded.
+- **Metadata and directory workloads** are unchanged, as expected: these phases did
+  not touch them.
+
+Migration from version 3: a 978 MiB database (11 files) written by `dbfs-pr6` was
+migrated by `dbfs-pr7` in 20.8 s.
+
+- Every file had an identical sha256 and identical metadata afterwards.
+- `PRAGMA integrity_check` returned ok, with 0 foreign-key violations.
+- The database file grew to 2.0 GB, because the freed pages stay on the freelist
+  until a `VACUUM`.
+
+Docker compatibility matrix on `3c3a1bc`: PASS 13, FAIL 0, SKIP 3, XFAIL 0. S6
+(`docker stop` with 16 MiB unflushed) exits 0 after 1.29 s and the data is restored
+byte for byte. The image is 18.67 MB. The log is in `.bench/compat-final.log`.
