@@ -1,6 +1,7 @@
 mod cli;
 mod db;
 mod fuse;
+mod arena;
 mod model;
 mod open_table;
 mod run;

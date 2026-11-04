@@ -338,3 +338,23 @@ fn run_passes_allow_other_to_the_mounter() {
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }
+
+#[test]
+fn write_buffer_accepts_sizes_with_suffixes() {
+    assert_eq!(parse_mount(&[]).write_buffer, None);
+    assert_eq!(parse_mount(&["--write-buffer", "8M"]).write_buffer, Some(8 << 20));
+    assert_eq!(parse_mount(&["--write-buffer", "512k"]).write_buffer, Some(512 << 10));
+    assert_eq!(parse_mount(&["--write-buffer", "1G"]).write_buffer, Some(1 << 30));
+    assert_eq!(parse_mount(&["--write-buffer", "65536"]).write_buffer, Some(65_536));
+}
+
+#[test]
+fn write_buffer_rejects_bad_sizes() {
+    for bad in ["", "8X", "M", "1K", "-5M", "99999999999999999999G"] {
+        let argv = ["dbfs", "mount", "--write-buffer", bad, "dbfs.sqlite", "mnt"];
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "`{bad}` should be rejected"
+        );
+    }
+}

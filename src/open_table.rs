@@ -5,12 +5,10 @@
 //! [`Handles`], so the data path (`read`, `write`, `flush`, `release`) never
 //! hashes or queries SQLite for the inode kind or size.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
+use crate::arena::{ChunkArena, DirtyIdx};
 use crate::{FileKind, Timestamp};
-
-/// Dirty chunks of one inode, keyed by chunk index.
-pub(crate) type DirtyIdx = BTreeMap<u64, Vec<u8>>;
 
 /// Index into the per-inode arrays of [`OpenInodes`].
 pub(crate) type Slot = u32;
@@ -92,6 +90,16 @@ impl OpenInodes {
     pub fn live_slots(&self) -> Vec<Slot> {
         self.by_ino.values().copied().collect()
     }
+
+    /// The live slot with the most dirty chunks: the one to flush when the
+    /// arena is full. Only runs when the write buffer budget is used up.
+    pub fn largest_dirty(&self) -> Option<Slot> {
+        self.by_ino
+            .values()
+            .copied()
+            .filter(|&slot| !self.dirty[slot as usize].is_empty())
+            .max_by_key(|&slot| self.dirty[slot as usize].len())
+    }
 }
 
 /// FUSE file handle -> slot. The handle is the index; several handles can map
@@ -132,12 +140,25 @@ impl Handles {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct OpenTable {
     pub inodes: OpenInodes,
     pub handles: Handles,
+    /// Bytes of every dirty chunk, shared by all inodes.
+    pub arena: ChunkArena,
     /// Set when shutdown starts; later buffered writes are refused.
     pub closing: bool,
+}
+
+impl OpenTable {
+    /// A table whose dirty data may use up to `write_buffer` bytes.
+    pub fn new(write_buffer: usize) -> Self {
+        Self {
+            inodes: OpenInodes::default(),
+            handles: Handles::default(),
+            arena: ChunkArena::new(write_buffer),
+            closing: false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -146,7 +167,7 @@ mod tests {
 
     #[test]
     fn freed_handles_and_slots_are_reused_without_stale_state() {
-        let mut table = OpenTable::default();
+        let mut table = OpenTable::new(1 << 20);
         let a = table.inodes.insert(10, FileKind::RegularFile, 5);
         table.inodes.refs[a as usize] = 1;
         table.inodes.unlinked[a as usize] = true;
@@ -170,7 +191,7 @@ mod tests {
 
     #[test]
     fn unknown_handles_are_rejected() {
-        let table = OpenTable::default();
+        let table = OpenTable::new(1 << 20);
         assert_eq!(table.handles.get(0), None);
         assert_eq!(table.handles.get(u64::MAX), None);
     }

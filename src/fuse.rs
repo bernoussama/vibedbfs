@@ -1,4 +1,3 @@
-use std::collections::btree_map::Entry;
 use std::ffi::OsStr;
 use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
@@ -15,7 +14,10 @@ use crate::open_table::{OpenTable, Slot};
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
-const FLUSH_THRESHOLD: usize = 64 * 1024 * 1024;
+
+/// Default budget for buffered writes, shared by all open files. When it is used
+/// up, the file with the most dirty chunks is flushed.
+pub const DEFAULT_WRITE_BUFFER: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsStats {
@@ -74,14 +76,18 @@ impl Shared {
     /// buffered, so a later flush can retry.
     fn flush_slot(&self, t: &mut OpenTable, slot: Slot, unlinked: Unlinked) -> Result<(), i32> {
         let i = slot as usize;
-        let inodes = &mut t.inodes;
+        let OpenTable { inodes, arena, .. } = t;
         if inodes.dirty[i].is_empty() || (inodes.unlinked[i] && unlinked == Unlinked::Skip) {
             return Ok(());
         }
+        let chunks = inodes.dirty[i]
+            .entries()
+            .iter()
+            .map(|&(chunk_index, a)| (chunk_index, arena.chunk(a)));
         self.db
-            .replace_chunks(inodes.ino[i], inodes.size[i], &inodes.dirty[i], inodes.mtime[i])
+            .replace_chunks(inodes.ino[i], inodes.size[i], chunks, inodes.mtime[i])
             .map_err(errno_from_db_error)?;
-        inodes.dirty[i].clear();
+        inodes.dirty[i].release_into(arena);
         Ok(())
     }
 
@@ -95,7 +101,7 @@ impl Shared {
 
     /// Drops `slot` and its dirty data without writing anything: its inode is gone.
     fn discard_slot(t: &mut OpenTable, slot: Slot) {
-        t.inodes.dirty[slot as usize].clear();
+        t.inodes.dirty[slot as usize].release_into(&mut t.arena);
         t.inodes.remove(slot);
     }
 
@@ -161,10 +167,26 @@ impl Shared {
             .read_into(inodes.ino[i], offset, &mut output)
             .map_err(errno_from_db_error)?;
         let span = ChunkSpan::new(offset, output.len()).expect("non-empty read");
-        for (&chunk_index, data) in inodes.dirty[i].range(span.first..=span.last) {
-            span.copy_out(chunk_index, data, &mut output);
+        for &(chunk_index, a) in inodes.dirty[i].range(span.first, span.last) {
+            span.copy_out(chunk_index, t.arena.chunk(a), &mut output);
         }
         Ok(output)
+    }
+
+    /// An empty arena slot. When the write budget is used up, the inode with the
+    /// most dirty chunks (possibly `writing`, the one being written) is flushed
+    /// first.
+    fn alloc_chunk(&self, t: &mut OpenTable, writing: Slot) -> Result<u32, i32> {
+        loop {
+            if let Some(a) = t.arena.alloc() {
+                return Ok(a);
+            }
+            let victim = t.inodes.largest_dirty().ok_or(libc::EIO)?;
+            self.flush_slot(t, victim, Unlinked::Persist)?;
+            if victim != writing {
+                Self::free_if_idle(t, victim);
+            }
+        }
     }
 
     fn write_slot(&self, t: &mut OpenTable, slot: Slot, offset: u64, data: &[u8]) -> Result<u32, i32> {
@@ -180,32 +202,37 @@ impl Shared {
         let Some(span) = ChunkSpan::new(offset, data.len()) else {
             return Ok(0);
         };
-        if t.inodes.dirty[i].len() * CHUNK_SIZE >= FLUSH_THRESHOLD {
-            self.flush_slot(t, slot, Unlinked::Persist)?;
-        }
+        t.inodes.mtime[i] = Timestamp::from_system_time(SystemTime::now());
 
         let ino = t.inodes.ino[i];
-        let dirty = &mut t.inodes.dirty[i];
         for chunk_index in span.first..=span.last {
             let piece = span.piece(chunk_index);
-            let chunk = match dirty.entry(chunk_index) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) if piece.is_full_chunk() => entry.insert(Vec::new()),
-                Entry::Vacant(entry) => {
-                    let mut chunk = Vec::new();
-                    self.db
-                        .read_chunk_into(ino, chunk_index, &mut chunk)
-                        .map_err(errno_from_db_error)?;
-                    entry.insert(chunk)
+            let a = match t.inodes.dirty[i].find(chunk_index) {
+                Ok(position) => t.inodes.dirty[i].slot_at(position),
+                Err(_) => {
+                    // May flush this inode too, so look the position up again after.
+                    let a = self.alloc_chunk(t, slot)?;
+                    if !piece.is_full_chunk() {
+                        let buffer = t.arena.buffer_mut(a);
+                        match self.db.read_chunk_into(ino, chunk_index, buffer) {
+                            Ok(len) => t.arena.set_len(a, len),
+                            Err(error) => {
+                                t.arena.release(a);
+                                return Err(errno_from_db_error(error));
+                            }
+                        }
+                    }
+                    let position = t.inodes.dirty[i].find(chunk_index).unwrap_err();
+                    t.inodes.dirty[i].insert(position, chunk_index, a);
+                    a
                 }
             };
-            if chunk.len() < piece.chunk.end {
-                chunk.resize(piece.chunk.end, 0);
-            }
-            chunk[piece.chunk].copy_from_slice(&data[piece.buf]);
+            t.arena.write(a, piece.chunk.clone(), &data[piece.buf]);
+            // Grow the size chunk by chunk, so an eviction in the middle of this
+            // write stores a size that covers every chunk it stores.
+            let chunk_end = chunk_index * CHUNK_SIZE as u64 + piece.chunk.end as u64;
+            t.inodes.size[i] = t.inodes.size[i].max(chunk_end);
         }
-        t.inodes.size[i] = t.inodes.size[i].max(span.end);
-        t.inodes.mtime[i] = Timestamp::from_system_time(SystemTime::now());
         Ok(data.len() as u32)
     }
 
@@ -287,10 +314,16 @@ impl ShutdownHandle {
 
 impl Dbfs {
     pub fn new(db: Db) -> Self {
+        Self::with_write_buffer(db, DEFAULT_WRITE_BUFFER)
+    }
+
+    /// A filesystem whose buffered writes use at most `write_buffer` bytes
+    /// (at least one 64 KiB chunk). The memory is reserved as it is used.
+    pub fn with_write_buffer(db: Db, write_buffer: usize) -> Self {
         Self {
             shared: Arc::new(Shared {
                 db,
-                table: Mutex::new(OpenTable::default()),
+                table: Mutex::new(OpenTable::new(write_buffer)),
                 last_flush: Mutex::new(Ok(())),
             }),
         }
@@ -1182,6 +1215,11 @@ impl Dbfs {
             .count()
     }
 
+    fn arena_stats(&self) -> (usize, usize) {
+        let t = self.table();
+        (t.arena.capacity_bytes(), t.arena.slots_in_use())
+    }
+
     fn is_dirty(&self, ino: u64) -> bool {
         let t = self.table();
         t.inodes
@@ -1310,5 +1348,94 @@ mod tests {
         assert_eq!(fs.write(file.ino, 0, b"after"), Err(libc::EIO));
         assert_eq!(handle.flush_failure(), None);
         assert_eq!(fs.db.read_file(file.ino, 0, 6).expect("read"), b"before");
+    }
+
+    #[test]
+    fn a_full_write_buffer_evicts_the_largest_file_and_every_file_reads_back() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let inos: Vec<u64> = (0..3)
+            .map(|n| {
+                db.create_file(1, format!("f{n}").as_bytes(), 0o644, 1, 1)
+                    .expect("create file")
+                    .ino
+            })
+            .collect();
+        // Room for four chunks across all files.
+        let fs = Dbfs::with_write_buffer(db, 4 * CHUNK_SIZE);
+        let handles: Vec<u64> = inos.iter().map(|&ino| fs.open(ino).expect("open")).collect();
+        let pattern = |n: usize, len: usize| -> Vec<u8> {
+            (0..len).map(|i| (i * 7 + n * 31) as u8).collect()
+        };
+        for (n, &fh) in handles.iter().enumerate() {
+            // Unaligned, so partial chunks take the read-modify-write path.
+            fs.write_fh(fh, 100, &pattern(n, 3 * CHUNK_SIZE)).expect("buffer write");
+        }
+        let (capacity, in_use) = fs.arena_stats();
+        assert_eq!(capacity, 4 * CHUNK_SIZE, "the arena never exceeds its budget");
+        assert!(in_use <= 4);
+
+        for (n, &fh) in handles.iter().enumerate() {
+            let len = 3 * CHUNK_SIZE + 100;
+            let mut expected = vec![0u8; 100];
+            expected.extend(pattern(n, 3 * CHUNK_SIZE));
+            assert_eq!(
+                fs.read_fh(fh, 0, len as u32 + 10).expect("read back"),
+                expected,
+                "file {n} reads back while buffered"
+            );
+        }
+        for &fh in &handles {
+            fs.release_file(fh).expect("release");
+        }
+        for (n, &ino) in inos.iter().enumerate() {
+            let mut expected = vec![0u8; 100];
+            expected.extend(pattern(n, 3 * CHUNK_SIZE));
+            assert_eq!(
+                fs.db.read_file(ino, 0, u32::MAX).expect("read stored"),
+                expected,
+                "file {n} is stored intact"
+            );
+        }
+    }
+
+    #[test]
+    fn write_flush_write_reuses_arena_memory() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db.create_file(1, b"reuse.bin", 0o644, 1, 1).expect("create file");
+        let fs = Dbfs::new(db);
+        let fh = fs.open(file.ino).expect("open");
+        fs.write_fh(fh, 0, &vec![1u8; 8 * CHUNK_SIZE]).expect("first write");
+        let (capacity, _) = fs.arena_stats();
+        fs.flush_fh(fh).expect("flush");
+        assert_eq!(fs.arena_stats().1, 0, "a flush returns every slot");
+        fs.write_fh(fh, 0, &vec![2u8; 8 * CHUNK_SIZE]).expect("second write");
+        assert_eq!(fs.arena_stats().0, capacity, "the arena did not grow");
+        fs.release_file(fh).expect("release");
+        assert_eq!(
+            fs.db.read_file(file.ino, 0, 16).expect("read"),
+            vec![2u8; 16]
+        );
+    }
+
+    #[test]
+    fn a_failed_eviction_keeps_the_buffered_data() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db.create_file(1, b"full.bin", 0o644, 1, 1).expect("create file");
+        db.cap_page_count_at_current().expect("cap sqlite page count");
+        let fs = Dbfs::with_write_buffer(db, 2 * CHUNK_SIZE);
+        let fh = fs.open(file.ino).expect("open");
+        let first = vec![5u8; 2 * CHUNK_SIZE];
+        fs.write_fh(fh, 0, &first).expect("fills the budget");
+
+        assert_eq!(
+            fs.write_fh(fh, 2 * CHUNK_SIZE as u64, b"more"),
+            Err(libc::ENOSPC),
+            "eviction cannot flush into a full database"
+        );
+        assert_eq!(
+            fs.read_fh(fh, 0, first.len() as u32).expect("read"),
+            first,
+            "the earlier buffered data is intact"
+        );
     }
 }

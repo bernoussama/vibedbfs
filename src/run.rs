@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use fuser::{MountOption, Session, SessionUnmounter};
 
 use crate::fuse::ShutdownHandle;
+use crate::fuse::DEFAULT_WRITE_BUFFER;
 use crate::{Cli, Command, Db, DbError, Dbfs, MountConfig};
 
 const ALLOW_OTHER_HINT: &str = "hint: allow_other requires 'user_allow_other' in /etc/fuse.conf";
@@ -39,7 +40,12 @@ pub fn run_with_mounter(
             // Validate options before the database is opened or created.
             let options = mount_options_for(&config)?;
             let db = Db::open(database)?;
-            mounter(Dbfs::new(db), &mountpoint, &options)
+            let write_buffer = config.write_buffer.unwrap_or(DEFAULT_WRITE_BUFFER);
+            mounter(
+                Dbfs::with_write_buffer(db, write_buffer),
+                &mountpoint,
+                &options,
+            )
         }
     }
 }

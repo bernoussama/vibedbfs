@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -533,30 +532,34 @@ impl Db {
         Ok(written as u32)
     }
 
-    /// Replaces `dst` with the stored bytes of chunk `chunk_index` (empty for a
-    /// hole), reusing `dst`'s capacity.
+    /// Copies the stored bytes of chunk `chunk_index` into the start of `dst`
+    /// and returns how many there were (0 for a hole).
     pub(crate) fn read_chunk_into(
         &self,
         ino: u64,
         chunk_index: u64,
-        dst: &mut Vec<u8>,
-    ) -> Result<(), DbError> {
-        dst.clear();
+        dst: &mut [u8],
+    ) -> Result<usize, DbError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached("SELECT data FROM file_chunks WHERE ino = ?1 AND chunk_index = ?2")?;
         let mut rows = stmt.query(params![ino as i64, chunk_index as i64])?;
-        if let Some(row) = rows.next()? {
-            dst.extend_from_slice(row.get_ref(0)?.as_blob().map_err(SqlError::from)?);
-        }
-        Ok(())
+        let Some(row) = rows.next()? else {
+            return Ok(0);
+        };
+        let data = row.get_ref(0)?.as_blob().map_err(SqlError::from)?;
+        let len = data.len().min(dst.len());
+        dst[..len].copy_from_slice(&data[..len]);
+        Ok(len)
     }
 
-    pub(crate) fn replace_chunks(
+    /// Upserts `chunks` (`(chunk_index, bytes)`) and sets size and mtime, in one
+    /// transaction.
+    pub(crate) fn replace_chunks<'a>(
         &self,
         ino: u64,
         size: u64,
-        chunks: &BTreeMap<u64, Vec<u8>>,
+        chunks: impl IntoIterator<Item = (u64, &'a [u8])>,
         now: Timestamp,
     ) -> Result<(), DbError> {
         let mut conn = self.conn.lock().unwrap();
@@ -568,7 +571,7 @@ impl Db {
                  ON CONFLICT (ino, chunk_index) DO UPDATE SET data = excluded.data",
             )?;
             for (chunk_index, data) in chunks {
-                write_stmt.execute(params![ino as i64, *chunk_index as i64, data])?;
+                write_stmt.execute(params![ino as i64, chunk_index as i64, data])?;
             }
         }
 
