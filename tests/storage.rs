@@ -878,12 +878,42 @@ fn unversioned_legacy_database_migrates_to_current_schema() {
 #[test]
 fn database_from_newer_dbfs_is_rejected_untouched() {
     let path = disk_db_path("schema-newer");
-    drop(Db::open(&path).expect("create database"));
     let newer = SCHEMA_VERSION + 1;
-    exec_sql(&path, &format!("PRAGMA user_version = {newer}"));
+    // A rollback-journal database (not WAL) with a table of its own.
+    exec_sql(
+        &path,
+        &format!(
+            "CREATE TABLE future_only (id INTEGER PRIMARY KEY, note BLOB);
+             INSERT INTO future_only (note) VALUES (X'0102');
+             PRAGMA user_version = {newer};"
+        ),
+    );
+    let before = std::fs::read(&path).expect("read database bytes");
+
     assert_eq!(
         Db::open(&path).err(),
         Some(DbError::UnsupportedSchema(newer))
+    );
+
+    assert_eq!(
+        std::fs::read(&path).expect("read database bytes"),
+        before,
+        "the refused database file is byte-for-byte unchanged"
+    );
+    assert_eq!(
+        query_string(&path, "PRAGMA journal_mode"),
+        "delete",
+        "no switch to WAL"
+    );
+    assert!(!path.with_extension("sqlite-wal").exists(), "no -wal file");
+    assert!(!path.with_extension("sqlite-shm").exists(), "no -shm file");
+    assert_eq!(
+        query_string(
+            &path,
+            "SELECT group_concat(name) FROM sqlite_master WHERE type = 'table'"
+        ),
+        "future_only",
+        "no dbfs tables were created"
     );
     assert_eq!(query_i64(&path, "PRAGMA user_version"), newer);
     remove_db(&path);
@@ -1030,6 +1060,12 @@ fn query_i64(path: &Path, sql: &str) -> i64 {
     let conn = Connection::open(path).expect("open raw sqlite");
     conn.query_row(sql, [], |row| row.get(0))
         .expect("query scalar")
+}
+
+fn query_string(path: &Path, sql: &str) -> String {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    conn.query_row(sql, [], |row| row.get(0))
+        .expect("query text")
 }
 
 fn exec_sql(path: &Path, sql: &str) {

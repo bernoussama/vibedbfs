@@ -70,9 +70,16 @@ impl Db {
         conn.execute_batch(
             "
             PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
+            ",
+        )?;
+        // Before the WAL switch and the table creation in `initialize`, both of
+        // which write to the file.
+        refuse_newer_schema(&conn)?;
+        conn.execute_batch(
+            "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
-            PRAGMA busy_timeout = 5000;
             PRAGMA wal_autocheckpoint = 10000;
             ",
         )?;
@@ -1121,6 +1128,15 @@ fn add_directory_nlink(
     Ok(())
 }
 
+/// Refuses a database written by a newer dbfs. Only reads `user_version`.
+fn refuse_newer_schema(conn: &Connection) -> Result<(), DbError> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(DbError::UnsupportedSchema(version));
+    }
+    Ok(())
+}
+
 /// Bring an existing database up to `SCHEMA_VERSION`, one step at a time,
 /// in a single transaction. A failure leaves the database at its old version.
 ///
@@ -1129,6 +1145,8 @@ fn add_directory_nlink(
 /// (from `CREATE TABLE IF NOT EXISTS`), and must not be "upgraded" again.
 fn migrate(conn: &Connection) -> Result<(), DbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // `open` refuses newer schemas before writing; this keeps migrate from ever
+    // stamping an older version over one.
     if version > SCHEMA_VERSION {
         return Err(DbError::UnsupportedSchema(version));
     }
