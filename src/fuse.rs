@@ -1320,6 +1320,7 @@ fn errno_from_db_error(error: DbError) -> i32 {
         DbError::NoSpace => libc::ENOSPC,
         DbError::NotDirectory => libc::ENOTDIR,
         DbError::FileTooLarge => libc::EFBIG,
+        DbError::DatabaseInUse => libc::EBUSY,
         DbError::Corrupt | DbError::UnsupportedSchema(_) | DbError::Sqlite(_) => libc::EIO,
     }
 }

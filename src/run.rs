@@ -314,6 +314,7 @@ impl fmt::Display for RunError {
                  ({}); upgrade dbfs",
                 crate::SCHEMA_VERSION
             ),
+            Self::Db(error @ DbError::DatabaseInUse) => write!(f, "{error}"),
             Self::Db(error) => write!(f, "database error: {error:?}"),
             // fusermount3 output ends with a newline; don't print a blank line.
             Self::Mount(error) => write!(f, "mount error: {}", error.to_string().trim_end()),

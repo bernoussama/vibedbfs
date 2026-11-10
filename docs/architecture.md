@@ -49,7 +49,7 @@
  │  • conn: Mutex<Connection> (rusqlite), prepare_cached for SQL   │
  │  • No per-process file state: callers say whether an inode is   │
  │    open (unlink_entry, rename_entry)                            │
- │  • Schema migrations via PRAGMA user_version (currently 4)      │
+ │  • Schema migrations via PRAGMA user_version (currently 5)      │
  └─────────────────────┬────────────────────────────────────────────┘
                        │ SQL via rusqlite (prepare_cached)
                        ▼
@@ -86,13 +86,14 @@
  └── model.rs         FileKind, Inode, DirEntry, MetadataUpdate, Timestamp, DbError
 ```
 
-## SQLite Schema (version 4)
+## SQLite Schema (version 5)
 
 ```
  ┌─────────────────────────────────────────────┐
  │  inodes                                     │
  │─────────────────────────────────────────────│
- │  ino       INTEGER PRIMARY KEY              │
+ │  ino       INTEGER PRIMARY KEY AUTOINCREMENT│
+ │            (never reused; FUSE node id)     │
  │  kind      INTEGER  (1=file, 2=dir, 3=sym)  │
  │  mode, uid, gid, size, nlink   INTEGER      │
  │  atime_ns, mtime_ns, ctime_ns  INTEGER      │

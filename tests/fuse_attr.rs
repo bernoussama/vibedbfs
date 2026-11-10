@@ -18,8 +18,8 @@ fn maps_regular_file_inode_to_fuse_attr() {
         },
         mtime: Timestamp { secs: 20, nsec: 0 },
         ctime: Timestamp {
-            secs: -5,
-            nsec: 250_000_000,
+            secs: -6,
+            nsec: 750_000_000,
         },
         nlink: 1,
     };
