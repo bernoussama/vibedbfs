@@ -602,6 +602,35 @@ fn rename_over_hardlink_only_removes_destination_name() {
 }
 
 #[test]
+fn rename_over_a_non_empty_directory_is_refused() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let source = db
+        .create_dir(1, b"source", 0o755, 1000, 1000)
+        .expect("create source directory");
+    let target = db
+        .create_dir(1, b"target", 0o755, 1000, 1000)
+        .expect("create target directory");
+    db.create_file(target.ino, b"keep.txt", 0o644, 1000, 1000)
+        .expect("create entry inside target");
+
+    let result = db
+        .rename(1, b"source", 1, b"target")
+        .expect_err("a non-empty directory cannot be replaced");
+
+    assert_eq!(result, DbError::DirectoryNotEmpty);
+    assert_eq!(
+        db.lookup(1, b"source").expect("source stays").ino,
+        source.ino
+    );
+    assert_eq!(
+        db.lookup(target.ino, b"keep.txt")
+            .expect("target kept")
+            .kind,
+        FileKind::RegularFile
+    );
+}
+
+#[test]
 fn rename_onto_another_name_of_the_same_inode_changes_nothing() {
     let db = Db::open_in_memory().expect("open in-memory database");
     let file = db

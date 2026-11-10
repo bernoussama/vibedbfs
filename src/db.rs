@@ -755,7 +755,7 @@ impl Db {
                 (FileKind::Directory, FileKind::RegularFile)
                 | (FileKind::Directory, FileKind::Symlink) => return Err(DbError::NotDirectory),
                 (FileKind::Directory, FileKind::Directory)
-                    if !self.list_dir(target.ino)?.is_empty() =>
+                    if self.directory_has_entries(target.ino)? =>
                 {
                     return Err(DbError::DirectoryNotEmpty);
                 }
@@ -905,6 +905,15 @@ impl Db {
             ctime: now,
             nlink: nlink as u32,
         })
+    }
+
+    /// Whether directory `ino` has any entry. Stops at the first row, so a large
+    /// directory is not listed just to learn that it is not empty.
+    fn directory_has_entries(&self, ino: u64) -> Result<bool, DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM dirents WHERE parent_ino = ?1)")?
+            .query_row(params![ino as i64], |row| row.get::<_, bool>(0))
+            .map_err(Into::into)
     }
 
     fn is_descendant(&self, ino: u64, possible_ancestor: u64) -> Result<bool, DbError> {
