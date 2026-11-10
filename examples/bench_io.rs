@@ -134,8 +134,11 @@ fn read_job(dir: &Path, size: u64, bs: u64, random: bool) {
             file.write_all(&buf).expect("write");
         }
     }
-    // dbfs replies to open without FOPEN_KEEP_CACHE, so reopening drops the
-    // kernel page cache for the file and reads go to the filesystem.
+    // Reopen without dropping any cache. On ext4 and btrfs the reads hit the page
+    // cache that the layout phase just filled. dbfs replies to open without
+    // FOPEN_KEEP_CACHE (unless --kernel-cache), so its page cache is dropped here
+    // and reads go through FUSE and SQLite. The two read paths are not
+    // like-for-like; see docs/2026-11-03-baseline-benchmark.md.
     let file = File::open(&path).expect("open");
     let mut buf = vec![0u8; bs as usize];
     let blocks = size / bs;
