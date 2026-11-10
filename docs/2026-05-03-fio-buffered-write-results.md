@@ -1,5 +1,7 @@
 # dbfs Buffered-write fio Results
 
+> **Note (2026-11-10):** These results predate commit `89da6ec` (`fix(fuse): fdatasync the WAL when fsync flushes`). Before that commit, dbfs `fsync` returned without a host sync, so the fsync=1 row here is not a durable-write result. This document makes no passthrough comparison.
+
 Date: 2026-05-03
 
 ## Change

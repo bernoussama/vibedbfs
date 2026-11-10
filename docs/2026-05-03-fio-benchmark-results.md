@@ -1,5 +1,7 @@
 # dbfs fio Benchmark Results
 
+> **Note (2026-11-10):** These results predate commit `89da6ec` (`fix(fuse): fdatasync the WAL when fsync flushes`). Before that commit, dbfs `fsync` returned without a host sync, so the fsync=1 dbfs numbers here are not durable-write results. The Important Caveat section below says the same for this run. This document makes no passthrough comparison.
+
 Date: 2026-05-03
 
 ## Workload

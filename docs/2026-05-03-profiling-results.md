@@ -1,5 +1,7 @@
 # dbfs Profiling & Flamegraph Analysis
 
+> **Note (2026-11-10):** These profiles predate commit `89da6ec` (`fix(fuse): fdatasync the WAL when fsync flushes`). Before that commit, dbfs `fsync` returned without a host sync, so the write-fsync workload profiled here did not do durable writes. This document makes no passthrough comparison.
+
 Profiled on a Cloud VM (kernel 6.1.147, ext4/overlayfs, single-core).
 Release build with `CARGO_PROFILE_RELEASE_DEBUG=2` for symbol resolution.
 Sampled at 999 Hz via `perf record -g -F 999`.

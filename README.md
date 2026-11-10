@@ -140,7 +140,7 @@ pytest tests/test_with_libfuse.py -v
 
 ## Benchmark
 
-Use the fio helper script:
+Use the fio helper script. It mounts dbfs on a fresh directory under `.bench/` (disk-backed, never `/tmp`) and removes that directory afterwards unless `--keep` is given:
 
 ```bash
 scripts/bench-fio.sh
@@ -170,24 +170,29 @@ Pass extra fio arguments after `--`:
 scripts/bench-fio.sh --job randwrite --fsync 0 -- --group_reporting --output-format=json
 ```
 
-## Current fio Results
+Choose the database and mountpoint yourself:
 
-### dbfs vs Native vs FUSE Passthrough
+```bash
+scripts/bench-fio.sh --database /srv/bench/dbfs.sqlite --mountpoint /srv/bench/mnt
+```
 
-Three-way comparison on overlay/ext4, interleaved runs, `fio` with `ioengine=sync`, `numjobs=1`:
+The script refuses to run if the database directory or the mountpoint is on `tmpfs` or `ramfs`, because those measure RAM. It also refuses a mountpoint that is already mounted, and it fails unless the mountpoint is a FUSE mount, so another filesystem cannot be benchmarked as dbfs. To benchmark RAM on purpose, pass `--allow-tmpfs` or set `DBFS_BENCH_ALLOW_TMPFS=1`.
 
-| Workload | Native | FUSE Passthrough | dbfs | dbfs vs Passthrough |
-| --- | ---: | ---: | ---: | ---: |
-| `randwrite`, `4k`, `fsync=0` | 1455 MiB/s | 152 MiB/s | 217 MiB/s | **1.43x** |
-| `randwrite`, `4k`, `fsync=1` | 3.8 MiB/s | 2.1 MiB/s | 29.7 MiB/s | **14.2x** |
-| `randread`, `4k` | 100 MiB/s | 120 MiB/s | 137 MiB/s | **1.14x** |
-| `seqwrite`, `128k`, `fsync=0` | 2535 MiB/s | 535 MiB/s | 1056 MiB/s | **1.97x** |
-| create 5000 files | 0.219s | 0.837s | 0.769s | **1.09x** |
-| delete 5000 files | 4.256s | 5.003s | 5.852s | 0.85x |
+`scripts/bench.sh` runs `examples/bench_io.rs` against a fresh mount for each run and appends JSON lines to `.bench/results/`. Each line records the target path and the filesystem types, so a mislabelled run is easy to spot. `scripts/bench-docker/compare.sh` compares dbfs with ext4, btrfs and `passthrough_hp` in one privileged container.
 
-dbfs beats FUSE passthrough in 5 of 6 workloads. On fsync-heavy writes, dbfs is 14.2x faster than passthrough and 7.8x faster than native ext4 because SQLite WAL batches per-write fsyncs into efficient journal commits.
+## Benchmark results
 
-Full benchmark notes:
+These numbers come from [the 2026-11-03 baseline benchmark](docs/2026-11-03-baseline-benchmark.md). It ran on ext4 under `.bench/` with `examples/bench_io.rs`, through `scripts/bench.sh`. fio was not available on that host when the main table was measured. The first table is the baseline before the data-oriented redesign (`8c75dde`). Later sections measure the redesigned build (`3c3a1bc`) and other intermediate builds. Compare numbers only within one table of that document.
+
+- **Durable writes are on par with ext4.** With an fsync after every 4 KiB write, the baseline does 216 IOPS on dbfs against 195 on ext4. The redesigned build, in fio over 2 runs, does 215 and 207 IOPS against 206 and 204. Both are bound by the disk's flush latency. A dbfs fsync is one `fdatasync` of the WAL on the same ext4 (commit `89da6ec`).
+- **Buffered writes are much slower than ext4.** In the baseline, 4 KiB random writes without fsync run at 23.0 MiB/s on dbfs against 990 MiB/s on ext4, which is 43× slower. Sequential 512 MiB writes in 128 KiB blocks run at 154 MiB/s against 4,048 MiB/s, which is 26× slower. The redesigned build does 25.6 MiB/s random (against 996) and 206 MiB/s sequential (against 4,110).
+- **Metadata is slower.** In the baseline, 5,000 files of 4 KiB over 200 directories take 4.146 s on dbfs and 0.165 s on ext4. Unlink alone takes 2.777 s against 0.051 s. The redesigned build takes 2.48 s against 0.164 s.
+- **Reads are not compared directly.** ext4 reads come from the page cache. Without `--kernel-cache`, dbfs drops its page cache on every open, so its reads go through FUSE and SQLite. With `--kernel-cache`, warm sequential reads reach about the speed of `passthrough_hp --nopassthrough` on ext4 (8,545 against 8,429 MiB/s), because the kernel serves them from its page cache.
+- **FUSE passthrough.** The like-for-like comparison with libfuse's `passthrough_hp`, with every filesystem run from one container, is in the same document. `scripts/bench-docker/compare.sh` runs it.
+
+### Earlier results, measured before durable fsync
+
+The fio runs from 2026-05-03 predate commit `89da6ec`. Before that commit, dbfs `fsync` returned without a host sync. Their fsync numbers are therefore not durable-write numbers, and the 14.2x and 7.8x fsync ratios against passthrough and native ext4 should not be cited. Their passthrough comparisons also do not use the same I/O path as dbfs. Each document has a dated note at the top:
 
 - [Disk-backed dbfs vs FUSE passthrough benchmark](docs/2026-05-03-disk-backed-fuse-passthrough-benchmark.md)
 - [Optimization results and methodology](docs/2026-05-03-optimization-results.md)
