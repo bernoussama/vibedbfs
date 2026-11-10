@@ -1,5 +1,6 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -57,6 +58,9 @@ pub(crate) struct VolumeUsage {
 /// (`unlink_entry`, `rename_entry`).
 pub struct Db {
     conn: Mutex<Connection>,
+    /// Held as long as the `Db` is alive. Declared after `conn`, so the
+    /// connection closes before the lock is released.
+    _lock: Option<File>,
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +72,9 @@ enum NewNode<'a> {
 
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let path = path.as_ref();
+        // Before the database file is opened, so a refused process never touches it.
+        let lock = lock_database(path)?;
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "
@@ -85,13 +92,13 @@ impl Db {
             PRAGMA wal_autocheckpoint = 10000;
             ",
         )?;
-        Self::initialize(conn)
+        Self::initialize(lock, conn)
     }
 
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        Self::initialize(conn)
+        Self::initialize(None, conn)
     }
 
     pub(crate) fn sync_durable(&self) -> Result<(), DbError> {
@@ -137,7 +144,7 @@ impl Db {
             .map_err(Into::into)
     }
 
-    fn initialize(conn: Connection) -> Result<Self, DbError> {
+    fn initialize(lock: Option<File>, conn: Connection) -> Result<Self, DbError> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS inodes (
@@ -211,6 +218,7 @@ impl Db {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            _lock: lock,
         })
     }
 
@@ -1087,6 +1095,39 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
+}
+
+/// Takes the lock that keeps a second dbfs off the same database: an exclusive,
+/// non-blocking `flock` on the sibling file `<db>.lock`, held while the returned
+/// file is open. `flock` belongs to the open file description, so closing other
+/// descriptors (SQLite's own) cannot release it. The lock file is never deleted:
+/// a deleted lock file would let the next process lock a different inode.
+/// In-memory databases have no file to share, so they take no lock.
+fn lock_database(path: &Path) -> Result<Option<File>, DbError> {
+    if path.as_os_str().is_empty() || path == Path::new(":memory:") {
+        return Ok(None);
+    }
+    let lock_path = path_with_suffix(path, ".lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            DbError::Sqlite(format!("cannot open {}: {error}", lock_path.display()))
+        })?;
+    // SAFETY: `flock` only uses the descriptor, which `file` keeps open.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == ErrorKind::WouldBlock {
+        return Err(DbError::DatabaseInUse);
+    }
+    Err(DbError::Sqlite(format!(
+        "cannot lock {}: {error}",
+        lock_path.display()
+    )))
 }
 
 fn pragma_query(name: &str) -> Result<String, DbError> {

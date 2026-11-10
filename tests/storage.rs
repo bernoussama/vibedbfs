@@ -52,6 +52,7 @@ fn file_backed_database_persists_entries_after_reopen() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -76,6 +77,7 @@ fn file_backed_database_enables_wal_and_foreign_keys() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -114,6 +116,7 @@ fn opening_legacy_database_migrates_root_owner_to_mount_user() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -156,6 +159,7 @@ fn legacy_second_timestamps_read_back_with_zero_nsec() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -202,6 +206,7 @@ fn legacy_directory_nlink_counts_subdirectories() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -1076,6 +1081,53 @@ fn directory_listing_query_uses_the_scan_index_without_sorting() {
     remove_db(&path);
 }
 
+#[test]
+fn second_open_of_a_database_in_use_is_refused() {
+    let path = disk_db_path("lock-refused");
+    let first = Db::open(&path).expect("open first");
+
+    match Db::open(&path) {
+        Ok(_) => panic!("a second open must not share the database"),
+        Err(error) => assert_eq!(error, DbError::DatabaseInUse),
+    }
+
+    drop(first);
+    drop(Db::open(&path).expect("open again once the first is dropped"));
+    remove_db(&path);
+}
+
+#[test]
+fn refused_second_open_leaves_the_database_files_unchanged() {
+    let path = disk_db_path("lock-untouched");
+    let wal = path.with_extension("sqlite-wal");
+    let first = Db::open(&path).expect("open first");
+    let snapshot = |file: &Path| std::fs::read(file).unwrap_or_default();
+    let before = (snapshot(&path), snapshot(&wal));
+
+    assert!(Db::open(&path).is_err(), "a second open must be refused");
+
+    assert_eq!((snapshot(&path), snapshot(&wal)), before);
+    drop(first);
+    remove_db(&path);
+}
+
+#[test]
+fn databases_without_a_file_take_no_lock() {
+    let first = Db::open_in_memory().expect("open first in-memory database");
+    let second = Db::open_in_memory().expect("open second in-memory database");
+    let third = Db::open(":memory:").expect("open first ':memory:' database");
+    let fourth = Db::open(":memory:").expect("open second ':memory:' database");
+    drop((first, second, third, fourth));
+}
+
+#[test]
+fn database_in_use_has_a_clear_message() {
+    assert_eq!(
+        DbError::DatabaseInUse.to_string(),
+        "database is already in use by another dbfs"
+    );
+}
+
 fn disk_db_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1092,6 +1144,7 @@ fn remove_db(path: &Path) {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 /// Chunk rows stored for `ino` (keys are `(ino << 24) | chunk_index`).

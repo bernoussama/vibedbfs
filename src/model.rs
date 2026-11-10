@@ -1,3 +1,4 @@
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Error as SqlError, ErrorCode, ffi};
@@ -146,7 +147,32 @@ pub enum DbError {
     UnsupportedSchema(i64),
     /// The file would grow past the 1 TiB limit (`EFBIG`).
     FileTooLarge,
+    /// Another dbfs process holds the database's lock.
+    DatabaseInUse,
     Sqlite(String),
+}
+
+impl fmt::Display for DbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyExists => write!(f, "already exists"),
+            Self::DirectoryNotEmpty => write!(f, "directory not empty"),
+            Self::InvalidInput => write!(f, "invalid input"),
+            Self::IsDirectory => write!(f, "is a directory"),
+            Self::NameTooLong => write!(f, "name too long"),
+            Self::NoSpace => write!(f, "no space left on device"),
+            Self::NotDirectory => write!(f, "not a directory"),
+            Self::NotFound => write!(f, "not found"),
+            Self::Corrupt => write!(f, "database is corrupt"),
+            Self::UnsupportedSchema(version) => write!(
+                f,
+                "database was written by a newer dbfs (schema version {version})"
+            ),
+            Self::FileTooLarge => write!(f, "file too large"),
+            Self::DatabaseInUse => write!(f, "database is already in use by another dbfs"),
+            Self::Sqlite(message) => write!(f, "database error: {message}"),
+        }
+    }
 }
 
 impl From<SqlError> for DbError {
