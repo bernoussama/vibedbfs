@@ -602,6 +602,30 @@ fn rename_over_hardlink_only_removes_destination_name() {
 }
 
 #[test]
+fn rename_onto_another_name_of_the_same_inode_changes_nothing() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"a", 0o644, 1000, 1000)
+        .expect("create file");
+    db.link(file.ino, 1, b"b").expect("create second name");
+    let dir = db
+        .create_dir(1, b"dir", 0o755, 1000, 1000)
+        .expect("create directory");
+    db.link(file.ino, dir.ino, b"c")
+        .expect("create name in another directory");
+
+    db.rename(1, b"a", 1, b"b")
+        .expect("POSIX: renaming onto a link to the same inode is a no-op");
+    db.rename(1, b"b", dir.ino, b"c")
+        .expect("same no-op across directories");
+
+    assert_eq!(db.lookup(1, b"a").expect("a stays").ino, file.ino);
+    assert_eq!(db.lookup(1, b"b").expect("b stays").ino, file.ino);
+    assert_eq!(db.lookup(dir.ino, b"c").expect("c stays").ino, file.ino);
+    assert_eq!(db.get_inode(file.ino).expect("inode").nlink, 3);
+}
+
+#[test]
 fn rejects_moving_directory_into_its_descendant() {
     let db = Db::open_in_memory().expect("open in-memory database");
     let parent = db

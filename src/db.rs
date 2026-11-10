@@ -739,6 +739,15 @@ impl Db {
             return Err(DbError::AlreadyExists);
         }
 
+        // The target is another name for the source inode. POSIX makes this a
+        // no-op: both names stay, and nothing is removed.
+        if existing_target
+            .as_ref()
+            .is_some_and(|target| target.ino == source.ino)
+        {
+            return Ok(None);
+        }
+
         if let Some(target) = &existing_target {
             match (source.kind, target.kind) {
                 (FileKind::RegularFile, FileKind::Directory)
