@@ -417,6 +417,14 @@ impl Dbfs {
         self.shared.flush_all()
     }
 
+    /// Makes committed directory changes durable for `fsyncdir`. Directories hold
+    /// no buffered data and every change is a database commit, so syncing the WAL
+    /// is enough. The handle is not used: `opendir` returns 0 and nothing is kept
+    /// per directory.
+    pub fn sync_dir(&self) -> Result<(), i32> {
+        self.db.sync_durable().map_err(errno_from_db_error)
+    }
+
     /// A handle for the shutdown path in `run.rs`. It keeps working after this
     /// `Dbfs` moves into the FUSE session.
     pub(crate) fn shutdown_handle(&self) -> ShutdownHandle {
@@ -1106,6 +1114,20 @@ impl Filesystem for Dbfs {
         reply: ReplyEmpty,
     ) {
         match self.sync_fh(fh) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.sync_dir() {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
