@@ -1591,6 +1591,53 @@ fn version_4_database_keeps_its_contents_and_stops_reusing_inode_numbers() {
 }
 
 #[test]
+fn upgrade_keeps_the_constraints_and_indexes_of_inodes() {
+    let path = disk_db_path("schema-v4-constraints");
+    exec_sql(
+        &path,
+        "CREATE TABLE inodes (
+           ino INTEGER PRIMARY KEY, kind INTEGER NOT NULL, mode INTEGER NOT NULL,
+           uid INTEGER NOT NULL CHECK (uid < 100000), gid INTEGER NOT NULL,
+           size INTEGER NOT NULL, atime_ns INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+           ctime_ns INTEGER NOT NULL, nlink INTEGER NOT NULL
+         );
+         CREATE INDEX inodes_kind ON inodes(kind);
+         INSERT INTO inodes VALUES (1, 2, 493, 1000, 1000, 0, 1, 1, 1, 2);
+         PRAGMA user_version = 4;",
+    );
+
+    drop(Db::open(&path).expect("upgrade version 4 database"));
+
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    let definition = query_string(
+        &path,
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inodes'",
+    );
+    assert!(definition.contains("AUTOINCREMENT"), "{definition}");
+    assert!(definition.contains("CHECK (uid < 100000)"), "{definition}");
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'inodes_kind'"
+        ),
+        1,
+        "the index on inodes survives the rebuild"
+    );
+    let conn = Connection::open(&path).expect("open raw sqlite");
+    assert!(
+        conn.execute(
+            "INSERT INTO inodes (kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink)
+             VALUES (1, 420, 200000, 1, 0, 0, 0, 0, 1)",
+            [],
+        )
+        .is_err(),
+        "the CHECK constraint still rejects out-of-range uids"
+    );
+    drop(conn);
+    remove_db(&path);
+}
+
+#[test]
 fn reopening_a_current_database_does_not_rebuild_inodes() {
     let path = disk_db_path("schema-v5-noop");
     drop(Db::open(&path).expect("create database"));

@@ -1301,33 +1301,56 @@ fn rekey_file_chunks(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Version 5: rebuilds `inodes` with AUTOINCREMENT, so the sequence remembers the
-/// highest number ever used and a deleted number is not handed out again. Every
-/// `ino` is copied unchanged, so the root and all references stay valid. The
-/// sequence starts at the highest number still present. Numbers freed before
-/// this step are not recorded anywhere, which is safe: this runs at mount start,
-/// and the kernel has dropped every inode of the previous mount.
+/// Version 5: gives `inodes` AUTOINCREMENT, so the sequence remembers the highest
+/// number ever used and a deleted number is not handed out again.
+///
+/// The table is rebuilt from its stored definition with AUTOINCREMENT added after
+/// the primary key, so every other column and constraint is kept as it was, and
+/// so are indexes and triggers on the table. Every `ino` is copied unchanged, so
+/// the root and all references stay valid. The sequence starts at the highest
+/// number still present. Numbers freed before this step are not recorded
+/// anywhere, which is safe: this runs at mount start, and the kernel has dropped
+/// every inode of the previous mount.
 fn autoincrement_inodes(conn: &Connection) -> Result<(), DbError> {
-    conn.execute_batch(
-        "CREATE TABLE inodes_v5 (
-           ino INTEGER PRIMARY KEY AUTOINCREMENT,
-           kind INTEGER NOT NULL,
-           mode INTEGER NOT NULL,
-           uid INTEGER NOT NULL,
-           gid INTEGER NOT NULL,
-           size INTEGER NOT NULL,
-           atime_ns INTEGER NOT NULL,
-           mtime_ns INTEGER NOT NULL,
-           ctime_ns INTEGER NOT NULL,
-           nlink INTEGER NOT NULL
-         );
-         INSERT INTO inodes_v5
-           (ino, kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink)
-           SELECT ino, kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink
-           FROM inodes;
-         DROP TABLE inodes;
-         ALTER TABLE inodes_v5 RENAME TO inodes;",
+    let stored: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inodes'",
+        [],
+        |row| row.get(0),
     )?;
+    let unexpected =
+        || DbError::Sqlite("cannot add AUTOINCREMENT to inodes: unexpected definition".into());
+    // Everything from the column list on; the name is replaced by `inodes_v5`.
+    let columns = &stored[stored.find('(').ok_or_else(unexpected)?..];
+    let key_end = columns
+        .to_ascii_uppercase()
+        .find("PRIMARY KEY")
+        .ok_or_else(unexpected)?
+        + "PRIMARY KEY".len();
+    // If the key cannot take AUTOINCREMENT, SQLite refuses the CREATE and the
+    // whole upgrade rolls back.
+    let definition = format!(
+        "{} AUTOINCREMENT{}",
+        &columns[..key_end],
+        &columns[key_end..]
+    );
+
+    // Indexes and triggers on `inodes` are dropped with the old table; recreate them.
+    let attached: Vec<String> = conn
+        .prepare(
+            "SELECT sql FROM sqlite_master
+             WHERE tbl_name = 'inodes' AND type IN ('index', 'trigger') AND sql IS NOT NULL",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE inodes_v5 {definition};
+         INSERT INTO inodes_v5 SELECT * FROM inodes;
+         DROP TABLE inodes;
+         ALTER TABLE inodes_v5 RENAME TO inodes;"
+    ))?;
+    for sql in attached {
+        conn.execute_batch(&sql)?;
+    }
     Ok(())
 }
 
