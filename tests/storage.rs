@@ -1282,6 +1282,75 @@ fn timestamps_outside_the_nanosecond_range_are_clamped_not_rejected() {
 }
 
 #[test]
+fn timestamps_just_before_the_epoch_keep_their_sign_in_the_database() {
+    let path = disk_db_path("timestamps-pre-epoch");
+    let file = {
+        let db = Db::open(&path).expect("open database");
+        db.create_file(1, b"pre-epoch", 0o644, 1000, 1000)
+            .expect("create file")
+    };
+    let cases = [
+        (UNIX_EPOCH - Duration::from_nanos(1), -1),
+        (UNIX_EPOCH - Duration::from_millis(500), -500_000_000),
+        (UNIX_EPOCH - Duration::from_secs(1), -1_000_000_000),
+        (UNIX_EPOCH - Duration::from_millis(1500), -1_500_000_000),
+        (UNIX_EPOCH, 0),
+    ];
+    for (time, ns) in cases {
+        {
+            let db = Db::open(&path).expect("open database");
+            db.update_metadata(
+                file.ino,
+                MetadataUpdate {
+                    mtime: Some(Timestamp::from_system_time(time)),
+                    ..MetadataUpdate::default()
+                },
+            )
+            .expect("set mtime");
+        }
+        assert_eq!(
+            query_i64(
+                &path,
+                &format!("SELECT mtime_ns FROM inodes WHERE ino = {}", file.ino)
+            ),
+            ns,
+            "stored nanoseconds for {time:?}"
+        );
+        let db = Db::open(&path).expect("reopen database");
+        let mtime = db.get_inode(file.ino).expect("read inode").mtime;
+        assert_eq!(mtime.to_system_time(), time, "read back after reopen");
+        assert_eq!(mtime.to_ns(), ns);
+    }
+
+    // The ends of the stored range are kept exactly, not wrapped or sign-flipped.
+    let db = Db::open(&path).expect("open database");
+    for (ns, time) in [(i64::MIN, "far past"), (i64::MAX, "far future")] {
+        db.update_metadata(
+            file.ino,
+            MetadataUpdate {
+                atime: Some(Timestamp::from_ns(ns)),
+                ..MetadataUpdate::default()
+            },
+        )
+        .expect("set atime");
+        assert_eq!(
+            query_i64(
+                &path,
+                &format!("SELECT atime_ns FROM inodes WHERE ino = {}", file.ino)
+            ),
+            ns,
+            "stored nanoseconds at the {time} end"
+        );
+        assert_eq!(
+            db.get_inode(file.ino).expect("read inode").atime,
+            Timestamp::from_ns(ns)
+        );
+    }
+    drop(db);
+    remove_db(&path);
+}
+
+#[test]
 fn version_3_database_is_rekeyed_with_contents_intact() {
     let path = disk_db_path("schema-v3-chunks");
     // Build a version 3 database by hand: split timestamps, composite chunk key.
@@ -1338,7 +1407,14 @@ fn version_3_database_is_rekeyed_with_contents_intact() {
                 nsec: 123_456_789
             }
         );
-        assert_eq!(data.mtime, Timestamp { secs: -5, nsec: 7 });
+        // Stored as -5_000_000_007 ns: -5.000000007 s, floored to secs -6.
+        assert_eq!(
+            data.mtime,
+            Timestamp {
+                secs: -6,
+                nsec: 999_999_993
+            }
+        );
         let bytes = db.read_file(2, 0, 200_000).expect("read file");
         assert_eq!(bytes.len(), 131_077);
         assert_eq!(&bytes[..2], b"xx");
