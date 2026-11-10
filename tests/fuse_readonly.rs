@@ -1074,3 +1074,19 @@ fn link_reports_the_buffered_size_and_a_ctime_after_the_write() {
     );
     fs.release_file(fh).expect("release");
 }
+
+#[test]
+fn lookup_reports_the_buffered_size_of_an_open_file() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write_fh(fh, 0, b"0123456789").expect("buffer write");
+
+    let attr = fs.lookup(1, b"notes.txt").expect("lookup");
+
+    assert_eq!(attr.size, 10, "the buffered size, not the stored 0");
+    fs.release_file(fh).expect("release");
+}
