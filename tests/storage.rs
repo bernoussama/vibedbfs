@@ -1447,3 +1447,178 @@ fn version_3_database_is_rekeyed_with_contents_intact() {
     );
     remove_db(&path);
 }
+
+#[test]
+fn deleting_the_highest_inode_does_not_reuse_its_number() {
+    let path = disk_db_path("inode-no-reuse");
+    let deleted = {
+        let db = Db::open(&path).expect("open database");
+        db.create_file(1, b"kept", 0o644, 1000, 1000)
+            .expect("create kept");
+        let top = db
+            .create_file(1, b"top", 0o644, 1000, 1000)
+            .expect("create top");
+        db.unlink_file(1, b"top").expect("unlink the highest inode");
+        let next = db
+            .create_file(1, b"next", 0o644, 1000, 1000)
+            .expect("create after the delete");
+        assert!(next.ino > top.ino, "inode {} was reused", top.ino);
+        top.ino
+    };
+
+    let db = Db::open(&path).expect("reopen database");
+    let later = db
+        .create_file(1, b"later", 0o644, 1000, 1000)
+        .expect("create after reopen");
+    assert!(
+        later.ino > deleted,
+        "inode {deleted} was reused after reopen"
+    );
+    drop(db);
+    remove_db(&path);
+}
+
+fn foreign_key_violations(path: &Path) -> usize {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    let mut stmt = conn
+        .prepare("PRAGMA foreign_key_check")
+        .expect("prepare foreign_key_check");
+    stmt.query_map([], |_| Ok(()))
+        .expect("run foreign_key_check")
+        .count()
+}
+
+#[test]
+fn version_4_database_keeps_its_contents_and_stops_reusing_inode_numbers() {
+    let path = disk_db_path("schema-v4-autoincrement");
+    // The version 4 layout: plain INTEGER PRIMARY KEY, one `*_ns` column per time.
+    exec_sql(
+        &path,
+        "CREATE TABLE inodes (
+           ino INTEGER PRIMARY KEY, kind INTEGER NOT NULL, mode INTEGER NOT NULL,
+           uid INTEGER NOT NULL, gid INTEGER NOT NULL, size INTEGER NOT NULL,
+           atime_ns INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL,
+           nlink INTEGER NOT NULL
+         );
+         CREATE TABLE dirents (
+           id INTEGER PRIMARY KEY, parent_ino INTEGER NOT NULL, name BLOB NOT NULL,
+           child_ino INTEGER NOT NULL,
+           FOREIGN KEY (parent_ino) REFERENCES inodes(ino) ON DELETE CASCADE,
+           FOREIGN KEY (child_ino) REFERENCES inodes(ino) ON DELETE CASCADE
+         );
+         CREATE UNIQUE INDEX dirents_name ON dirents(parent_ino, name);
+         CREATE INDEX dirents_child ON dirents(child_ino);
+         CREATE INDEX dirents_scan ON dirents(parent_ino);
+         CREATE TABLE file_chunks (id INTEGER PRIMARY KEY, data BLOB NOT NULL);
+         CREATE TABLE symlink_targets (
+           ino INTEGER PRIMARY KEY, target BLOB NOT NULL,
+           FOREIGN KEY (ino) REFERENCES inodes(ino) ON DELETE CASCADE
+         );
+         INSERT INTO inodes VALUES (1, 2, 493, 1000, 1000, 0, 1, 1, 1, 3);
+         INSERT INTO inodes VALUES (2, 2, 493, 1000, 1000, 0, 1, 1, 1, 2);
+         INSERT INTO inodes VALUES (3, 1, 420, 1000, 1000, 6, 1, 1, 1, 1);
+         INSERT INTO inodes VALUES (4, 3, 511, 1000, 1000, 14, 1, 1, 1, 1);
+         INSERT INTO inodes VALUES (5, 1, 420, 1000, 1000, 65539, 1, 1, 1, 1);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, CAST('docs' AS BLOB), 2);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (2, CAST('notes.txt' AS BLOB), 3);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, CAST('link' AS BLOB), 4);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, CAST('big.bin' AS BLOB), 5);
+         INSERT INTO symlink_targets VALUES (4, CAST('docs/notes.txt' AS BLOB));
+         INSERT INTO file_chunks VALUES ((3 << 24) | 0, CAST('hello!' AS BLOB));
+         INSERT INTO file_chunks VALUES ((5 << 24) | 0, zeroblob(65536));
+         INSERT INTO file_chunks VALUES ((5 << 24) | 1, CAST('abc' AS BLOB));
+         PRAGMA user_version = 4;",
+    );
+
+    {
+        let db = Db::open(&path).expect("upgrade version 4 database");
+        assert_eq!(db.lookup(1, b"docs").expect("docs").ino, 2);
+        assert_eq!(db.lookup(2, b"notes.txt").expect("notes").ino, 3);
+        assert_eq!(db.read_file(3, 0, 6).expect("read notes"), b"hello!");
+        assert_eq!(db.read_symlink(4).expect("symlink"), b"docs/notes.txt");
+        assert_eq!(db.list_dir(1).expect("root").len(), 3);
+        assert_eq!(db.get_inode(1).expect("root").ino, 1);
+        assert_eq!(db.read_file(5, 65_536, 3).expect("big.bin tail"), b"abc");
+        assert_eq!(db.get_inode(5).expect("big.bin").size, 65_539);
+    }
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    assert!(
+        query_string(
+            &path,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inodes'"
+        )
+        .contains("AUTOINCREMENT")
+    );
+    assert_eq!(count_chunks(&path, 3), 1);
+    assert_eq!(count_chunks(&path, 5), 2, "chunks are kept by the rebuild");
+    assert_eq!(foreign_key_violations(&path), 0);
+
+    {
+        let db = Db::open(&path).expect("reopen upgraded database");
+        db.unlink_file(1, b"big.bin")
+            .expect("delete the highest inode, 5");
+        let next = db
+            .create_file(1, b"after-upgrade", 0o644, 1000, 1000)
+            .expect("create after the upgrade");
+        assert!(next.ino > 5, "inode 5 was reused as {}", next.ino);
+    }
+    assert_eq!(count_chunks(&path, 5), 0);
+    remove_db(&path);
+}
+
+#[test]
+fn reopening_a_current_database_does_not_rebuild_inodes() {
+    let path = disk_db_path("schema-v5-noop");
+    drop(Db::open(&path).expect("create database"));
+    // A rebuild of `inodes` would drop this index along with the old table.
+    exec_sql(&path, "CREATE INDEX layout_marker ON inodes(kind);");
+    let sequence = query_i64(
+        &path,
+        "SELECT seq FROM sqlite_sequence WHERE name = 'inodes'",
+    );
+
+    drop(Db::open(&path).expect("reopen current database"));
+    drop(Db::open(&path).expect("reopen again"));
+
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'layout_marker'"
+        ),
+        1,
+        "inodes was not rebuilt"
+    );
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT seq FROM sqlite_sequence WHERE name = 'inodes'"
+        ),
+        sequence
+    );
+    remove_db(&path);
+}
+
+#[test]
+fn inode_layout_is_detected_not_trusted_from_the_version_number() {
+    let path = disk_db_path("schema-v5-layout");
+    drop(Db::open(&path).expect("create database"));
+    // The current layout, but a stamp that claims version 4.
+    exec_sql(
+        &path,
+        "CREATE INDEX layout_marker ON inodes(kind); PRAGMA user_version = 4;",
+    );
+
+    drop(Db::open(&path).expect("open database stamped as version 4"));
+
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'layout_marker'"
+        ),
+        1,
+        "a table already in the current layout is not rebuilt"
+    );
+    remove_db(&path);
+}

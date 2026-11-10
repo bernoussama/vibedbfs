@@ -41,7 +41,9 @@ fn chunk_index_of(key: i64) -> u64 {
 /// - 3: `dirents.id` is a stable per-entry id, used as the readdir cookie
 /// - 4: `file_chunks` keyed by one integer, `(ino << 24) | chunk_index`; one
 ///   `*_ns` column per timestamp
-pub const SCHEMA_VERSION: i64 = 4;
+/// - 5: `inodes.ino` is AUTOINCREMENT, so an inode number is never reused, even
+///   after the highest one is deleted
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub(crate) struct VolumeUsage {
     pub page_size: u64,
@@ -139,7 +141,7 @@ impl Db {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS inodes (
-              ino INTEGER PRIMARY KEY,
+              ino INTEGER PRIMARY KEY AUTOINCREMENT,
               kind INTEGER NOT NULL,
               mode INTEGER NOT NULL,
               uid INTEGER NOT NULL,
@@ -1212,6 +1214,9 @@ fn migrate_steps(conn: &Connection, version: i64) -> Result<(), DbError> {
             rekey_file_chunks(&tx)?;
         }
     }
+    if version < 5 && !inodes_is_autoincrement(&tx)? {
+        autoincrement_inodes(&tx)?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -1285,6 +1290,48 @@ fn rekey_file_chunks(conn: &Connection) -> Result<(), DbError> {
          ALTER TABLE file_chunks_v4 RENAME TO file_chunks;"
     ))?;
     Ok(())
+}
+
+/// Version 5: rebuilds `inodes` with AUTOINCREMENT, so the sequence remembers the
+/// highest number ever used and a deleted number is not handed out again. Every
+/// `ino` is copied unchanged, so the root and all references stay valid. The
+/// sequence starts at the highest number still present. Numbers freed before
+/// this step are not recorded anywhere, which is safe: this runs at mount start,
+/// and the kernel has dropped every inode of the previous mount.
+fn autoincrement_inodes(conn: &Connection) -> Result<(), DbError> {
+    conn.execute_batch(
+        "CREATE TABLE inodes_v5 (
+           ino INTEGER PRIMARY KEY AUTOINCREMENT,
+           kind INTEGER NOT NULL,
+           mode INTEGER NOT NULL,
+           uid INTEGER NOT NULL,
+           gid INTEGER NOT NULL,
+           size INTEGER NOT NULL,
+           atime_ns INTEGER NOT NULL,
+           mtime_ns INTEGER NOT NULL,
+           ctime_ns INTEGER NOT NULL,
+           nlink INTEGER NOT NULL
+         );
+         INSERT INTO inodes_v5
+           (ino, kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink)
+           SELECT ino, kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink
+           FROM inodes;
+         DROP TABLE inodes;
+         ALTER TABLE inodes_v5 RENAME TO inodes;",
+    )?;
+    Ok(())
+}
+
+/// Whether `inodes` already has AUTOINCREMENT. Checks the table's definition,
+/// not the version: `initialize` creates it that way, so a fresh database must
+/// not be rebuilt.
+fn inodes_is_autoincrement(conn: &Connection) -> Result<bool, DbError> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inodes'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(sql.to_ascii_uppercase().contains("AUTOINCREMENT"))
 }
 
 fn ensure_nsec_columns(conn: &Connection) -> Result<(), DbError> {
