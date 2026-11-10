@@ -1,5 +1,9 @@
 # dbfs Optimization: Profiling, Bottlenecks, and Results
 
+> **Note (2026-11-10):** These results predate commit `89da6ec` (`fix(fuse): fdatasync the WAL when fsync flushes`). Before that commit, dbfs `fsync` committed to SQLite and returned without a host sync. The fsync comparisons below (14.2× against passthrough, 7.8× against native) are therefore not durable-write results and should not be cited.
+>
+> The `passthrough_ll` runs here used libfuse's defaults ("without writeback or caching options"): no writeback cache and `cache=auto`, not `-o no_writeback -o cache=never`. Passthrough therefore used the kernel page cache without direct I/O, while dbfs used the page cache and its own write buffer. The comparison is not like-for-like.
+
 Date: 2026-05-03
 
 ## Summary
