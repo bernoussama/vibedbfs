@@ -1,5 +1,6 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -41,7 +42,9 @@ fn chunk_index_of(key: i64) -> u64 {
 /// - 3: `dirents.id` is a stable per-entry id, used as the readdir cookie
 /// - 4: `file_chunks` keyed by one integer, `(ino << 24) | chunk_index`; one
 ///   `*_ns` column per timestamp
-pub const SCHEMA_VERSION: i64 = 4;
+/// - 5: `inodes.ino` is AUTOINCREMENT, so an inode number is never reused, even
+///   after the highest one is deleted
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub(crate) struct VolumeUsage {
     pub page_size: u64,
@@ -55,6 +58,9 @@ pub(crate) struct VolumeUsage {
 /// (`unlink_entry`, `rename_entry`).
 pub struct Db {
     conn: Mutex<Connection>,
+    /// Held as long as the `Db` is alive. Declared after `conn`, so the
+    /// connection closes before the lock is released.
+    _lock: Option<File>,
 }
 
 #[derive(Clone, Copy)]
@@ -66,23 +72,33 @@ enum NewNode<'a> {
 
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let path = path.as_ref();
+        // Before the database file is opened, so a refused process never touches it.
+        let lock = lock_database(path)?;
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "
             PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
+            ",
+        )?;
+        // Before the WAL switch and the table creation in `initialize`, both of
+        // which write to the file.
+        refuse_newer_schema(&conn)?;
+        conn.execute_batch(
+            "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
-            PRAGMA busy_timeout = 5000;
             PRAGMA wal_autocheckpoint = 10000;
             ",
         )?;
-        Self::initialize(conn)
+        Self::initialize(lock, conn)
     }
 
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        Self::initialize(conn)
+        Self::initialize(None, conn)
     }
 
     pub(crate) fn sync_durable(&self) -> Result<(), DbError> {
@@ -128,11 +144,11 @@ impl Db {
             .map_err(Into::into)
     }
 
-    fn initialize(conn: Connection) -> Result<Self, DbError> {
+    fn initialize(lock: Option<File>, conn: Connection) -> Result<Self, DbError> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS inodes (
-              ino INTEGER PRIMARY KEY,
+              ino INTEGER PRIMARY KEY AUTOINCREMENT,
               kind INTEGER NOT NULL,
               mode INTEGER NOT NULL,
               uid INTEGER NOT NULL,
@@ -202,6 +218,7 @@ impl Db {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            _lock: lock,
         })
     }
 
@@ -730,6 +747,15 @@ impl Db {
             return Err(DbError::AlreadyExists);
         }
 
+        // The target is another name for the source inode. POSIX makes this a
+        // no-op: both names stay, and nothing is removed.
+        if existing_target
+            .as_ref()
+            .is_some_and(|target| target.ino == source.ino)
+        {
+            return Ok(None);
+        }
+
         if let Some(target) = &existing_target {
             match (source.kind, target.kind) {
                 (FileKind::RegularFile, FileKind::Directory)
@@ -737,7 +763,7 @@ impl Db {
                 (FileKind::Directory, FileKind::RegularFile)
                 | (FileKind::Directory, FileKind::Symlink) => return Err(DbError::NotDirectory),
                 (FileKind::Directory, FileKind::Directory)
-                    if !self.list_dir(target.ino)?.is_empty() =>
+                    if self.directory_has_entries(target.ino)? =>
                 {
                     return Err(DbError::DirectoryNotEmpty);
                 }
@@ -887,6 +913,15 @@ impl Db {
             ctime: now,
             nlink: nlink as u32,
         })
+    }
+
+    /// Whether directory `ino` has any entry. Stops at the first row, so a large
+    /// directory is not listed just to learn that it is not empty.
+    fn directory_has_entries(&self, ino: u64) -> Result<bool, DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM dirents WHERE parent_ino = ?1)")?
+            .query_row(params![ino as i64], |row| row.get::<_, bool>(0))
+            .map_err(Into::into)
     }
 
     fn is_descendant(&self, ino: u64, possible_ancestor: u64) -> Result<bool, DbError> {
@@ -1062,6 +1097,39 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Takes the lock that keeps a second dbfs off the same database: an exclusive,
+/// non-blocking `flock` on the sibling file `<db>.lock`, held while the returned
+/// file is open. `flock` belongs to the open file description, so closing other
+/// descriptors (SQLite's own) cannot release it. The lock file is never deleted:
+/// a deleted lock file would let the next process lock a different inode.
+/// In-memory databases have no file to share, so they take no lock.
+fn lock_database(path: &Path) -> Result<Option<File>, DbError> {
+    if path.as_os_str().is_empty() || path == Path::new(":memory:") {
+        return Ok(None);
+    }
+    let lock_path = path_with_suffix(path, ".lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            DbError::Sqlite(format!("cannot open {}: {error}", lock_path.display()))
+        })?;
+    // SAFETY: `flock` only uses the descriptor, which `file` keeps open.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == ErrorKind::WouldBlock {
+        return Err(DbError::DatabaseInUse);
+    }
+    Err(DbError::Sqlite(format!(
+        "cannot lock {}: {error}",
+        lock_path.display()
+    )))
+}
+
 fn pragma_query(name: &str) -> Result<String, DbError> {
     match name {
         "busy_timeout" | "foreign_keys" | "journal_mode" | "synchronous" | "user_version" => {
@@ -1121,6 +1189,15 @@ fn add_directory_nlink(
     Ok(())
 }
 
+/// Refuses a database written by a newer dbfs. Only reads `user_version`.
+fn refuse_newer_schema(conn: &Connection) -> Result<(), DbError> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(DbError::UnsupportedSchema(version));
+    }
+    Ok(())
+}
+
 /// Bring an existing database up to `SCHEMA_VERSION`, one step at a time,
 /// in a single transaction. A failure leaves the database at its old version.
 ///
@@ -1129,6 +1206,8 @@ fn add_directory_nlink(
 /// (from `CREATE TABLE IF NOT EXISTS`), and must not be "upgraded" again.
 fn migrate(conn: &Connection) -> Result<(), DbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // `open` refuses newer schemas before writing; this keeps migrate from ever
+    // stamping an older version over one.
     if version > SCHEMA_VERSION {
         return Err(DbError::UnsupportedSchema(version));
     }
@@ -1193,6 +1272,9 @@ fn migrate_steps(conn: &Connection, version: i64) -> Result<(), DbError> {
         if table_has_column(&tx, "file_chunks", "chunk_index")? {
             rekey_file_chunks(&tx)?;
         }
+    }
+    if version < 5 && !inodes_is_autoincrement(&tx)? {
+        autoincrement_inodes(&tx)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -1267,6 +1349,71 @@ fn rekey_file_chunks(conn: &Connection) -> Result<(), DbError> {
          ALTER TABLE file_chunks_v4 RENAME TO file_chunks;"
     ))?;
     Ok(())
+}
+
+/// Version 5: gives `inodes` AUTOINCREMENT, so the sequence remembers the highest
+/// number ever used and a deleted number is not handed out again.
+///
+/// The table is rebuilt from its stored definition with AUTOINCREMENT added after
+/// the primary key, so every other column and constraint is kept as it was, and
+/// so are indexes and triggers on the table. Every `ino` is copied unchanged, so
+/// the root and all references stay valid. The sequence starts at the highest
+/// number still present. Numbers freed before this step are not recorded
+/// anywhere, which is safe: this runs at mount start, and the kernel has dropped
+/// every inode of the previous mount.
+fn autoincrement_inodes(conn: &Connection) -> Result<(), DbError> {
+    let stored: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inodes'",
+        [],
+        |row| row.get(0),
+    )?;
+    let unexpected =
+        || DbError::Sqlite("cannot add AUTOINCREMENT to inodes: unexpected definition".into());
+    // Everything from the column list on; the name is replaced by `inodes_v5`.
+    let columns = &stored[stored.find('(').ok_or_else(unexpected)?..];
+    let key_end = columns
+        .to_ascii_uppercase()
+        .find("PRIMARY KEY")
+        .ok_or_else(unexpected)?
+        + "PRIMARY KEY".len();
+    // If the key cannot take AUTOINCREMENT, SQLite refuses the CREATE and the
+    // whole upgrade rolls back.
+    let definition = format!(
+        "{} AUTOINCREMENT{}",
+        &columns[..key_end],
+        &columns[key_end..]
+    );
+
+    // Indexes and triggers on `inodes` are dropped with the old table; recreate them.
+    let attached: Vec<String> = conn
+        .prepare(
+            "SELECT sql FROM sqlite_master
+             WHERE tbl_name = 'inodes' AND type IN ('index', 'trigger') AND sql IS NOT NULL",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE inodes_v5 {definition};
+         INSERT INTO inodes_v5 SELECT * FROM inodes;
+         DROP TABLE inodes;
+         ALTER TABLE inodes_v5 RENAME TO inodes;"
+    ))?;
+    for sql in attached {
+        conn.execute_batch(&sql)?;
+    }
+    Ok(())
+}
+
+/// Whether `inodes` already has AUTOINCREMENT. Checks the table's definition,
+/// not the version: `initialize` creates it that way, so a fresh database must
+/// not be rebuilt.
+fn inodes_is_autoincrement(conn: &Connection) -> Result<bool, DbError> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inodes'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(sql.to_ascii_uppercase().contains("AUTOINCREMENT"))
 }
 
 fn ensure_nsec_columns(conn: &Connection) -> Result<(), DbError> {
