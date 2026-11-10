@@ -1048,3 +1048,29 @@ fn directory_sync_makes_commits_durable_and_reports_a_failed_sync() {
     );
     remove_db(&path);
 }
+
+#[test]
+fn link_reports_the_buffered_size_and_a_ctime_after_the_write() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write(file.ino, 0, b"0123456789").expect("buffer write");
+    let before_link = fs.getattr(file.ino).expect("attr before link");
+
+    let attr = fs.link(file.ino, 1, b"alias.txt").expect("link");
+
+    assert_eq!(attr.size, 10, "the buffered size, not the stored 0");
+    assert_eq!(attr.nlink, 2);
+    assert!(
+        attr.ctime > before_link.ctime,
+        "the link is a change after the write"
+    );
+    assert_eq!(
+        fs.getattr(file.ino).expect("attr after link").ctime,
+        attr.ctime
+    );
+    fs.release_file(fh).expect("release");
+}

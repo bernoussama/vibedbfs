@@ -341,7 +341,9 @@ impl Shared {
         if !t.inodes.dirty[i].is_empty() {
             let modified = t.inodes.mtime[i].to_system_time();
             attr.mtime = modified;
-            attr.ctime = modified;
+            // The stored ctime can be later than the buffered write, as after a
+            // `link`. Report the later of the two.
+            attr.ctime = attr.ctime.max(modified);
         }
     }
 }
@@ -565,10 +567,13 @@ impl Dbfs {
     }
 
     pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &[u8]) -> Result<FileAttr, i32> {
-        self.db
+        let mut attr = self
+            .db
             .link(ino, new_parent_ino, new_name)
             .map(|inode| file_attr_from_inode(&inode))
-            .map_err(errno_from_db_error)
+            .map_err(errno_from_db_error)?;
+        self.overlay_attr(&mut attr);
+        Ok(attr)
     }
 
     #[allow(clippy::too_many_arguments)]
