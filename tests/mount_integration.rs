@@ -1,3 +1,10 @@
+//! Tests that mount dbfs through FUSE. Each one is `#[ignore]`d and panics unless
+//! `DBFS_RUN_FUSE_TESTS=1` is set and `fusermount3` exists. Run them with:
+//!
+//! ```text
+//! DBFS_RUN_FUSE_TESTS=1 cargo test --test mount_integration -- --ignored
+//! ```
+
 use std::ffi::CString;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::Write;
@@ -12,9 +19,7 @@ use rusqlite::Connection;
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn mounted_filesystem_supports_basic_file_lifecycle_when_enabled() {
-    if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || command_path("fusermount3").is_none() {
-        panic!("FUSE mount tests require DBFS_RUN_FUSE_TESTS=1 and fusermount3");
-    }
+    require_fuse_gate();
 
     let base = temp_path("mount-integration");
     let db_path = base.with_extension("sqlite");
@@ -52,10 +57,9 @@ fn mounted_filesystem_supports_basic_file_lifecycle_when_enabled() {
 }
 
 #[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn utimens_round_trips_nanoseconds_when_enabled() {
-    let Some(mounted) = Mounted::start("utimens-nsec") else {
-        return;
-    };
+    let mounted = Mounted::start("utimens-nsec");
 
     let path = mounted.mountpoint.join("notes.txt");
     fs::write(&path, b"hello").expect("create file through mount");
@@ -75,10 +79,9 @@ fn utimens_round_trips_nanoseconds_when_enabled() {
 }
 
 #[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn statfs_reports_sqlite_blocks_and_inodes_when_enabled() {
-    let Some(mounted) = Mounted::start("statfs") else {
-        return;
-    };
+    let mounted = Mounted::start("statfs");
 
     fs::write(mounted.mountpoint.join("notes.txt"), b"hello").expect("create file through mount");
 
@@ -108,10 +111,9 @@ fn statfs_reports_sqlite_blocks_and_inodes_when_enabled() {
 }
 
 #[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn rename_noreplace_does_not_replace_an_existing_target_when_enabled() {
-    let Some(mounted) = Mounted::start("rename-noreplace") else {
-        return;
-    };
+    let mounted = Mounted::start("rename-noreplace");
 
     let source = mounted.mountpoint.join("source.txt");
     let target = mounted.mountpoint.join("target.txt");
@@ -151,9 +153,6 @@ fn rm_rf_removes_every_entry_of_a_large_directory_when_enabled() {
     // The kernel lists a directory in buffer-sized batches. `rm -rf` deletes
     // each batch before asking for the next, so positional readdir offsets
     // used to skip entries and leave the directory non-empty.
-    if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() {
-        return;
-    }
     let mount = BenchMount::start("rm-rf");
     let tree = mount.mountpoint().join("tree");
     std::fs::create_dir(&tree).expect("mkdir tree");
@@ -413,10 +412,9 @@ fn pragma_u64(conn: &Connection, name: &str) -> u64 {
 }
 
 #[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn close_after_many_small_random_writes_does_not_stall_other_requests_when_enabled() {
-    if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || command_path("fusermount3").is_none() {
-        return;
-    }
+    require_fuse_gate();
 
     const BLOCK: u64 = 4096;
     const BLOCKS: u64 = 65_536;
@@ -478,10 +476,9 @@ fn close_after_many_small_random_writes_does_not_stall_other_requests_when_enabl
 }
 
 #[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn large_write_keeps_daemon_memory_bounded_when_enabled() {
-    if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || command_path("fusermount3").is_none() {
-        return;
-    }
+    require_fuse_gate();
 
     const MIB: u64 = 1 << 20;
     const WRITTEN_MIB: u64 = 512;
@@ -531,6 +528,7 @@ struct Mount {
 
 impl Mount {
     fn start(db_path: PathBuf) -> Self {
+        require_fuse_gate();
         let mountpoint = db_path.with_extension("mnt");
         fs::create_dir(&mountpoint).expect("create mountpoint");
         let child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
@@ -561,9 +559,7 @@ impl Drop for Mount {
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn mounted_sparse_file_past_4gib_reads_marker_at_that_offset() {
-    if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || command_path("fusermount3").is_none() {
-        panic!("FUSE mount tests require DBFS_RUN_FUSE_TESTS=1 and fusermount3");
-    }
+    require_fuse_gate();
 
     const FOUR_GIB: u64 = 1 << 32;
     let marker_at = FOUR_GIB + 64;
@@ -648,12 +644,7 @@ struct BenchMount {
 
 impl BenchMount {
     fn start(name: &str) -> Self {
-        if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none()
-            || command_path("fusermount3").is_none()
-        {
-            panic!("FUSE mount tests require DBFS_RUN_FUSE_TESTS=1 and fusermount3");
-        }
-
+        require_fuse_gate();
         let base = bench_dir(name);
         let mountpoint = base.join("mnt");
         fs::create_dir(&mountpoint).expect("create mountpoint");
@@ -696,6 +687,14 @@ fn bench_dir(name: &str) -> PathBuf {
         .join(format!("{name}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).expect("create disk-backed test directory");
     dir
+}
+
+/// Panics unless the FUSE gate is open. The mount tests are `#[ignore]`d, so this
+/// runs only under `-- --ignored`, and a missing prerequisite fails instead of passing.
+fn require_fuse_gate() {
+    if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || command_path("fusermount3").is_none() {
+        panic!("FUSE mount tests require DBFS_RUN_FUSE_TESTS=1 and fusermount3");
+    }
 }
 
 fn command_path(command: &str) -> Option<PathBuf> {
@@ -793,13 +792,8 @@ struct Mounted {
 }
 
 impl Mounted {
-    fn start(name: &str) -> Option<Self> {
-        if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none()
-            || command_path("fusermount3").is_none()
-        {
-            return None;
-        }
-
+    fn start(name: &str) -> Self {
+        require_fuse_gate();
         let base = temp_path(name);
         let db_path = base.with_extension("sqlite");
         let mountpoint = base.with_extension("mnt");
@@ -816,7 +810,7 @@ impl Mounted {
             child,
         };
         wait_for_mount(&mounted.mountpoint);
-        Some(mounted)
+        mounted
     }
 }
 

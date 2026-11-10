@@ -539,7 +539,7 @@ test_s6_stop() {
   code="$(docker inspect -f '{{.State.ExitCode}}' "$ctr")"
   echo "$code" >"$dir/exit-code"
   if [[ "$code" == 137 ]]; then
-    skip "needs C1 (SIGTERM handler): docker stop ended in SIGKILL (exit 137) after ${ms} ms with ${S6_MIB} MiB unflushed"
+    die "dbfs did not handle SIGTERM (C1 regression, see src/run.rs): docker stop ended in SIGKILL (exit 137) after ${ms} ms with ${S6_MIB} MiB unflushed"
   fi
   [[ "$code" == 0 ]] || die "container exit code $code after ${ms} ms, want 0"
   (( ms < S6_STOP_LIMIT_MS )) || die "docker stop took ${ms} ms, limit ${S6_STOP_LIMIT_MS} ms"
@@ -560,7 +560,7 @@ test_s6_restart() {
   if [[ "$code" == 137 ]]; then
     local same=no
     [[ "$got" == "$want" ]] && same=yes
-    skip "needs C1 (SIGTERM handler): after SIGKILL big.bin has $size of $(( S6_MIB * 1048576 )) bytes, sha256 matches: $same"
+    die "dbfs did not handle SIGTERM (C1 regression, see src/run.rs): the stop row ended in SIGKILL, so after restart big.bin has $size of $(( S6_MIB * 1048576 )) bytes, sha256 matches: $same"
   fi
   [[ "$got" == "$want" ]] || die "big.bin sha256 ${got:-missing} differs from $want (size $size)"
   note "${S6_MIB} MiB restored byte-for-byte after restart on the same volume"
@@ -603,7 +603,7 @@ preflight() {
   [[ -c /dev/fuse ]] || fatal "/dev/fuse is missing"
   if [[ ! -x "$BIN" ]]; then
     echo "building $BIN"
-    (cd "$ROOT" && cargo build --release) >"$LOGS/cargo-build.log" 2>&1 \
+    (cd "$ROOT" && cargo build --locked --release) >"$LOGS/cargo-build.log" 2>&1 \
       || fatal "cargo build --release failed; see $LOGS/cargo-build.log"
   fi
 }
