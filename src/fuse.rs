@@ -11,7 +11,7 @@ use fuser::{
     Request, TimeOrNow,
 };
 
-use crate::db::{CHUNK_SIZE, ChunkSpan, MAX_FILE_SIZE};
+use crate::db::{CHUNK_SIZE, ChunkPiece, ChunkSpan, MAX_FILE_SIZE};
 use crate::open_table::{OpenTable, Slot};
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
@@ -201,6 +201,10 @@ impl Shared {
         }
     }
 
+    /// Buffers `data` at `offset` and returns how many bytes it applied. If a chunk
+    /// fails after earlier chunks were applied, those stay buffered and visible, so
+    /// the write is reported as short: the caller reissues the rest and then gets the
+    /// error. Only a write that applies nothing returns the error itself.
     fn write_slot(
         &self,
         t: &mut OpenTable,
@@ -223,38 +227,66 @@ impl Shared {
         if span.end > MAX_FILE_SIZE {
             return Err(libc::EFBIG);
         }
+        // Set before the first chunk: a flush inside this write stores the new mtime.
+        let previous_mtime = t.inodes.mtime[i];
         t.inodes.mtime[i] = Timestamp::from_system_time(SystemTime::now());
 
-        let ino = t.inodes.ino[i];
+        let mut applied = 0;
         for chunk_index in span.first..=span.last {
             let piece = span.piece(chunk_index);
-            let a = match t.inodes.dirty[i].find(chunk_index) {
-                Ok(position) => t.inodes.dirty[i].slot_at(position),
-                Err(_) => {
-                    // May flush this inode too, so look the position up again after.
-                    let a = self.alloc_chunk(t, slot)?;
-                    if !piece.is_full_chunk() {
-                        let buffer = t.arena.buffer_mut(a);
-                        match self.db.read_chunk_into(ino, chunk_index, buffer) {
-                            Ok(len) => t.arena.set_len(a, len),
-                            Err(error) => {
-                                t.arena.release(a);
-                                return Err(errno_from_db_error(error));
-                            }
-                        }
-                    }
-                    let position = t.inodes.dirty[i].find(chunk_index).unwrap_err();
-                    t.inodes.dirty[i].insert(position, chunk_index, a);
-                    a
+            if let Err(errno) =
+                self.write_piece(t, slot, chunk_index, &piece, &data[piece.buf.clone()])
+            {
+                if applied == 0 {
+                    // Nothing changed, so the modification time stays as it was.
+                    t.inodes.mtime[i] = previous_mtime;
+                    return Err(errno);
                 }
-            };
-            t.arena.write(a, piece.chunk.clone(), &data[piece.buf]);
+                break;
+            }
+            applied = piece.buf.end;
             // Grow the size chunk by chunk, so an eviction in the middle of this
             // write stores a size that covers every chunk it stores.
             let chunk_end = chunk_index * CHUNK_SIZE as u64 + piece.chunk.end as u64;
             t.inodes.size[i] = t.inodes.size[i].max(chunk_end);
         }
-        Ok(data.len() as u32)
+        Ok(applied as u32)
+    }
+
+    /// Copies `bytes` into the part of chunk `chunk_index` that `piece` covers,
+    /// buffering the chunk first if it has none. On error nothing has changed.
+    fn write_piece(
+        &self,
+        t: &mut OpenTable,
+        slot: Slot,
+        chunk_index: u64,
+        piece: &ChunkPiece,
+        bytes: &[u8],
+    ) -> Result<(), i32> {
+        let i = slot as usize;
+        let a = match t.inodes.dirty[i].find(chunk_index) {
+            Ok(position) => t.inodes.dirty[i].slot_at(position),
+            Err(_) => {
+                // May flush this inode too, so look the position up again after.
+                let a = self.alloc_chunk(t, slot)?;
+                if !piece.is_full_chunk() {
+                    let ino = t.inodes.ino[i];
+                    let buffer = t.arena.buffer_mut(a);
+                    match self.db.read_chunk_into(ino, chunk_index, buffer) {
+                        Ok(len) => t.arena.set_len(a, len),
+                        Err(error) => {
+                            t.arena.release(a);
+                            return Err(errno_from_db_error(error));
+                        }
+                    }
+                }
+                let position = t.inodes.dirty[i].find(chunk_index).unwrap_err();
+                t.inodes.dirty[i].insert(position, chunk_index, a);
+                a
+            }
+        };
+        t.arena.write(a, piece.chunk.clone(), bytes);
+        Ok(())
     }
 
     /// Drops one handle. The last handle of an inode unlinked while open deletes
@@ -309,7 +341,9 @@ impl Shared {
         if !t.inodes.dirty[i].is_empty() {
             let modified = t.inodes.mtime[i].to_system_time();
             attr.mtime = modified;
-            attr.ctime = modified;
+            // The stored ctime can be later than the buffered write, as after a
+            // `link`. Report the later of the two.
+            attr.ctime = attr.ctime.max(modified);
         }
     }
 }
@@ -383,6 +417,14 @@ impl Dbfs {
     /// after a failure and returns the first error; a failed buffer stays dirty.
     pub fn flush_all(&self) -> Result<(), i32> {
         self.shared.flush_all()
+    }
+
+    /// Makes committed directory changes durable for `fsyncdir`. Directories hold
+    /// no buffered data and every change is a database commit, so syncing the WAL
+    /// is enough. The handle is not used: `opendir` returns 0 and nothing is kept
+    /// per directory.
+    pub fn sync_dir(&self) -> Result<(), i32> {
+        self.db.sync_durable().map_err(errno_from_db_error)
     }
 
     /// A handle for the shutdown path in `run.rs`. It keeps working after this
@@ -525,10 +567,13 @@ impl Dbfs {
     }
 
     pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &[u8]) -> Result<FileAttr, i32> {
-        self.db
+        let mut attr = self
+            .db
             .link(ino, new_parent_ino, new_name)
             .map(|inode| file_attr_from_inode(&inode))
-            .map_err(errno_from_db_error)
+            .map_err(errno_from_db_error)?;
+        self.overlay_attr(&mut attr);
+        Ok(attr)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1079,6 +1124,20 @@ impl Filesystem for Dbfs {
         }
     }
 
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.sync_dir() {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
     fn read(
         &mut self,
         _req: &Request<'_>,
@@ -1532,5 +1591,65 @@ mod tests {
             first,
             "the earlier buffered data is intact"
         );
+    }
+
+    #[test]
+    fn a_write_that_fails_part_way_reports_the_bytes_already_applied() {
+        // Offset 0 starts on a chunk boundary; offset 100 starts with a partial chunk.
+        for offset in [0u64, 100] {
+            let db = Db::open_in_memory().expect("open in-memory database");
+            let file = db
+                .create_file(1, b"partial.bin", 0o644, 1, 1)
+                .expect("create file");
+            db.cap_page_count_at_current()
+                .expect("cap sqlite page count");
+            // Room for one chunk. The second chunk needs a flush of the first, which fails.
+            let fs = Dbfs::with_write_buffer(db, CHUNK_SIZE);
+            let fh = fs.open(file.ino).expect("open");
+            let data = vec![7u8; 2 * CHUNK_SIZE];
+
+            let written = fs
+                .write_fh(fh, offset, &data)
+                .expect("the applied chunk is reported as a short write");
+
+            let applied = CHUNK_SIZE - offset as usize;
+            assert_eq!(written as usize, applied, "offset {offset}");
+            assert_eq!(
+                fs.getattr(file.ino).expect("attr").size,
+                offset + written as u64,
+                "offset {offset}: size covers exactly the reported bytes"
+            );
+            assert_eq!(
+                fs.read_fh(fh, offset, data.len() as u32).expect("read"),
+                &data[..applied],
+                "offset {offset}: the reported bytes are visible"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_that_applies_nothing_leaves_size_and_mtime_alone() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"full.bin", 0o644, 1, 1)
+            .expect("create file");
+        db.cap_page_count_at_current()
+            .expect("cap sqlite page count");
+        let fs = Dbfs::with_write_buffer(db, CHUNK_SIZE);
+        let fh = fs.open(file.ino).expect("open");
+        // A whole chunk, so flushing it needs pages the capped database does not have.
+        fs.write_fh(fh, 0, &vec![5u8; CHUNK_SIZE])
+            .expect("fills the budget");
+        let before = fs.getattr(file.ino).expect("attr before");
+
+        // The next chunk needs a flush of the first, which fails: nothing is applied.
+        assert_eq!(
+            fs.write_fh(fh, CHUNK_SIZE as u64, b"more"),
+            Err(libc::ENOSPC)
+        );
+
+        let after = fs.getattr(file.ino).expect("attr after");
+        assert_eq!(after.size, before.size);
+        assert_eq!(after.mtime, before.mtime, "a failed write keeps the mtime");
     }
 }

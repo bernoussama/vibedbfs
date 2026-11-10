@@ -1007,3 +1007,86 @@ fn setattr_after_a_buffered_write_reports_and_keeps_both() {
     );
     assert_eq!(fs.read(file.ino, 0, 16).expect("read"), b"hello\n");
 }
+
+#[test]
+fn directory_sync_is_ok_on_an_in_memory_database() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let fs = Dbfs::new(db);
+
+    assert_eq!(fs.sync_dir(), Ok(()), "there is no file to sync");
+}
+
+#[test]
+fn directory_sync_makes_commits_durable_and_reports_a_failed_sync() {
+    let path = disk_db_path("dir-sync");
+    let db = Db::open(&path).expect("open file-backed database");
+    db.create_dir(1, b"docs", 0o755, 1000, 1000)
+        .expect("create directory");
+    let fs = Dbfs::new(db);
+    assert_eq!(fs.sync_dir(), Ok(()), "a file database syncs");
+
+    // Hide the database and its WAL, so the durable sync can open neither file.
+    let wal = path.with_extension("sqlite-wal");
+    let hidden = path.with_extension("hidden");
+    let hidden_wal = path.with_extension("hidden-wal");
+    let had_wal = wal.exists();
+    std::fs::rename(&path, &hidden).expect("hide database");
+    if had_wal {
+        std::fs::rename(&wal, &hidden_wal).expect("hide wal");
+    }
+    let hidden_result = fs.sync_dir();
+    std::fs::rename(&hidden, &path).expect("restore database");
+    if had_wal {
+        std::fs::rename(&hidden_wal, &wal).expect("restore wal");
+    }
+
+    assert_eq!(hidden_result, Err(libc::EIO), "the failed sync is reported");
+    assert_eq!(
+        fs.sync_dir(),
+        Ok(()),
+        "syncing works once the files are back"
+    );
+    remove_db(&path);
+}
+
+#[test]
+fn link_reports_the_buffered_size_and_a_ctime_after_the_write() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write(file.ino, 0, b"0123456789").expect("buffer write");
+    let before_link = fs.getattr(file.ino).expect("attr before link");
+
+    let attr = fs.link(file.ino, 1, b"alias.txt").expect("link");
+
+    assert_eq!(attr.size, 10, "the buffered size, not the stored 0");
+    assert_eq!(attr.nlink, 2);
+    assert!(
+        attr.ctime > before_link.ctime,
+        "the link is a change after the write"
+    );
+    assert_eq!(
+        fs.getattr(file.ino).expect("attr after link").ctime,
+        attr.ctime
+    );
+    fs.release_file(fh).expect("release");
+}
+
+#[test]
+fn lookup_reports_the_buffered_size_of_an_open_file() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write_fh(fh, 0, b"0123456789").expect("buffer write");
+
+    let attr = fs.lookup(1, b"notes.txt").expect("lookup");
+
+    assert_eq!(attr.size, 10, "the buffered size, not the stored 0");
+    fs.release_file(fh).expect("release");
+}
