@@ -205,13 +205,14 @@ fn an_idle_database_resets_its_wal() {
     // Past the 4 MiB passive threshold that a cap of 8 MiB gives, so the thread
     // checkpoints while the writes are still going.
     write_stream(&db, &db_path, b"burst.bin", 6 * MIB / CHUNK as u64);
-    let before = wal_len(&db_path);
-    assert!(
-        before > 4 * MIB,
-        "the burst left only {before} bytes of WAL"
-    );
+    let burst = wal_len(&db_path);
+    assert!(burst > 4 * MIB, "the burst left only {burst} bytes of WAL");
 
+    // The burst's last operations sit in an open batch until the commit timer
+    // commits it, up to 5 ms later. Those commits grow the WAL, so the size is read
+    // after the idle wait, once the batch is committed and the WAL is reset.
     thread::sleep(IDLE_WAIT);
+    let before = wal_len(&db_path);
     // A reset makes the next write start at the top of the WAL, so the file does not
     // grow. Without one, the write would append to the WAL and the file would grow.
     let note = db
