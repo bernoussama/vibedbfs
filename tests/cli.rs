@@ -11,7 +11,9 @@ fn parse_mount(extra_args: &[&str]) -> MountConfig {
     argv.extend_from_slice(extra_args);
     argv.extend(["dbfs.sqlite", "mnt"]);
     let cli = Cli::try_parse_from(argv).expect("parse mount command");
-    let Command::Mount { config, .. } = cli.command;
+    let Command::Mount { config, .. } = cli.command else {
+        panic!("expected the mount command");
+    };
     config
 }
 
@@ -451,4 +453,44 @@ fn rejects_wal_cap_below_one_chunk() {
 fn sync_metadata_is_off_unless_requested() {
     assert!(!parse_mount(&[]).sync_metadata);
     assert!(parse_mount(&["--sync-metadata"]).sync_metadata);
+}
+
+#[test]
+fn parses_migrate_with_a_page_size_and_suffixes() {
+    for (text, bytes) in [("4096", 4096), ("4K", 4096), ("16K", 16384), ("64K", 65536)] {
+        let cli = Cli::try_parse_from(["dbfs", "migrate", "--page-size", text, "dbfs.sqlite"])
+            .expect("parse migrate command");
+        let Command::Migrate {
+            database,
+            page_size,
+        } = cli.command
+        else {
+            panic!("expected the migrate command");
+        };
+        assert_eq!(database, PathBuf::from("dbfs.sqlite"));
+        assert_eq!(page_size, bytes, "{text}");
+    }
+}
+
+#[test]
+fn migrate_refuses_a_page_size_sqlite_does_not_take() {
+    for text in ["3000", "256", "128K", "0"] {
+        let error = Cli::try_parse_from(["dbfs", "migrate", "--page-size", text, "dbfs.sqlite"])
+            .expect_err("a page size SQLite does not take should be refused");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn migrate_requires_a_page_size() {
+    let error = Cli::try_parse_from(["dbfs", "migrate", "dbfs.sqlite"])
+        .expect_err("migrate without --page-size should be refused");
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
 }

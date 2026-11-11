@@ -10,6 +10,7 @@ use fuser::{MountOption, Session, SessionUnmounter};
 
 use crate::fuse::DEFAULT_WRITE_BUFFER;
 use crate::fuse::ShutdownHandle;
+use crate::migrate::{self, MigrateError};
 use crate::stats;
 use crate::{Cli, Command, Db, DbError, Dbfs, MountConfig, OpenOptions};
 
@@ -28,7 +29,10 @@ pub fn run(cli: Cli) -> Result<(), RunError> {
     // Blocked before the database opens, because its checkpoint thread starts there
     // and inherits this mask. Only the signal waiter in `mount_dbfs` may take these
     // signals: a thread that did would apply their default action and end the process.
-    block_shutdown_signals().map_err(RunError::Session)?;
+    // A migration has no signal waiter, so Ctrl-C must still end it.
+    if matches!(cli.command, Command::Mount { .. }) {
+        block_shutdown_signals().map_err(RunError::Session)?;
+    }
     run_with_mounter(cli, mount_dbfs)
 }
 
@@ -55,6 +59,21 @@ pub fn run_with_mounter(
                 &mountpoint,
                 &options,
             )
+        }
+        Command::Migrate {
+            database,
+            page_size,
+        } => {
+            let before = migrate::migrate_page_size(&database, page_size)?;
+            if before == page_size {
+                println!("{}: already has {page_size}-byte pages", database.display());
+            } else {
+                println!(
+                    "{}: rewritten from {before}-byte to {page_size}-byte pages",
+                    database.display()
+                );
+            }
+            Ok(())
         }
     }
 }
@@ -340,6 +359,8 @@ pub enum RunError {
     /// Dirty data could not be written to the database during shutdown.
     ShutdownFlush(i32),
     MountOptions(String),
+    /// `dbfs migrate` failed. The database is unchanged, or fully rewritten.
+    Migrate(MigrateError),
 }
 
 impl fmt::Display for RunError {
@@ -356,6 +377,7 @@ impl fmt::Display for RunError {
             // fusermount3 output ends with a newline; don't print a blank line.
             Self::Mount(error) => write!(f, "mount error: {}", error.to_string().trim_end()),
             Self::MountOptions(message) => write!(f, "invalid mount options: {message}"),
+            Self::Migrate(error) => write!(f, "{error}"),
             Self::Session(error) => write!(f, "filesystem session error: {error}"),
             Self::ShutdownFlush(errno) => write!(
                 f,
@@ -367,6 +389,12 @@ impl fmt::Display for RunError {
 }
 
 impl std::error::Error for RunError {}
+
+impl From<MigrateError> for RunError {
+    fn from(error: MigrateError) -> Self {
+        Self::Migrate(error)
+    }
+}
 
 impl From<DbError> for RunError {
     fn from(error: DbError) -> Self {

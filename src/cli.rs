@@ -21,6 +21,16 @@ pub enum Command {
         #[command(flatten)]
         config: MountConfig,
     },
+    /// Rewrite a database with another SQLite page size. A database that is mounted,
+    /// or open in another dbfs, is refused. The old file is replaced only after the
+    /// copy is checked.
+    Migrate {
+        /// SQLite database file to rewrite.
+        database: PathBuf,
+        /// Page size of the rewritten file: a power of two from 512 bytes to 64K.
+        #[arg(long, value_name = "SIZE", value_parser = parse_page_size)]
+        page_size: u32,
+    },
 }
 
 /// Opt-in mount options. With no flags, the mount is accessible only to the
@@ -124,6 +134,17 @@ fn parse_size(text: &str) -> Result<usize, String> {
         return Err(format!("`{text}` is below the 64K minimum (one chunk)"));
     }
     Ok(bytes)
+}
+
+/// Parses a SQLite page size: `N`, `NK` or `NM` bytes, a power of two from 512 to 64K.
+fn parse_page_size(text: &str) -> Result<u32, String> {
+    let bytes = parse_bytes(text)?;
+    u32::try_from(bytes)
+        .ok()
+        .filter(|&size| crate::migrate::is_valid_page_size(size))
+        .ok_or_else(|| {
+            format!("`{text}` is not a SQLite page size: a power of two from 512 to 64K")
+        })
 }
 
 /// Parses `N`, `NK`, `NM` or `NG` (powers of 1024) with no minimum, so `0` is valid.

@@ -1446,7 +1446,7 @@ fn sync_database_file(db_path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
@@ -1458,7 +1458,7 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// descriptors (SQLite's own) cannot release it. The lock file is never deleted:
 /// a deleted lock file would let the next process lock a different inode.
 /// In-memory databases have no file to share, so they take no lock.
-fn lock_database(path: &Path) -> Result<Option<File>, DbError> {
+pub(crate) fn lock_database(path: &Path) -> Result<Option<File>, DbError> {
     if path.as_os_str().is_empty() || path == Path::new(":memory:") {
         return Ok(None);
     }
@@ -1551,7 +1551,7 @@ fn add_directory_nlink(conn: &Connection, ino: u64, delta: i64) -> Result<(), Db
 }
 
 /// Refuses a database written by a newer dbfs. Only reads `user_version`.
-fn refuse_newer_schema(conn: &Connection) -> Result<(), DbError> {
+pub(crate) fn refuse_newer_schema(conn: &Connection) -> Result<(), DbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(DbError::UnsupportedSchema(version));

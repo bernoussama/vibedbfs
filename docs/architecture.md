@@ -75,7 +75,7 @@
 ```
  src/
  ├── main.rs          Entry point: Cli::parse() → run()
- ├── cli.rs           Cli, Command::Mount { database, mountpoint, MountConfig }
+ ├── cli.rs           Cli, Command::Mount { database, mountpoint, MountConfig }, Command::Migrate
  ├── run.rs           run() → Db::open() → Dbfs::with_write_buffer() → fuser::Session
  │                    on a thread; main thread waits for SIGTERM/SIGINT/SIGHUP or
  │                    session end
@@ -85,6 +85,7 @@
  ├── blocks.rs        4 KiB block masks of buffered chunks, merge of dirty blocks into a row
  ├── stats.rs         Opt-in counters (--stats), printed as one JSON line at exit
  ├── db.rs            Db: SQLite storage layer, all SQL, chunk I/O, migrations
+ ├── migrate.rs       dbfs migrate: copy with another page size, check, rename over the original
  ├── checkpoint.rs    WAL checkpoints: commit hook, background thread, reset, --wal-cap
 ├── batch.rs         Metadata batch: the open transaction, commit points, fail-stop, commit timer
  └── model.rs         FileKind, Inode, DirEntry, MetadataUpdate, Timestamp, DbError
@@ -141,6 +142,16 @@ before the WAL switch and before `initialize`. SQLite ignores `page_size` on a
 non-empty file, so an existing database keeps its page size. `statfs` reports the
 page size as `f_bsize`. The 4 KiB dirty-block masks of the write buffer (`blocks.rs`)
 do not depend on the SQLite page size.
+
+**Changing the page size (`migrate.rs`).** `dbfs migrate --page-size N` takes the
+database lock, so a mounted database is refused. It checks the free space against
+the database plus its WAL, then checkpoints with `TRUNCATE`. It runs `VACUUM INTO`
+on a connection with `PRAGMA page_size` set, into `<DATABASE>.migrate`. The copy is
+then checked for page size, `user_version` and `quick_check`, and synced. The
+original's `-wal` and `-shm` are removed, the copy is renamed over the original, and
+the directory is synced. Nothing before the rename changes the original, so a
+failure at any earlier point removes the copy and leaves the database as it was. A
+crash leaves the copy, which the next run removes first.
 
 ## Write Data Flow
 
