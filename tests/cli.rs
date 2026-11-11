@@ -376,3 +376,25 @@ fn kernel_cache_is_off_unless_requested() {
     assert!(!parse_mount(&[]).kernel_cache);
     assert!(parse_mount(&["--kernel-cache"]).kernel_cache);
 }
+
+#[test]
+fn mmap_size_accepts_zero_and_the_write_buffer_suffixes() {
+    assert_eq!(parse_mount(&[]).mmap_size, None);
+    assert_eq!(parse_mount(&["--mmap-size", "0"]).mmap_size, Some(0));
+    assert_eq!(
+        parse_mount(&["--mmap-size", "512M"]).mmap_size,
+        Some(512 << 20)
+    );
+    assert_eq!(parse_mount(&["--mmap-size", "1G"]).mmap_size, Some(1 << 30));
+}
+
+#[test]
+fn mmap_size_rejects_bad_sizes() {
+    for bad in ["", "2X", "M", "-1", "99999999999999999999G"] {
+        let argv = ["dbfs", "mount", "--mmap-size", bad, "dbfs.sqlite", "mnt"];
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "`{bad}` should be rejected"
+        );
+    }
+}

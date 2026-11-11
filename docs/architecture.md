@@ -231,6 +231,12 @@ Step 2 runs on the signal path, not only in `destroy`, because a process that st
  ┌──────────────────────────────────────────────────────────┐
  │  Db::read_into(ino, offset, out)                        │
  │                                                         │
+ │  Inside one chunk, not the whole of it (4 KiB read):    │
+ │    blob_open(file_chunks.data, key(ino, chunk))         │
+ │    read_at_exact(out, offset in chunk, len)             │
+ │    only those bytes are read; no row (hole): zeros      │
+ │                                                         │
+ │  Otherwise (several chunks, or a whole chunk):          │
  │  SELECT id, data FROM file_chunks                       │
  │    WHERE id BETWEEN key(ino, first) AND key(ino, last)  │
  │    ORDER BY id                  one range statement     │
@@ -431,8 +437,8 @@ call reaches FUSE, so user space should not normally see it.
 | Buffered writes | One `ChunkArena` for all inodes, grown lazily to `--write-buffer` and reused, so steady-state writes do not allocate. A full arena flushes the inode with the most dirty chunks. |
 | Dirty chunk lookup | `DirtyIdx` is sorted by chunk index; sequential writes hit the last entry before any binary search. |
 | Flush | `replace_chunks` upserts borrowed arena bytes by integer key in one transaction, with no SELECT. |
-| Read | One range statement over the chunk keys; each blob is borrowed and copied straight into the reply buffer. |
+| Read | A read inside one chunk reads only its bytes, through the chunk's blob. Other reads use one range statement over the chunk keys; each blob is borrowed and copied straight into the reply buffer. |
 | Chunk table | `file_chunks` is a rowid table keyed `(ino << 24) \| chunk_index`: one B-tree, no separate index, and a file is one contiguous key range. |
 | Unlink | The resolved inode is passed to `unlink_entry` (no second lookup); an unlinked closed file's dirty data is dropped, not flushed. |
 | Readdir | Keyset scan `id > cookie` on `dirents_scan`; names are borrowed from SQLite into the reply. |
-| SQLite | WAL mode, `wal_autocheckpoint = 10000`, every statement through `prepare_cached`. |
+| SQLite | WAL mode, `wal_autocheckpoint = 10000`, `mmap_size` 2 GiB by default (`--mmap-size`; with the map an I/O error can raise SIGBUS, see README), every statement through `prepare_cached`. |

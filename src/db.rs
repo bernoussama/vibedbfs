@@ -11,6 +11,14 @@ use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
 
 pub(crate) const CHUNK_SIZE: usize = 65_536;
 
+/// `PRAGMA mmap_size` when none is given: a 2 GiB map of the database file on
+/// 64-bit targets. 32-bit targets get none, since a large map competes for their
+/// small address space.
+#[cfg(target_pointer_width = "64")]
+const DEFAULT_MMAP_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+#[cfg(not(target_pointer_width = "64"))]
+const DEFAULT_MMAP_SIZE: u64 = 0;
+
 /// Chunk rows are keyed by `(ino << CHUNK_BITS) | chunk_index`.
 const CHUNK_BITS: u32 = 24;
 const MAX_CHUNKS: u64 = 1 << CHUNK_BITS;
@@ -92,7 +100,15 @@ impl Db {
             PRAGMA wal_autocheckpoint = 10000;
             ",
         )?;
+        apply_mmap_size(&conn, DEFAULT_MMAP_SIZE)?;
         Self::initialize(lock, conn)
+    }
+
+    /// Sets `PRAGMA mmap_size`, the most of the database file that SQLite maps
+    /// into memory, and returns the size in force. SQLite caps the request at its
+    /// compiled-in maximum, so the result can be smaller. `0` turns the map off.
+    pub fn set_mmap_size(&self, bytes: u64) -> Result<u64, DbError> {
+        apply_mmap_size(&self.conn.lock().unwrap(), bytes)
     }
 
     pub fn open_in_memory() -> Result<Self, DbError> {
@@ -453,10 +469,13 @@ impl Db {
     }
 
     /// Copies the stored bytes of `ino` at `offset..offset + out.len()` into
-    /// `out`, with one range query. Blobs are borrowed from SQLite, not copied
-    /// into a `Vec` first. Holes (missing chunks, or short trailing chunks) are
-    /// left as they are, so the caller passes a zeroed buffer. Does not check
-    /// the inode kind or size.
+    /// `out`. Holes (missing chunks, or short trailing chunks) are left as they
+    /// are, so the caller passes a zeroed buffer. Does not check the inode kind
+    /// or size.
+    ///
+    /// A read that covers part of one chunk reads only those bytes, through the
+    /// chunk's blob (see [`read_chunk_part`]). Other reads use one range query;
+    /// blobs are borrowed from SQLite, not copied into a `Vec` first.
     pub(crate) fn read_into(&self, ino: u64, offset: u64, out: &mut [u8]) -> Result<(), DbError> {
         let Some(span) = ChunkSpan::new(offset, out.len()) else {
             return Ok(());
@@ -464,8 +483,11 @@ impl Db {
         if span.first >= MAX_CHUNKS {
             return Ok(());
         }
-        let last = span.last.min(MAX_CHUNKS - 1);
         let conn = self.conn.lock().unwrap();
+        if span.first == span.last && !span.piece(span.first).is_full_chunk() {
+            return read_chunk_part(&conn, ino, span, out);
+        }
+        let last = span.last.min(MAX_CHUNKS - 1);
         let mut stmt = conn.prepare_cached(
             "SELECT id, data FROM file_chunks WHERE id BETWEEN ?1 AND ?2 ORDER BY id",
         )?;
@@ -1019,6 +1041,43 @@ impl ChunkSpan {
     }
 }
 
+/// Copies the bytes that `span` asks for from one chunk into `out`, reading
+/// them through the chunk's blob. The span must lie within one chunk and not
+/// cover all of it. Only the requested bytes are read, so SQLite does not load
+/// the rest of the row's overflow pages. A missing row is a hole: `out` keeps
+/// its zeros. Bytes past the end of a short blob are holes too.
+fn read_chunk_part(
+    conn: &Connection,
+    ino: u64,
+    span: ChunkSpan,
+    out: &mut [u8],
+) -> Result<(), DbError> {
+    let piece = span.piece(span.first);
+    let blob = match conn.blob_open(
+        "main",
+        "file_chunks",
+        "data",
+        chunk_key(ino, span.first),
+        true,
+    ) {
+        Ok(blob) => blob,
+        Err(error) if is_missing_row(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let avail = blob.len().min(piece.chunk.end);
+    if avail > piece.chunk.start {
+        let len = avail - piece.chunk.start;
+        let dst = &mut out[piece.buf.start..piece.buf.start + len];
+        blob.read_at_exact(dst, piece.chunk.start)?;
+    }
+    Ok(())
+}
+
+/// `blob_open` reports a missing row as a generic SQLite error, "no such rowid: N".
+fn is_missing_row(error: &SqlError) -> bool {
+    matches!(error, SqlError::SqliteFailure(_, Some(message)) if message.starts_with("no such rowid"))
+}
+
 /// Removes the inode behind a deleted entry: deletes directories and inodes
 /// whose last name went away, unless `is_open`, which keeps them with
 /// `nlink = 0`; otherwise drops one link.
@@ -1132,11 +1191,18 @@ fn lock_database(path: &Path) -> Result<Option<File>, DbError> {
 
 fn pragma_query(name: &str) -> Result<String, DbError> {
     match name {
-        "busy_timeout" | "foreign_keys" | "journal_mode" | "synchronous" | "user_version" => {
-            Ok(format!("PRAGMA {name}"))
-        }
+        "busy_timeout" | "foreign_keys" | "journal_mode" | "mmap_size" | "synchronous"
+        | "user_version" => Ok(format!("PRAGMA {name}")),
         _ => Err(DbError::InvalidInput),
     }
+}
+
+/// Sets `PRAGMA mmap_size` on `conn` and reads back the size SQLite applied.
+fn apply_mmap_size(conn: &Connection, bytes: u64) -> Result<u64, DbError> {
+    let requested = i64::try_from(bytes).map_err(|_| DbError::InvalidInput)?;
+    conn.pragma_update(None, "mmap_size", requested)?;
+    let effective: i64 = conn.query_row("PRAGMA mmap_size", [], |row| row.get(0))?;
+    Ok(effective.max(0) as u64)
 }
 
 fn inode_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Inode> {

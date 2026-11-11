@@ -43,7 +43,7 @@ Stopping dbfs with Ctrl-C, or sending it SIGTERM or SIGHUP, also unmounts cleanl
 ## Mount options
 
 ```bash
-dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [--kernel-cache] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
+dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [--mmap-size SIZE] [--kernel-cache] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
 ```
 
 By default only the user who mounted dbfs can access the filesystem. `dbfs mount --help` lists every option.
@@ -54,8 +54,11 @@ By default only the user who mounted dbfs can access the filesystem. `dbfs mount
 | `--allow-root` | Lets root access the mount, in addition to the mounting user. |
 | `--auto-unmount` | Unmounts the filesystem when dbfs exits, including after a crash or SIGKILL, so no stale mount is left behind. Requires `--allow-other` or `--allow-root`. On Ubuntu, the AppArmor profile for `fusermount3` blocks this cleanup (`fusermount3: failed to mark mounts private` in the log, an `apparmor="DENIED" ... flags="rw, rprivate"` line in the kernel log), so the mount stays until `fusermount3 -u`. This affects every FUSE filesystem, not just dbfs. |
 | `--write-buffer SIZE` | Memory for buffered writes, shared by all open files. Default `64M`, minimum `64K`; accepts `K`, `M` and `G` suffixes. Memory is reserved as it is used, so set `8M` in a container with a small memory limit. |
+| `--mmap-size SIZE` | Largest part of the database file that SQLite may map into memory (`PRAGMA mmap_size`). Default `2G` on 64-bit systems and `0` on 32-bit. `0` turns the map off. Accepts the same suffixes as `--write-buffer`. Random reads are faster with the map. Applies to read-only mounts too. |
 | `--kernel-cache` | Let the kernel cache more: writeback cache, parallel directory operations, 1 MiB requests, cached symlinks, attributes cached for a day, and page cache kept across opens. Repeated reads run at page-cache speed (6–28× faster in the benchmarks). Off by default because, with the writeback cache, data written to a file that is still open can sit in the kernel until close or fsync, so a crash or `docker stop` can lose it. |
 | `-o OPT[,OPT...]` | Extra options. Repeatable, and each value may be a comma-separated list. Known names map to typed FUSE options: `ro`, `rw`, `atime`, `noatime`, `suid`, `nosuid`, `dev`, `nodev`, `exec`, `noexec`, `dirsync`, `sync`, `async`, `fsname=NAME`, `subtype=NAME`. Any other option is passed to `fusermount3`, which accepts only the options it knows, such as `max_read=N`. An unknown option, such as `context=...`, makes the mount fail with `unknown option`. |
+
+`--mmap-size` and SIGBUS: with the memory map, an I/O error on the database file (a failing disk, or the file being truncated by another process) can make the kernel send dbfs SIGBUS. That kills the daemon instead of returning EIO to the caller, and writes still buffered in dbfs are lost. `--mmap-size 0` returns EIO instead, at the cost of slower random reads.
 
 `default_permissions` is always on and cannot be turned off. The kernel therefore enforces file mode bits and owners, even for other users.
 
@@ -97,9 +100,10 @@ PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA busy_timeout = 5000;
 PRAGMA wal_autocheckpoint = 10000;
+PRAGMA mmap_size = 2147483648;  -- --mmap-size; SQLite caps it at its own maximum
 ```
 
-File data is stored in 64 KiB chunk rows in SQLite, keyed by one integer, `(ino << 24) | chunk_index`. A file can hold up to 1 TiB (2^24 chunks); writing past that returns `EFBIG`. Timestamps are stored as i64 nanoseconds. Times outside 1677–2262 are clamped, never rejected, the way ext4 clamps to its own range.
+File data is stored in 64 KiB chunk rows in SQLite, keyed by one integer, `(ino << 24) | chunk_index`. A file can hold up to 1 TiB (2^24 chunks); writing past that returns `EFBIG`. A read that covers part of one chunk reads only the bytes it asks for, through the chunk's blob; a read across chunks, or of a whole chunk, uses one range query. Timestamps are stored as i64 nanoseconds. Times outside 1677–2262 are clamped, never rejected, the way ext4 clamps to its own range.
 
 FUSE writes are buffered in memory and flushed to SQLite on `flush`, `fsync` or `release`. All open files share one write buffer of 64 KiB slots (`--write-buffer`, default 64 MiB). When it is full, the file with the most buffered data is flushed. This lets buffered write workloads avoid one SQLite transaction per small write. Overlapping dirty writes merge in their chunk buffer, and full-chunk writes skip the read-modify-write cycle. A file unlinked while open is never flushed on close: its data goes away with its last handle. All SQL queries use prepared statement caching to avoid re-parsing.
 
