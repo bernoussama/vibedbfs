@@ -451,6 +451,15 @@ impl Dbfs {
         self.db.sync_durable().map_err(errno_from_db_error)
     }
 
+    /// Test hook for disk-full tests: caps the database at `pages` pages. A write
+    /// that needs a page past the cap fails with `ENOSPC`. A higher value lifts it.
+    #[doc(hidden)]
+    pub fn set_max_page_count(&self, pages: u64) -> Result<(), i32> {
+        self.db
+            .set_max_page_count(pages)
+            .map_err(errno_from_db_error)
+    }
+
     /// A handle for the shutdown path in `run.rs`. It keeps working after this
     /// `Dbfs` moves into the FUSE session.
     pub(crate) fn shutdown_handle(&self) -> ShutdownHandle {
