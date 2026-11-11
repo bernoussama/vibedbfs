@@ -72,10 +72,29 @@ pub struct MountConfig {
     /// data that dbfs never saw. Off by default.
     #[arg(long)]
     pub kernel_cache: bool,
+
+    /// Largest part of the database file that SQLite may map into memory
+    /// (`PRAGMA mmap_size`). Takes the same sizes as `--write-buffer`, but `0` is
+    /// allowed and turns the map off. Default 2G on 64-bit systems, 0 on 32-bit.
+    ///
+    /// Random reads are faster with the map. An I/O error on the database file
+    /// can then end dbfs with SIGBUS instead of returning EIO; `--mmap-size 0`
+    /// avoids that.
+    #[arg(long, value_name = "SIZE", value_parser = parse_bytes)]
+    pub mmap_size: Option<usize>,
 }
 
 /// Parses `N`, `NK`, `NM` or `NG` (powers of 1024), at least 64 KiB.
 fn parse_size(text: &str) -> Result<usize, String> {
+    let bytes = parse_bytes(text)?;
+    if bytes < 64 * 1024 {
+        return Err(format!("`{text}` is below the 64K minimum (one chunk)"));
+    }
+    Ok(bytes)
+}
+
+/// Parses `N`, `NK`, `NM` or `NG` (powers of 1024) with no minimum, so `0` is valid.
+fn parse_bytes(text: &str) -> Result<usize, String> {
     let text = text.trim();
     let (digits, shift) = match text.chars().last().map(|c| c.to_ascii_uppercase()) {
         Some('K') => (&text[..text.len() - 1], 10),
@@ -86,11 +105,7 @@ fn parse_size(text: &str) -> Result<usize, String> {
     let value: usize = digits
         .parse()
         .map_err(|_| format!("`{text}` is not a size such as 65536, 512K, 8M or 1G"))?;
-    let bytes = value
+    value
         .checked_mul(1 << shift)
-        .ok_or_else(|| format!("`{text}` is too large"))?;
-    if bytes < 64 * 1024 {
-        return Err(format!("`{text}` is below the 64K minimum (one chunk)"));
-    }
-    Ok(bytes)
+        .ok_or_else(|| format!("`{text}` is too large"))
 }

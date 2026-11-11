@@ -39,7 +39,7 @@ pub fn run_with_mounter(
         } => {
             // Validate options before the database is opened or created.
             let options = mount_options_for(&config)?;
-            let db = Db::open(database)?;
+            let db = open_database(database, &config)?;
             let write_buffer = config.write_buffer.unwrap_or(DEFAULT_WRITE_BUFFER);
             mounter(
                 Dbfs::with_write_buffer(db, write_buffer).with_kernel_cache(config.kernel_cache),
@@ -48,6 +48,16 @@ pub fn run_with_mounter(
             )
         }
     }
+}
+
+/// Opens the database with the SQLite settings the mount asks for. These do not
+/// depend on the mount options, so `-o ro` gets the same settings.
+fn open_database(path: impl AsRef<Path>, config: &MountConfig) -> Result<Db, RunError> {
+    let db = Db::open(path)?;
+    if let Some(bytes) = config.mmap_size {
+        db.set_mmap_size(bytes as u64)?;
+    }
+    Ok(db)
 }
 
 /// Mounts `fs` and runs the FUSE session on its own thread. The calling thread
