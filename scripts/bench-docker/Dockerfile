@@ -11,4 +11,5 @@ RUN git clone --depth 1 --branch "$LIBFUSE_TAG" https://github.com/libfuse/libfu
     && cd /src/libfuse && meson setup build -Dexamples=true -Dtests=false -Dutils=false \
     && ninja -C build example/passthrough_hp \
     && install -m755 build/example/passthrough_hp /usr/local/bin/passthrough_hp \
-    && ln -s /src/libfuse/build/lib/libfuse3.so* /usr/local/lib/ 2>/dev/null; ldconfig
+    && ln -s /src/libfuse/build/lib/libfuse3.so* /usr/local/lib/ \
+    && ldconfig

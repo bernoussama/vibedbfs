@@ -11,7 +11,9 @@ fn parse_mount(extra_args: &[&str]) -> MountConfig {
     argv.extend_from_slice(extra_args);
     argv.extend(["dbfs.sqlite", "mnt"]);
     let cli = Cli::try_parse_from(argv).expect("parse mount command");
-    let Command::Mount { config, .. } = cli.command;
+    let Command::Mount { config, .. } = cli.command else {
+        panic!("expected the mount command");
+    };
     config
 }
 
@@ -375,4 +377,120 @@ fn write_buffer_rejects_bad_sizes() {
 fn kernel_cache_is_off_unless_requested() {
     assert!(!parse_mount(&[]).kernel_cache);
     assert!(parse_mount(&["--kernel-cache"]).kernel_cache);
+}
+
+#[test]
+fn keep_cache_is_on_unless_no_keep_cache_is_requested() {
+    assert!(!parse_mount(&[]).no_keep_cache);
+    assert!(parse_mount(&["--no-keep-cache"]).no_keep_cache);
+}
+
+#[test]
+fn no_keep_cache_conflicts_with_kernel_cache() {
+    for argv in [
+        [
+            "dbfs",
+            "mount",
+            "--no-keep-cache",
+            "--kernel-cache",
+            "dbfs.sqlite",
+            "mnt",
+        ],
+        [
+            "dbfs",
+            "mount",
+            "--kernel-cache",
+            "--no-keep-cache",
+            "dbfs.sqlite",
+            "mnt",
+        ],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "{argv:?} should conflict"
+        );
+    }
+}
+
+#[test]
+fn mmap_size_accepts_zero_and_the_write_buffer_suffixes() {
+    assert_eq!(parse_mount(&[]).mmap_size, None);
+    assert_eq!(parse_mount(&["--mmap-size", "0"]).mmap_size, Some(0));
+    assert_eq!(
+        parse_mount(&["--mmap-size", "512M"]).mmap_size,
+        Some(512 << 20)
+    );
+    assert_eq!(parse_mount(&["--mmap-size", "1G"]).mmap_size, Some(1 << 30));
+}
+
+#[test]
+fn mmap_size_rejects_bad_sizes() {
+    for bad in ["", "2X", "M", "-1", "99999999999999999999G"] {
+        let argv = ["dbfs", "mount", "--mmap-size", bad, "dbfs.sqlite", "mnt"];
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "`{bad}` should be rejected"
+        );
+    }
+}
+
+#[test]
+fn parses_wal_cap_with_a_size_suffix() {
+    assert_eq!(parse_mount(&["--wal-cap", "512K"]).wal_cap, Some(512 << 10));
+    assert_eq!(parse_mount(&["--wal-cap", "1G"]).wal_cap, Some(1 << 30));
+    assert_eq!(parse_mount(&[]).wal_cap, None);
+}
+
+#[test]
+fn rejects_wal_cap_below_one_chunk() {
+    let error = Cli::try_parse_from(["dbfs", "mount", "--wal-cap", "1K", "dbfs.sqlite", "mnt"])
+        .expect_err("a 1K WAL cap should be refused");
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+}
+
+#[test]
+fn sync_metadata_is_off_unless_requested() {
+    assert!(!parse_mount(&[]).sync_metadata);
+    assert!(parse_mount(&["--sync-metadata"]).sync_metadata);
+}
+
+#[test]
+fn parses_migrate_with_a_page_size_and_suffixes() {
+    for (text, bytes) in [("4096", 4096), ("4K", 4096), ("16K", 16384), ("64K", 65536)] {
+        let cli = Cli::try_parse_from(["dbfs", "migrate", "--page-size", text, "dbfs.sqlite"])
+            .expect("parse migrate command");
+        let Command::Migrate {
+            database,
+            page_size,
+        } = cli.command
+        else {
+            panic!("expected the migrate command");
+        };
+        assert_eq!(database, PathBuf::from("dbfs.sqlite"));
+        assert_eq!(page_size, bytes, "{text}");
+    }
+}
+
+#[test]
+fn migrate_refuses_a_page_size_sqlite_does_not_take() {
+    for text in ["3000", "256", "128K", "0"] {
+        let error = Cli::try_parse_from(["dbfs", "migrate", "--page-size", text, "dbfs.sqlite"])
+            .expect_err("a page size SQLite does not take should be refused");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn migrate_requires_a_page_size() {
+    let error = Cli::try_parse_from(["dbfs", "migrate", "dbfs.sqlite"])
+        .expect_err("migrate without --page-size should be refused");
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
 }

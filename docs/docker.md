@@ -10,7 +10,7 @@ This guide covers the `dbfs:dev` image and these ways to run dbfs with container
 
 The scenario IDs come from the [compatibility requirements](plans/2026-11-03-data-oriented-redesign.md#linux-and-docker-compatibility-requirements) in the redesign plan.
 
-Some steps depend on changes that may not be merged yet. Those steps say so with phrases such as "until C1 is merged". The [status table](#changes-these-steps-depend-on) lists every such change.
+The changes these steps depend on (C1, C2, C4 and C5 in the redesign plan) are all merged. The [status table](#changes-these-steps-depend-on) lists them, together with the work that is still pending.
 
 ## Overview
 
@@ -65,24 +65,30 @@ The first run builds a helper image, `dbfs-build:trixie-2`, and creates the `dbf
 
 ## Changes these steps depend on
 
-| Change | What it adds | Needed for |
-|---|---|---|
-| C1 | Graceful shutdown: SIGTERM, SIGINT and SIGHUP unmount and flush; `Filesystem::destroy` | Clean `docker stop` (S3, S4, S6) |
-| C2 | `--allow-other`, `--allow-root`, `--auto-unmount`, `-o OPT` | Containers and other users on a host mount (S2, S4) |
-| C4 | Explicit xattr behaviour | `cp -a`, `tar --xattrs`, `rsync -X` |
-| C5 | `fallocate` | Package managers, databases and `fio` in containers (S2, S3) |
+| Change | Status | What it provides | Needed for |
+|---|---|---|---|
+| C1 | Merged | Graceful shutdown: SIGTERM, SIGINT and SIGHUP flush, unmount and exit 0 (exit 1 if the flush fails); `Filesystem::destroy` flushes too | Clean `docker stop` (S3, S4, S6) |
+| C2 | Merged | `--allow-other`, `--allow-root`, `--auto-unmount`, `-o OPT` | Containers and other users on a host mount (S2, S4) |
+| C4 | Merged | Explicit xattr behaviour | `cp -a`, `tar --xattrs`, `rsync -X` |
+| C5 | Merged | `fallocate`, mode 0 and `FALLOC_FL_KEEP_SIZE` | Package managers, databases and `fio` in containers (S2, S3) |
 
-The target `mount` syntax, once C2 is merged:
+Still pending:
+
+- **S4 automation.** The host-side check in `tests/compat/run.sh` is not written yet, so the S4 row is always SKIP.
+- **S5 (rootless Podman).** Best effort. It is not in CI yet.
+- **aarch64.** linux/arm64 has not been built or tested.
+
+The `mount` syntax:
 
 ```text
-dbfs mount [--allow-other | --allow-root] [--auto-unmount] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
+dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [--kernel-cache | --no-keep-cache] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
 ```
 
 ## S2: host mount shared into a container
 
 The host mounts dbfs, and containers reach the same files through a bind mount. The mount must exist before the container starts.
 
-This needs C2. A mount made by a non-root user is not accessible to containers without `--allow-other`, so the bind mount fails until C2 is merged.
+This needs `--allow-other`. Without it, only the user who mounted dbfs can access the mount, so root inside a container gets `EACCES` and the bind mount does not work.
 
 Run this once on the host:
 
@@ -100,9 +106,7 @@ Start the mount. It runs in the foreground until it is unmounted, so use a separ
 dbfs mount --allow-other /srv/dbfs.sqlite /srv/dbfs
 ```
 
-Add `--auto-unmount` (C2) so that a killed dbfs does not leave a stale mount behind. On Ubuntu hosts, the AppArmor profile shipped for `fusermount3` denies the
-`rprivate` remount that the cleanup needs, so a killed dbfs still leaves a stale mount there.
-Unmount it with `fusermount3 -u <mnt>`.
+Add `--auto-unmount` so that a killed dbfs does not leave a stale mount behind. It needs `--allow-other` or `--allow-root`, and dbfs refuses it without one. On Ubuntu hosts, the AppArmor profile shipped for `fusermount3` denies the `rprivate` remount that the cleanup needs, so a killed dbfs can still leave a stale mount there. Unmount it with `fusermount3 -u <mnt>`.
 
 Now use the mount from a container, then read the file on the host:
 
@@ -117,7 +121,7 @@ When you are finished, unmount:
 fusermount3 -u /srv/dbfs
 ```
 
-Until C1 is merged, killing dbfs (Ctrl-C or `kill`) does not flush dirty buffers. The kernel sends a flush request on every `close(2)` of a file, and dbfs writes that file's buffer out when it gets it. So a program that closes its files before dbfs stops loses nothing. Writes that a program still holds open and has not closed are lost if dbfs is killed.
+Ctrl-C, `kill` with SIGTERM, SIGINT or SIGHUP, and `docker stop` all flush buffered writes and unmount before dbfs exits. Only SIGKILL cannot be caught. The kernel sends a flush request on every `close(2)` of a file, and dbfs writes that file's buffer out when it gets it. So a program that closes its files before dbfs stops loses nothing. Writes that a program still holds open and has not closed are lost only if dbfs is killed with SIGKILL.
 
 ## S3: dbfs inside a container, mounting inside it
 
@@ -187,7 +191,7 @@ docker run --rm --init --device /dev/fuse --cap-add SYS_ADMIN --security-opt app
   --entrypoint /bin/sh dbfs:dev /wrap.sh sh -c 'echo hi > /mnt/hello.txt && cat /mnt/hello.txt'
 ```
 
-A plain `sh` as PID 1 ignores SIGTERM unless it installs a handler, which is why the script has a `trap`. `--init` still helps: it reaps children and forwards signals to the script. The wrapper exits when the app does, so `docker stop` finishes in time. Until C1 is merged, the final SIGTERM to dbfs is not handled, so writes that were not yet flushed are lost.
+A plain `sh` as PID 1 ignores SIGTERM unless it installs a handler, which is why the script has a `trap`. `--init` still helps: it reaps children and forwards signals to the script. The wrapper exits when the app does, so `docker stop` finishes in time. The wrapper then sends SIGTERM to dbfs, which flushes and unmounts before it exits.
 
 ## S4: sharing the in-container mount with the host
 
@@ -225,7 +229,7 @@ Both sides need propagation:
 - The host side must be shared. `findmnt` shows this, and `--make-rshared` (above) fixes it when it is not.
 - `:rshared` on the bind mount lets mounts that the container creates under `/mnt` propagate back to the host. Without it (`-v /srv/dbfs:/mnt` alone), a mount made inside the container may stay there. This was not tested here.
 
-Access: host root can read the mount, because the container's root is host root and made the mount. Other host users need `--allow-other` on the in-container mount, for example `dbfs:dev mount --allow-other /data/db.sqlite /mnt`. That needs C2, so until C2 is merged only root can access it. `user_allow_other` in `/etc/fuse.conf` affects only `fusermount3`. This container mounts as root and does not use `fusermount3`, so this scenario does not need that setting.
+Access: host root can read the mount, because the container's root is host root and made the mount. Other host users need `--allow-other` on the in-container mount, for example `dbfs:dev mount --allow-other /data/db.sqlite /mnt`. Without it, only root can access the mount. `user_allow_other` in `/etc/fuse.conf` affects only `fusermount3`. This container mounts as root and does not use `fusermount3`, so this scenario does not need that setting.
 
 When you are finished, stop the container and check that the mount is gone:
 
@@ -266,7 +270,9 @@ docker stop -t 30 <container>
 docker run --rm --init --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined -v dbdata:/data dbfs:dev mount /data/db.sqlite /mnt
 ```
 
-Until C1 is merged, dbfs has no SIGTERM handler. As PID 1 it ignores SIGTERM, so `docker stop` always waits the full timeout and ends in SIGKILL (exit code 137), and buffered writes are lost. The compat test (S6 in `tests/compat/run.sh`) keeps a 16 MiB write open without closing it. The stop ends in SIGKILL after about 10 s, and after the restart the file has 0 of 16777216 bytes. After C1 is merged, dbfs unmounts and flushes on SIGTERM and exits 0. Check the exit code after a stop:
+dbfs handles SIGTERM even as PID 1, so `docker stop` ends with a clean shutdown: dbfs flushes buffered writes, detaches the mount and exits 0. If a flush fails, dbfs prints `failed to flush unsaved data on shutdown` to stderr and exits 1, so the failure is visible. If a process still has a file open, the kernel keeps the FUSE session alive after the detach. dbfs then exits when a one-second grace period runs out. The data is already flushed by then, and new writes fail, so nothing is lost.
+
+The S6 row in `tests/compat/run.sh` checks this with a 16 MiB write that is held open and not flushed. The stop must exit 0 in under 5 s, and after a restart the file must match byte for byte. An exit code of 137 (SIGKILL) makes that row FAIL. Check the exit code after a stop:
 
 ```bash
 docker inspect -f '{{.State.ExitCode}}' <container>
@@ -299,13 +305,13 @@ docker compose exec dbfs sh -c 'echo hi > /mnt/hello.txt && cat /mnt/hello.txt'
 docker compose stop
 ```
 
-`stop_grace_period` is the Compose equivalent of `--stop-timeout`. Until C1 is merged, it only delays the SIGKILL. It does not make the stop clean.
+`stop_grace_period` is the Compose equivalent of `--stop-timeout`. Raise it only if a stop needs more than the default 10 s.
 
 ## Limitations
 
 - **(a) dbfs cannot be Docker's `data-root`.** Docker's overlay2 driver uses the storage as an overlayfs upperdir, and the kernel's overlayfs does not support a FUSE upperdir. Volumes and bind mounts are fine.
 - **(b) No SELinux relabeling.** `:z` and `:Z` do not work on dbfs. On SELinux hosts, use `--security-opt label=disable`.
-- **(c) xattrs (C4).** Until C4 is merged, xattr calls are not implemented. After C4, `getxattr` and `listxattr` return ENODATA and an empty list, and `setxattr` returns EOPNOTSUPP. Tools then treat the filesystem as having no xattrs. dbfs does not store xattr values, so values such as `security.capability` on binaries cannot be kept.
-- **(d) Access by other users (C2).** Only the user who started dbfs can access the mount, unless it was started with `--allow-other`. `--allow-root` admits root only. Until C2 is merged, neither flag exists.
-- **(e) Durability.** The database lives in a volume and is only as durable as its last flush. File data is buffered and flushed on `flush` (the kernel sends one on every `close(2)`), `fsync` or `release`, on `setattr` (including truncate), on unlink and on rename over a file, or when a file has buffered 64 MiB. See [Storage in the README](../README.md#storage). Until C1 is merged, a killed container also loses writes that a program still holds open and has not closed.
-- **(f) fallocate (C5).** Until C5 is merged, `fallocate` returns an error. Programs that call `posix_fallocate`, such as package managers, databases and `fio`, can fail on dbfs. musl does not fall back to writing as glibc does.
+- **(c) xattrs.** dbfs stores no extended attributes. `getxattr` and `setxattr` return `EOPNOTSUPP`, `listxattr` returns an empty list, and `removexattr` returns `ENODATA`. dbfs replies `ENOSYS` to `getxattr`, so the kernel stops sending it for the mount (this removes a `security.capability` probe before every write). Tools then treat the filesystem as having no xattrs. Values such as `security.capability` on binaries therefore cannot be kept.
+- **(d) Access by other users.** Only the user who started dbfs can access the mount, unless it was started with `--allow-other` (every user) or `--allow-root` (root, as well as the mounting user). The two flags cannot be combined. For a non-root user, `--allow-other` also needs `user_allow_other` in `/etc/fuse.conf`.
+- **(e) Durability.** The database lives in a volume and is only as durable as its last flush. File data is held in memory and written to the database on `flush` (the kernel sends one on every `close(2)`), on `fsync`, on `release`, and before a size change (`truncate`); other attribute changes such as `chmod` or `utimensat` leave it buffered. It is also written when the shared write buffer is full. `--write-buffer` sets its size (256 MiB by default); up to 16 MiB of the file with the most buffered data is written first. Data for a file that is unlinked, or replaced by a rename, is dropped, not written. A SIGTERM, SIGINT or SIGHUP flushes everything before dbfs exits. A SIGKILL cannot be caught, so writes that a program still holds open and has not closed are lost then. See [Storage in the README](../README.md#storage).
+- **(f) fallocate.** Mode 0 and `FALLOC_FL_KEEP_SIZE` work. Mode 0 extends the file with zeros, which read back as zeros. Neither reserves space, because SQLite allocates pages on write. Punch hole and zero range fail with `EOPNOTSUPP`. `posix_fallocate` uses mode 0, so it works.

@@ -20,6 +20,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod common;
+
 const POLL: Duration = Duration::from_millis(50);
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -100,6 +102,7 @@ fn unknown_option_is_passed_to_fusermount_and_fails_the_mount() {
 fn run_mount_to_exit(db_path: &Path, mountpoint: &Path, args: &[&str]) -> (bool, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
         .arg("mount")
+        .args(common::mount_args(args))
         .args(args)
         .arg(db_path)
         .arg(mountpoint)
@@ -192,6 +195,7 @@ impl Mounted {
         fs::create_dir(&mountpoint).expect("create mountpoint");
         let child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
             .arg("mount")
+            .args(common::mount_args(extra_args))
             .args(extra_args)
             .arg(&db_path)
             .arg(&mountpoint)

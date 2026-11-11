@@ -147,16 +147,23 @@ pub(crate) struct OpenTable {
     pub arena: ChunkArena,
     /// Set when shutdown starts; later buffered writes are refused.
     pub closing: bool,
+    /// Chunks written by each budget eviction, so tests can check the bound on
+    /// one transaction.
+    #[cfg(test)]
+    pub evicted_chunks: Vec<usize>,
 }
 
 impl OpenTable {
-    /// A table whose dirty data may use up to `write_buffer` bytes.
+    /// A table whose dirty data may use up to `write_buffer` bytes. No arena
+    /// memory is reserved yet.
     pub fn new(write_buffer: usize) -> Self {
         Self {
             inodes: OpenInodes::default(),
             handles: Handles::default(),
             arena: ChunkArena::new(write_buffer),
             closing: false,
+            #[cfg(test)]
+            evicted_chunks: Vec::new(),
         }
     }
 }
@@ -164,6 +171,7 @@ impl OpenTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::CHUNK_SIZE;
 
     #[test]
     fn freed_handles_and_slots_are_reused_without_stale_state() {
@@ -194,5 +202,19 @@ mod tests {
         let table = OpenTable::new(1 << 20);
         assert_eq!(table.handles.get(0), None);
         assert_eq!(table.handles.get(u64::MAX), None);
+    }
+
+    #[test]
+    fn a_default_sized_write_buffer_reserves_no_memory_up_front() {
+        let mut table = OpenTable::new(crate::fuse::DEFAULT_WRITE_BUFFER);
+        assert_eq!(table.arena.capacity_bytes(), 0);
+        let a = table.inodes.insert(10, FileKind::RegularFile, 0);
+        let slot = table.arena.alloc().expect("slot");
+        table.inodes.dirty[a as usize].insert(0, 0, slot);
+        assert_eq!(
+            table.arena.capacity_bytes(),
+            CHUNK_SIZE,
+            "one slot is one chunk"
+        );
     }
 }

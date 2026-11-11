@@ -1,11 +1,11 @@
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Error as SqlError, ErrorCode, ffi};
 
-/// Seconds and nanoseconds since the Unix epoch.
-///
-/// Negative `secs` follows fuser's split. The duration before the epoch is
-/// `secs.unsigned_abs()` seconds plus `nsec`.
+/// Seconds and nanoseconds since the Unix epoch, floored: the instant is
+/// `secs + nsec / 1e9` with `0 <= nsec < 1e9`. So -0.5 s is
+/// `{ secs: -1, nsec: 500_000_000 }`, the same split as the kernel's `timespec64`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp {
     pub secs: i64,
@@ -19,10 +19,21 @@ impl Timestamp {
                 secs: duration.as_secs() as i64,
                 nsec: duration.subsec_nanos(),
             },
-            Err(error) => Self {
-                secs: -(error.duration().as_secs() as i64),
-                nsec: error.duration().subsec_nanos(),
-            },
+            Err(error) => {
+                // Floor of -(whole + frac): -(whole + 1) plus (1e9 - frac) nanoseconds.
+                let before = error.duration();
+                let whole = before.as_secs() as i128;
+                let frac = before.subsec_nanos();
+                let (secs, nsec) = if frac == 0 {
+                    (-whole, 0)
+                } else {
+                    (-whole - 1, 1_000_000_000 - frac)
+                };
+                Self {
+                    secs: secs.max(i64::MIN as i128) as i64,
+                    nsec,
+                }
+            }
         }
     }
 
@@ -30,26 +41,29 @@ impl Timestamp {
     /// range (years 1677 to 2262) are clamped to its ends, as ext4 clamps to its
     /// own range, so `utimensat` with an odd time never fails.
     pub fn to_ns(self) -> i64 {
-        let magnitude = (self.secs.unsigned_abs() as i128) * 1_000_000_000 + self.nsec as i128;
-        let ns = if self.secs < 0 { -magnitude } else { magnitude };
+        let ns = self.secs as i128 * 1_000_000_000 + self.nsec as i128;
         ns.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
-    /// Inverse of [`Timestamp::to_ns`].
+    /// Inverse of [`Timestamp::to_ns`]. Floors, so `nsec` is never negative.
     pub fn from_ns(ns: i64) -> Self {
-        let magnitude = ns.unsigned_abs();
-        let secs = (magnitude / 1_000_000_000) as i64;
         Self {
-            secs: if ns < 0 { -secs } else { secs },
-            nsec: (magnitude % 1_000_000_000) as u32,
+            secs: ns.div_euclid(1_000_000_000),
+            nsec: ns.rem_euclid(1_000_000_000) as u32,
         }
     }
 
     pub fn to_system_time(self) -> SystemTime {
-        if self.secs >= 0 {
-            UNIX_EPOCH + Duration::new(self.secs as u64, self.nsec)
+        let ns = self.secs as i128 * 1_000_000_000 + self.nsec as i128;
+        let magnitude = ns.unsigned_abs();
+        let duration = Duration::new(
+            (magnitude / 1_000_000_000) as u64,
+            (magnitude % 1_000_000_000) as u32,
+        );
+        if ns >= 0 {
+            UNIX_EPOCH + duration
         } else {
-            UNIX_EPOCH - Duration::new(self.secs.unsigned_abs(), self.nsec)
+            UNIX_EPOCH - duration
         }
     }
 }
@@ -133,7 +147,32 @@ pub enum DbError {
     UnsupportedSchema(i64),
     /// The file would grow past the 1 TiB limit (`EFBIG`).
     FileTooLarge,
+    /// Another dbfs process holds the database's lock.
+    DatabaseInUse,
     Sqlite(String),
+}
+
+impl fmt::Display for DbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyExists => write!(f, "already exists"),
+            Self::DirectoryNotEmpty => write!(f, "directory not empty"),
+            Self::InvalidInput => write!(f, "invalid input"),
+            Self::IsDirectory => write!(f, "is a directory"),
+            Self::NameTooLong => write!(f, "name too long"),
+            Self::NoSpace => write!(f, "no space left on device"),
+            Self::NotDirectory => write!(f, "not a directory"),
+            Self::NotFound => write!(f, "not found"),
+            Self::Corrupt => write!(f, "database is corrupt"),
+            Self::UnsupportedSchema(version) => write!(
+                f,
+                "database was written by a newer dbfs (schema version {version})"
+            ),
+            Self::FileTooLarge => write!(f, "file too large"),
+            Self::DatabaseInUse => write!(f, "database is already in use by another dbfs"),
+            Self::Sqlite(message) => write!(f, "database error: {message}"),
+        }
+    }
 }
 
 impl From<SqlError> for DbError {
@@ -159,4 +198,84 @@ fn sqlite_failure(err: ffi::Error, message: Option<String>) -> DbError {
         return DbError::AlreadyExists;
     }
     DbError::Sqlite(SqlError::SqliteFailure(err, message).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn times_just_before_the_epoch_keep_their_sign() {
+        let cases = [
+            (
+                UNIX_EPOCH - Duration::from_nanos(1),
+                Timestamp {
+                    secs: -1,
+                    nsec: 999_999_999,
+                },
+                -1,
+            ),
+            (
+                UNIX_EPOCH - Duration::from_millis(500),
+                Timestamp {
+                    secs: -1,
+                    nsec: 500_000_000,
+                },
+                -500_000_000,
+            ),
+            (
+                UNIX_EPOCH - Duration::from_secs(1),
+                Timestamp { secs: -1, nsec: 0 },
+                -1_000_000_000,
+            ),
+            (
+                UNIX_EPOCH - Duration::from_millis(1500),
+                Timestamp {
+                    secs: -2,
+                    nsec: 500_000_000,
+                },
+                -1_500_000_000,
+            ),
+            (UNIX_EPOCH, Timestamp { secs: 0, nsec: 0 }, 0),
+        ];
+        for (time, stamp, ns) in cases {
+            assert_eq!(Timestamp::from_system_time(time), stamp, "{time:?}");
+            assert_eq!(stamp.to_system_time(), time, "{stamp:?}");
+            assert_eq!(stamp.to_ns(), ns, "{stamp:?}");
+            assert_eq!(Timestamp::from_ns(ns), stamp, "{ns} ns");
+        }
+    }
+
+    #[test]
+    fn ns_range_ends_clamp_and_round_trip() {
+        assert_eq!(
+            Timestamp {
+                secs: i64::MIN,
+                nsec: 0
+            }
+            .to_ns(),
+            i64::MIN
+        );
+        assert_eq!(
+            Timestamp {
+                secs: i64::MAX,
+                nsec: 999_999_999
+            }
+            .to_ns(),
+            i64::MAX
+        );
+        assert_eq!(Timestamp::from_ns(i64::MIN).to_ns(), i64::MIN);
+        assert_eq!(Timestamp::from_ns(i64::MAX).to_ns(), i64::MAX);
+        assert_eq!(Timestamp::from_ns(i64::MAX).secs, 9_223_372_036);
+    }
+
+    #[test]
+    fn times_far_before_the_epoch_neither_overflow_nor_wrap() {
+        let far = UNIX_EPOCH - Duration::new(1 << 62, 500_000_000);
+        let stamp = Timestamp::from_system_time(far);
+        assert_eq!(stamp.secs, -(1 << 62) - 1);
+        assert_eq!(stamp.nsec, 500_000_000);
+        assert_eq!(stamp.to_system_time(), far);
+        assert_eq!(stamp.to_ns(), i64::MIN);
+    }
 }

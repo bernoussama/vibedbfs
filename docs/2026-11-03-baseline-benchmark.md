@@ -39,8 +39,10 @@ with those docs. Compare only runs from this harness.
 | seqwrite | 512 MiB, 128 KiB writes, close | 3.33 s · **154 MiB/s** | 0.13 s · 4,048 MiB/s | 26× slower |
 | randwrite | 256 MiB, 4 KiB, no fsync | 11.15 s · **23.0 MiB/s** · 5,877 IOPS | 0.26 s · 990 MiB/s | 43× |
 | randwrite-fsync | 64 MiB, 4 KiB, fsync each | 75.8 s · **216 IOPS** | 84.0 s · 195 IOPS | ≈ 1× (disk-bound) |
-| seqread | 256 MiB, 128 KiB | 0.22 s · **1,141 MiB/s** | 0.03 s · 9,543 MiB/s | 8× |
-| randread | 256 MiB, 4 KiB | 3.01 s · **85 MiB/s** · 21,795 IOPS | 0.09 s · 761k IOPS | 35× |
+| seqread | 256 MiB, 128 KiB | 0.22 s · **1,141 MiB/s** | 0.03 s · 9,543 MiB/s | 8× (a) |
+| randread | 256 MiB, 4 KiB | 3.01 s · **85 MiB/s** · 21,795 IOPS | 0.09 s · 761k IOPS | 35× (a) |
+
+(a) These two ratios compare different read paths. `bench_io` writes the file and reopens it without dropping caches, so ext4 serves the reads from its page cache. dbfs without `--kernel-cache` drops its page cache on every open, so its reads go through FUSE and SQLite. The ratios measure those paths, not the disks.
 
 ### Metadata (5,000 files × 4 KiB over 200 dirs), seconds
 
@@ -236,7 +238,10 @@ so compare btrfs with ext4 (loop), not with native ext4.
 
 Each filesystem ran 3 interleaved rounds of `bench_io`; the medians are below. fio
 ran 2 rounds of the same jobs used for the A/B runs. The driver script and raw
-results are in `.bench/fscmp/`.
+results were in `.bench/fscmp/`, which is untracked, so this table cannot be reproduced
+from the repository. [`scripts/bench-docker/compare.sh`](../scripts/bench-docker/compare.sh)
+is the reproducible successor. It produces the like-for-like section below, but it has
+no ext4 (loop) column.
 
 | Workload | dbfs | ext4 | ext4 (loop) | btrfs (loop) |
 |---|---|---|---|---|
@@ -264,15 +269,19 @@ How to read these numbers:
   (about 210 IOPS each). Both are bound by the disk's flush latency, and a dbfs
   fsync is one `fdatasync` of the WAL on that same ext4.
 - **Buffered I/O.** Without fsync, ext4 and btrfs write into the kernel page cache
-  and read from it. They are 10–40× faster than dbfs, whose every operation is a
-  FUSE round trip into a single-threaded user-space process, followed by SQLite.
-- **Metadata.** Operations are 10–15× slower than ext4 and 4–7× slower than btrfs.
-  Each create or unlink is its own SQLite transaction.
+  and read from it. In the `bench_io` rows of the tables above, they are 7–43× faster
+  than default dbfs, whose every operation is a FUSE round trip into a single-threaded
+  user-space process, followed by SQLite.
+- **Metadata.** In the comparison tables above, totals, creates and unlinks are
+  13–21× slower than ext4 and 6–9× slower than btrfs. Each create or unlink is its
+  own SQLite transaction.
 - **The fio randread result is not a dbfs win.** Before each job, fio drops the
   page cache of the file it is about to test. On ext4 and btrfs, that forces cold
   4 KiB reads from the NVMe disk. Under dbfs, it only drops the FUSE cache, while
-  SQLite's database file stays in the host page cache. The `bench_io` randread row,
-  where all four filesystems read with warm caches, is the like-for-like number.
+  SQLite's database file stays in the host page cache. The `bench_io` randread row
+  is not like-for-like either. `bench_io` reopens the file without dropping caches, so
+  ext4 and btrfs read from their page cache, while dbfs without `--kernel-cache` drops
+  its cache on open and reads through FUSE and SQLite.
 - **Loop overhead.** The loop device costs little for buffered I/O. It halves
   durable-write IOPS (93 against 206), because each flush passes through two
   filesystems.
@@ -301,7 +310,10 @@ Everything ran from one privileged container. The script is
 - **btrfs:** a 24 GiB loop image on that disk (`losetup --direct-io=on`). There is
   no ext4 loop control in this run, so the btrfs-backed rows include the loop
   device's cost.
-- **FUSE speed-ups.** Every FUSE mount got every speed-up available to it.
+- **FUSE speed-ups.** Each `pt` mount got every speed-up that passthrough_hp offers.
+  The plain `dbfs` rows use dbfs's defaults, without `--kernel-cache`, so they get
+  none of the kernel-cache speed-ups. The `dbfs-kc` rows get those, but not the
+  multithreading, io_uring or kernel passthrough, which fuser 0.16 does not support.
 
 | Config | Speed-ups |
 |---|---|
@@ -345,20 +357,26 @@ Every config completed `rm -rf` of the 20,000-entry directory in every round.
   goes through user space.
 - **4 KiB random writes.** 5.5×. Kernel passthrough doesn't help here, because
   every write is still a FUSE request.
-- **Metadata.** 4–5×: every create, stat and unlink is a FUSE round trip.
+- **Metadata.** 3.5–7× per create and unlink (5.6× in total): every create, stat and
+  unlink is a FUSE round trip.
 
 ### What dbfs's design costs (pt-user → dbfs, the same FUSE data path)
 
-- **Reads with `--kernel-cache`.** On par with `passthrough_hp` (8.5 against
-  8.4 GiB/s sequential; 2.96 against 2.91 GiB/s random). Without the flag,
-  dbfs drops its page cache on every open, and warm reads are 6× (sequential)
-  to 28× (random) slower.
-- **Writes.** 4× slower sequentially and 6–7× slower for 4 KiB random writes. The
+- **Reads with `--kernel-cache`.** On par with `passthrough_hp --nopassthrough` on
+  ext4: 8,545 against 8,429 MiB/s sequential, 2,959 against 2,912 MiB/s random. These
+  rows measure the kernel page cache, not dbfs's read path. Once the cache is warm,
+  the kernel serves the reads and they never reach the daemon. So they show that dbfs
+  does not get in the way of the cache, not how fast dbfs reads. Without the flag,
+  dbfs drops its page cache on every open, and warm reads are 6× (sequential) to 28×
+  (random) slower than `passthrough_hp --nopassthrough` on ext4 (1,397 against 8,429
+  MiB/s; 105 against 2,912 MiB/s).
+- **Writes.** On ext4, 4–4.5× slower sequentially and 6.6–7.5× slower for 4 KiB random writes than `passthrough_hp --nopassthrough`. The
   bottleneck is dbfs's own write path: a single thread, one lock per request, a
   copy into the arena, and SQLite chunk upserts on flush. The number of requests
   is not the limit: `--kernel-cache` raises the request size to 1 MiB and adds
-  the writeback cache, yet random writes improve only 14% and sequential writes
-  not at all.
+  the writeback cache, yet random writes improve 14% on ext4 (25.4 to 29.0 MiB/s)
+  and 9% on btrfs (18.3 to 19.9 MiB/s). Sequential writes move +12% on ext4 (174 to
+  195 MiB/s) and −11% on btrfs (148 to 132 MiB/s), with no consistent change.
 - **Metadata.** About 2× slower. Each create or unlink is a SQLite transaction on
   one thread, while `passthrough_hp` runs multithreaded system calls on ext4.
 - **Durable writes.** At the disk's limit, like everything else: about 200 IOPS

@@ -1,3 +1,12 @@
+//! Durability tests that mount dbfs. Each one is `#[ignore]`d and panics unless
+//! `DBFS_RUN_FUSE_TESTS=1` is set. Run them with:
+//!
+//! ```text
+//! DBFS_RUN_FUSE_TESTS=1 cargo test --test durability -- --ignored
+//! ```
+//!
+//! The two fsync tests also attach strace, which needs `ptrace` permission.
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -6,12 +15,28 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod common;
+
 fn supports_fuse() -> bool {
     Path::new("/dev/fuse").exists() && command_exists("fusermount3") && command_exists("mountpoint")
 }
 
-fn supports_fuse_trace() -> bool {
-    supports_fuse() && command_exists("strace")
+/// Panics unless the FUSE gate is open. The tests are `#[ignore]`d, so this runs
+/// only under `-- --ignored`, and a missing prerequisite fails instead of passing.
+fn require_fuse_gate() {
+    if std::env::var_os("DBFS_RUN_FUSE_TESTS").is_none() || !supports_fuse() {
+        panic!(
+            "FUSE mount tests require DBFS_RUN_FUSE_TESTS=1, /dev/fuse, fusermount3 and mountpoint"
+        );
+    }
+}
+
+/// `require_fuse_gate`, plus strace, which the fsync tests attach to dbfs.
+fn require_fuse_trace_gate() {
+    require_fuse_gate();
+    if !command_exists("strace") {
+        panic!("the fsync trace tests require strace");
+    }
 }
 
 fn command_exists(name: &str) -> bool {
@@ -45,6 +70,7 @@ impl Mounted {
         fs::create_dir_all(mountpoint).expect("create mountpoint");
         let mut child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
             .arg("mount")
+            .args(common::mount_args(&[]))
             .arg(db)
             .arg(mountpoint)
             .stdout(Stdio::null())
@@ -174,10 +200,9 @@ fn assert_wal_synced(log: &str, db: &Path) {
 }
 
 #[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1, fusermount3 and strace"]
 fn fsync_of_dirty_data_fdatasyncs_the_wal() {
-    if !supports_fuse_trace() {
-        return;
-    }
+    require_fuse_trace_gate();
 
     let dir = work_dir("dirty-fsync");
     let db = dir.join("db.sqlite");
@@ -208,10 +233,9 @@ fn fsync_of_dirty_data_fdatasyncs_the_wal() {
 }
 
 #[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1, fusermount3 and strace"]
 fn fsync_of_a_clean_file_fdatasyncs_the_wal() {
-    if !supports_fuse_trace() {
-        return;
-    }
+    require_fuse_trace_gate();
 
     let dir = work_dir("clean-fsync");
     let db = dir.join("db.sqlite");
@@ -240,10 +264,9 @@ fn fsync_of_a_clean_file_fdatasyncs_the_wal() {
 }
 
 #[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn fsynced_bytes_survive_kill_and_remount() {
-    if !supports_fuse() {
-        return;
-    }
+    require_fuse_gate();
 
     let dir = work_dir("kill-remount");
     let db = dir.join("db.sqlite");

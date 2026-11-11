@@ -2,32 +2,46 @@ use std::ffi::OsStr;
 use std::ops::Deref;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
+    FileAttr, FileType, Filesystem, KernelConfig, Notifier, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, TimeOrNow,
 };
 
-use crate::db::{CHUNK_SIZE, ChunkSpan, MAX_FILE_SIZE};
+use crate::blocks::{self, BlockMask, block_range};
+use crate::db::{CHUNK_SIZE, ChunkPiece, ChunkSpan, ChunkUpdate, MAX_FILE_SIZE};
 use crate::open_table::{OpenTable, Slot};
+use crate::stats::{self, Op};
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
-const ATTR_TTL: Duration = Duration::from_secs(1);
-/// Attribute and entry TTL with `--kernel-cache`. dbfs is the only writer of its
-/// database, so the kernel's cached attributes cannot go stale behind its back.
+/// Attribute and entry TTL used by the default mode and by `--kernel-cache`, where
+/// the kernel keeps attributes and names for a day. This is safe because dbfs is the
+/// only writer of its database and every change goes through the kernel. A change
+/// that no reply carries (a rename over a file with other links or open handles, an
+/// extending `fallocate`) is handled by `Shared::invalidate_attr`.
 const KERNEL_CACHE_TTL: Duration = Duration::from_secs(86_400);
+/// Attribute and entry TTL with `--no-keep-cache`: the kernel asks again after one second.
+const ATTR_TTL: Duration = Duration::from_secs(1);
 /// Largest read or write request without `--kernel-cache`: the kernel default
 /// before FUSE_MAX_PAGES, kept so the default mount behaves as it always has.
 const DEFAULT_MAX_REQUEST: u32 = 128 * 1024;
 /// Largest request with `--kernel-cache` (the kernel caps FUSE_MAX_PAGES at 256 pages).
 const KERNEL_CACHE_MAX_REQUEST: u32 = 1024 * 1024;
 
-/// Default budget for buffered writes, shared by all open files. When it is used
-/// up, the file with the most dirty chunks is flushed.
-pub const DEFAULT_WRITE_BUFFER: usize = 64 * 1024 * 1024;
+/// Default budget for buffered writes, shared by all open files. Memory is taken
+/// as dirty chunks need it and is never given back. When the budget is used up,
+/// the file with the most dirty chunks is partly written out (see
+/// `FLUSH_SLICE_CHUNKS`).
+pub const DEFAULT_WRITE_BUFFER: usize = 256 * 1024 * 1024;
+
+/// Most chunks one flush transaction stores (16 MiB). An eviction writes one slice,
+/// and a flush, fsync or close of a file with more dirty data writes it in slices.
+/// So a commit adds at most this much to the WAL, and a request that needs a free
+/// slot waits for at most this much data to be stored.
+const FLUSH_SLICE_CHUNKS: usize = 16 * 1024 * 1024 / CHUNK_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsStats {
@@ -58,8 +72,14 @@ pub struct Shared {
     table: Mutex<OpenTable>,
     /// Outcome of the latest flush on a shutdown path (`destroy` or a signal).
     last_flush: Mutex<Result<(), i32>>,
-    /// `--kernel-cache`: kernel writeback cache, long TTLs, kept page cache.
+    /// `--kernel-cache`: kernel writeback cache, 1 MiB requests and the other
+    /// options in `Filesystem::init`. Implies `keep_cache`.
     kernel_cache: bool,
+    /// Keep the kernel's page cache across opens and cache attributes and names for
+    /// a day. On by default; `--no-keep-cache` turns it off.
+    keep_cache: bool,
+    /// Sends kernel notifications. Set by `run.rs` once the session exists.
+    notifier: OnceLock<Notifier>,
 }
 
 impl Deref for Dbfs {
@@ -84,23 +104,41 @@ impl Shared {
         self.table.lock().unwrap()
     }
 
-    /// Writes the dirty chunks of `slot` to the database. On failure they stay
-    /// buffered, so a later flush can retry.
+    /// Writes every dirty chunk of `slot` to the database, one transaction per slice of
+    /// at most `FLUSH_SLICE_CHUNKS` chunks. A transaction is what the WAL grows by, so
+    /// slicing bounds that growth. On failure the chunks not yet stored stay buffered,
+    /// so a later flush can retry.
     fn flush_slot(&self, t: &mut OpenTable, slot: Slot, unlinked: Unlinked) -> Result<(), i32> {
+        while self.flush_chunks(t, slot, unlinked, FLUSH_SLICE_CHUNKS)? > 0 {}
+        Ok(())
+    }
+
+    /// Writes the `limit` lowest-indexed dirty chunks of `slot`, in one
+    /// transaction, and returns how many it wrote. On failure they stay buffered.
+    fn flush_chunks(
+        &self,
+        t: &mut OpenTable,
+        slot: Slot,
+        unlinked: Unlinked,
+        limit: usize,
+    ) -> Result<usize, i32> {
         let i = slot as usize;
         let OpenTable { inodes, arena, .. } = t;
         if inodes.dirty[i].is_empty() || (inodes.unlinked[i] && unlinked == Unlinked::Skip) {
-            return Ok(());
+            return Ok(0);
         }
-        let chunks = inodes.dirty[i]
-            .entries()
-            .iter()
-            .map(|&(chunk_index, a)| (chunk_index, arena.chunk(a)));
+        let entries = &inodes.dirty[i].entries()[..limit.min(inodes.dirty[i].len())];
+        let chunks = entries.iter().map(|&(chunk_index, a)| ChunkUpdate {
+            chunk_index,
+            buffer: arena.buffer(a),
+            dirty: arena.dirty(a),
+        });
         self.db
             .replace_chunks(inodes.ino[i], inodes.size[i], chunks, inodes.mtime[i])
             .map_err(errno_from_db_error)?;
-        inodes.dirty[i].release_into(arena);
-        Ok(())
+        let written = entries.len();
+        inodes.dirty[i].release_front(written, arena);
+        Ok(written)
     }
 
     /// Frees `slot` if nothing needs it any more: no handles and no dirty data.
@@ -180,27 +218,41 @@ impl Shared {
             .map_err(errno_from_db_error)?;
         let span = ChunkSpan::new(offset, output.len()).expect("non-empty read");
         for &(chunk_index, a) in inodes.dirty[i].range(span.first, span.last) {
-            span.copy_out(chunk_index, t.arena.chunk(a), &mut output);
+            span.copy_dirty_blocks(
+                chunk_index,
+                t.arena.dirty(a),
+                t.arena.buffer(a),
+                &mut output,
+            );
         }
         Ok(output)
     }
 
     /// An empty arena slot. When the write budget is used up, the inode with the
-    /// most dirty chunks (possibly `writing`, the one being written) is flushed
-    /// first.
+    /// most dirty chunks (possibly `writing`, the one being written) gives up its
+    /// lowest `FLUSH_SLICE_CHUNKS` dirty chunks, in one transaction, which
+    /// frees at least one slot.
     fn alloc_chunk(&self, t: &mut OpenTable, writing: Slot) -> Result<u32, i32> {
         loop {
             if let Some(a) = t.arena.alloc() {
                 return Ok(a);
             }
             let victim = t.inodes.largest_dirty().ok_or(libc::EIO)?;
-            self.flush_slot(t, victim, Unlinked::Persist)?;
+            let written = self.flush_chunks(t, victim, Unlinked::Persist, FLUSH_SLICE_CHUNKS)?;
+            debug_assert!(written > 0, "a victim has dirty chunks");
+            stats::eviction(written);
+            #[cfg(test)]
+            t.evicted_chunks.push(written);
             if victim != writing {
                 Self::free_if_idle(t, victim);
             }
         }
     }
 
+    /// Buffers `data` at `offset` and returns how many bytes it applied. If a chunk
+    /// fails after earlier chunks were applied, those stay buffered and visible, so
+    /// the write is reported as short: the caller reissues the rest and then gets the
+    /// error. Only a write that applies nothing returns the error itself.
     fn write_slot(
         &self,
         t: &mut OpenTable,
@@ -217,44 +269,101 @@ impl Shared {
             // acknowledge a write that nothing will persist.
             return Err(libc::EIO);
         }
-        let Some(span) = ChunkSpan::new(offset, data.len()) else {
+        if self.db.writes_refused() {
+            // A failed batch lost writes already acknowledged, so the filesystem takes
+            // no more: this write would never reach the database either.
+            return Err(libc::EIO);
+        }
+        if data.is_empty() {
             return Ok(0);
-        };
+        }
+        // An `offset + len` that overflows u64 is past the size limit as well.
+        let span = ChunkSpan::new(offset, data.len()).ok_or(libc::EFBIG)?;
         if span.end > MAX_FILE_SIZE {
             return Err(libc::EFBIG);
         }
+        // Set before the first chunk: a flush inside this write stores the new mtime.
+        let previous_mtime = t.inodes.mtime[i];
         t.inodes.mtime[i] = Timestamp::from_system_time(SystemTime::now());
 
-        let ino = t.inodes.ino[i];
+        let mut applied = 0;
         for chunk_index in span.first..=span.last {
             let piece = span.piece(chunk_index);
-            let a = match t.inodes.dirty[i].find(chunk_index) {
-                Ok(position) => t.inodes.dirty[i].slot_at(position),
-                Err(_) => {
-                    // May flush this inode too, so look the position up again after.
-                    let a = self.alloc_chunk(t, slot)?;
-                    if !piece.is_full_chunk() {
-                        let buffer = t.arena.buffer_mut(a);
-                        match self.db.read_chunk_into(ino, chunk_index, buffer) {
-                            Ok(len) => t.arena.set_len(a, len),
-                            Err(error) => {
-                                t.arena.release(a);
-                                return Err(errno_from_db_error(error));
-                            }
-                        }
-                    }
-                    let position = t.inodes.dirty[i].find(chunk_index).unwrap_err();
-                    t.inodes.dirty[i].insert(position, chunk_index, a);
-                    a
+            if let Err(errno) =
+                self.write_piece(t, slot, chunk_index, &piece, &data[piece.buf.clone()])
+            {
+                if applied == 0 {
+                    // Nothing changed, so the modification time stays as it was.
+                    t.inodes.mtime[i] = previous_mtime;
+                    return Err(errno);
                 }
-            };
-            t.arena.write(a, piece.chunk.clone(), &data[piece.buf]);
+                break;
+            }
+            applied = piece.buf.end;
             // Grow the size chunk by chunk, so an eviction in the middle of this
             // write stores a size that covers every chunk it stores.
             let chunk_end = chunk_index * CHUNK_SIZE as u64 + piece.chunk.end as u64;
             t.inodes.size[i] = t.inodes.size[i].max(chunk_end);
         }
-        Ok(data.len() as u32)
+        Ok(applied as u32)
+    }
+
+    /// Copies `bytes` into the part of chunk `chunk_index` that `piece` covers,
+    /// giving the chunk a slot first if it has none. The blocks that `piece` covers
+    /// only in part are read from the database, unless already dirty. Blocks it
+    /// covers completely are not read. On error nothing visible has changed.
+    fn write_piece(
+        &self,
+        t: &mut OpenTable,
+        slot: Slot,
+        chunk_index: u64,
+        piece: &ChunkPiece,
+        bytes: &[u8],
+    ) -> Result<(), i32> {
+        let i = slot as usize;
+        let (a, is_new) = match t.inodes.dirty[i].find(chunk_index) {
+            Ok(position) => (t.inodes.dirty[i].slot_at(position), false),
+            // May flush this inode too, so the index is searched again below.
+            Err(_) => (self.alloc_chunk(t, slot)?, true),
+        };
+        let unknown = blocks::partly_covered(piece.chunk.clone()) & !t.arena.dirty(a);
+        let ino = t.inodes.ino[i];
+        if let Err(errno) = self.load_blocks(t, ino, chunk_index, a, unknown) {
+            if is_new {
+                t.arena.release(a);
+            }
+            return Err(errno);
+        }
+        if is_new {
+            let position = t.inodes.dirty[i].find(chunk_index).unwrap_err();
+            t.inodes.dirty[i].insert(position, chunk_index, a);
+        }
+        t.arena.write(a, piece.chunk.clone(), bytes);
+        Ok(())
+    }
+
+    /// Reads the blocks in `mask` of chunk `chunk_index` from the database into slot
+    /// `a`. A hole reads as zeros. The blocks stay unknown until a write marks them
+    /// dirty, so the caller must not read them as data before then.
+    fn load_blocks(
+        &self,
+        t: &mut OpenTable,
+        ino: u64,
+        chunk_index: u64,
+        a: u32,
+        mask: BlockMask,
+    ) -> Result<(), i32> {
+        let chunk_start = chunk_index * CHUNK_SIZE as u64;
+        let buffer = t.arena.buffer_mut(a);
+        for block in blocks::iter(mask) {
+            let range = block_range(block);
+            buffer[range.clone()].fill(0);
+            crate::stats::read_before_write();
+            self.db
+                .read_into(ino, chunk_start + range.start as u64, &mut buffer[range])
+                .map_err(errno_from_db_error)?;
+        }
+        Ok(())
     }
 
     /// Drops one handle. The last handle of an inode unlinked while open deletes
@@ -297,6 +406,17 @@ impl Shared {
             .is_some_and(|slot| t.inodes.is_open(slot))
     }
 
+    /// Makes the kernel forget its cached attributes of `ino`, for a change that the
+    /// request's reply does not carry, so the next access asks dbfs again. Only
+    /// attributes are dropped (offset -1). A notification that also drops pages can
+    /// wait for page locks, and a write in flight holds them until this thread
+    /// replies, which would deadlock. If the send fails, the mount is going away.
+    fn invalidate_attr(&self, ino: u64) {
+        if let Some(notifier) = self.notifier.get() {
+            let _ = notifier.inval_inode(ino, -1, 0);
+        }
+    }
+
     /// Size and mtime overlay for an inode with buffered writes.
     fn overlay_attr(&self, attr: &mut FileAttr) {
         let t = self.table();
@@ -309,7 +429,9 @@ impl Shared {
         if !t.inodes.dirty[i].is_empty() {
             let modified = t.inodes.mtime[i].to_system_time();
             attr.mtime = modified;
-            attr.ctime = modified;
+            // The stored ctime can be later than the buffered write, as after a
+            // `link`. Report the later of the two.
+            attr.ctime = attr.ctime.max(modified);
         }
     }
 }
@@ -335,6 +457,20 @@ impl ShutdownHandle {
     }
 }
 
+/// Hands the session's notifier to the filesystem. The session takes the
+/// filesystem by value, so the notifier can only be attached after it exists.
+pub(crate) struct NotifyHandle {
+    shared: Arc<Shared>,
+}
+
+impl NotifyHandle {
+    /// Attaches the notifier. Call it before the session runs. A second call keeps
+    /// the first notifier.
+    pub(crate) fn attach(&self, notifier: Notifier) {
+        let _ = self.shared.notifier.set(notifier);
+    }
+}
+
 impl Dbfs {
     pub fn new(db: Db) -> Self {
         Self::with_write_buffer(db, DEFAULT_WRITE_BUFFER)
@@ -349,30 +485,52 @@ impl Dbfs {
                 table: Mutex::new(OpenTable::new(write_buffer)),
                 last_flush: Mutex::new(Ok(())),
                 kernel_cache: false,
+                keep_cache: true,
+                notifier: OnceLock::new(),
             }),
         }
     }
 
     /// Turns on the kernel-side caches (`--kernel-cache`). Must be called before
-    /// the filesystem is mounted.
+    /// the filesystem is mounted. It implies `with_keep_cache(true)`.
     pub fn with_kernel_cache(mut self, enabled: bool) -> Self {
-        Arc::get_mut(&mut self.shared)
-            .expect("kernel cache is set before the filesystem is shared")
-            .kernel_cache = enabled;
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("kernel cache is set before the filesystem is shared");
+        shared.kernel_cache = enabled;
+        shared.keep_cache |= enabled;
         self
     }
 
+    /// Whether the kernel keeps file data across opens and caches attributes and
+    /// names for a day (the default). `false` (`--no-keep-cache`) drops the page
+    /// cache on every open and expires attributes and names after one second.
+    /// Must be called before the filesystem is mounted.
+    pub fn with_keep_cache(mut self, enabled: bool) -> Self {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("keep cache is set before the filesystem is shared");
+        shared.keep_cache = enabled || shared.kernel_cache;
+        self
+    }
+
+    /// The handle `run.rs` uses to attach the session's notifier.
+    pub(crate) fn notify_handle(&self) -> NotifyHandle {
+        NotifyHandle {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     fn ttl(&self) -> Duration {
-        if self.kernel_cache {
+        if self.keep_cache {
             KERNEL_CACHE_TTL
         } else {
             ATTR_TTL
         }
     }
 
-    /// FOPEN flags for `open` and `create` replies.
+    /// FOPEN flags for `open` and `create` replies. `FOPEN_KEEP_CACHE` keeps the
+    /// page cache across opens. Without it, every open drops the cached data.
     fn open_flags(&self) -> u32 {
-        if self.kernel_cache {
+        if self.keep_cache {
             fuser::consts::FOPEN_KEEP_CACHE
         } else {
             0
@@ -383,6 +541,23 @@ impl Dbfs {
     /// after a failure and returns the first error; a failed buffer stays dirty.
     pub fn flush_all(&self) -> Result<(), i32> {
         self.shared.flush_all()
+    }
+
+    /// Makes committed directory changes durable for `fsyncdir`. Directories hold
+    /// no buffered data and every change is a database commit, so syncing the WAL
+    /// is enough. The handle is not used: `opendir` returns 0 and nothing is kept
+    /// per directory.
+    pub fn sync_dir(&self) -> Result<(), i32> {
+        self.db.sync_durable().map_err(errno_from_db_error)
+    }
+
+    /// Test hook for disk-full tests: caps the database at `pages` pages. A write
+    /// that needs a page past the cap fails with `ENOSPC`. A higher value lifts it.
+    #[doc(hidden)]
+    pub fn set_max_page_count(&self, pages: u64) -> Result<(), i32> {
+        self.db
+            .set_max_page_count(pages)
+            .map_err(errno_from_db_error)
     }
 
     /// A handle for the shutdown path in `run.rs`. It keeps working after this
@@ -396,10 +571,14 @@ impl Dbfs {
     pub fn statfs(&self) -> Result<FsStats, i32> {
         let usage = self.db.volume_usage().map_err(errno_from_db_error)?;
         let bsize = usage.page_size as u32;
+        // The WAL file is disk space in use until a checkpoint moves its pages into the
+        // database file, so it counts against the free pages.
+        let wal_pages = self.db.wal_file_bytes().div_ceil(usage.page_size);
+        let free = usage.freelist_count.saturating_sub(wal_pages);
         Ok(FsStats {
             blocks: usage.page_count,
-            bfree: usage.freelist_count,
-            bavail: usage.freelist_count,
+            bfree: free,
+            bavail: free,
             files: usage.files,
             ffree: 0,
             bsize,
@@ -525,10 +704,13 @@ impl Dbfs {
     }
 
     pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &[u8]) -> Result<FileAttr, i32> {
-        self.db
+        let mut attr = self
+            .db
             .link(ino, new_parent_ino, new_name)
             .map(|inode| file_attr_from_inode(&inode))
-            .map_err(errno_from_db_error)
+            .map_err(errno_from_db_error)?;
+        self.overlay_attr(&mut attr);
+        Ok(attr)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -542,19 +724,19 @@ impl Dbfs {
         atime: Option<SystemTime>,
         mtime: Option<SystemTime>,
     ) -> Result<FileAttr, i32> {
-        // Persist buffered writes first: the returned attributes must include
-        // them, and a later flush must not overwrite the mtime set here (`cp -a`
+        // A size change flushes buffered writes first (`truncate_locked`). Any other
+        // change leaves them buffered: with the writeback cache the kernel sends a
+        // timestamp-only setattr during writeback, and flushing the whole file each
+        // time multiplied the data written. A new mtime is also kept in the slot, so
+        // the later flush stores it instead of the time of the last write (`cp -a`
         // writes, then calls utimensat, then closes).
+        let mtime = mtime.map(Timestamp::from_system_time);
         let mut t = self.table();
-        if let Some(slot) = t.inodes.find(ino) {
-            self.flush_slot(&mut t, slot, Unlinked::Persist)?;
-            Shared::free_if_idle(&mut t, slot);
-        }
         if let Some(size) = size {
             self.truncate_locked(&mut t, ino, size)?;
         }
-
-        self.db
+        let attr = self
+            .db
             .update_metadata(
                 ino,
                 MetadataUpdate {
@@ -562,18 +744,27 @@ impl Dbfs {
                     uid,
                     gid,
                     atime: atime.map(Timestamp::from_system_time),
-                    mtime: mtime.map(Timestamp::from_system_time),
+                    mtime,
                 },
             )
             .map(|inode| file_attr_from_inode(&inode))
-            .map_err(errno_from_db_error)
+            .map_err(errno_from_db_error)?;
+        if let (Some(mtime), Some(slot)) = (mtime, t.inodes.find(ino)) {
+            t.inodes.mtime[slot as usize] = mtime;
+        }
+        drop(t);
+        let mut attr = attr;
+        self.overlay_attr(&mut attr);
+        Ok(attr)
     }
 
-    /// Extended attributes are not stored, so no name exists on any inode. An
-    /// existing inode answers `ENODATA`, which tools read as "no such attribute".
+    /// Extended attributes are not stored. An existing inode answers `ENOSYS` on
+    /// purpose: the kernel then sets `fc->no_getxattr` and stops sending
+    /// `getxattr` for the mount, so the `security.capability` probe no longer
+    /// costs a round trip per write. Callers see `EOPNOTSUPP`.
     pub fn getxattr(&self, ino: u64, _name: &[u8]) -> Result<Vec<u8>, i32> {
         self.getattr(ino)?;
-        Err(libc::ENODATA)
+        Err(libc::ENOSYS)
     }
 
     /// The name list is always empty: there are no extended attributes to list.
@@ -594,10 +785,16 @@ impl Dbfs {
         Err(libc::ENODATA)
     }
 
-    /// Opens `ino` and returns a new file handle for it.
+    /// Opens `ino` and returns a new file handle for it. A directory is refused
+    /// with `EISDIR`: the kernel opens directories with OPENDIR, never OPEN, and a
+    /// directory handle would keep an open slot alive after `rmdir`.
     pub fn open(&self, ino: u64) -> Result<u64, i32> {
         let mut t = self.table();
         let slot = self.slot_for(&mut t, ino)?;
+        if t.inodes.kind[slot as usize] == FileKind::Directory {
+            Shared::free_if_idle(&mut t, slot);
+            return Err(libc::EISDIR);
+        }
         Ok(Shared::open_slot(&mut t, slot))
     }
 
@@ -672,7 +869,11 @@ impl Dbfs {
         if end <= size {
             return Ok(());
         }
-        self.truncate_locked(&mut t, ino, end)
+        self.truncate_locked(&mut t, ino, end)?;
+        // The reply carries no attributes, and the extension also set the mtime and
+        // ctime in the database, so the kernel must ask again.
+        self.invalidate_attr(ino);
+        Ok(())
     }
 
     fn truncate_locked(&self, t: &mut OpenTable, ino: u64, size: u64) -> Result<(), i32> {
@@ -764,6 +965,10 @@ impl Dbfs {
             .map_err(errno_from_db_error)?;
         if let Some(target) = replaced {
             Shared::entry_removed(&mut t, &target);
+            // The reply carries no attributes. The target's link count dropped (and
+            // its ctime moved, if it lives on under another name or an open handle),
+            // and the kernel cannot see that from this request.
+            self.invalidate_attr(target.ino);
         }
         Ok(())
     }
@@ -818,9 +1023,13 @@ impl Filesystem for Dbfs {
         // `ShutdownHandle::flush_failure`, which `run` checks before exiting.
         let result = self.flush_all();
         self.shared.record_flush(result);
+        // After the flush, so the data is in the WAL and fsynced. Stops the checkpoint
+        // thread, then empties the WAL.
+        self.shared.db.close_checkpoints();
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let _op = stats::op(Op::Lookup);
         match Dbfs::lookup(self, parent, name.as_bytes()) {
             Ok(attr) => reply.entry(&self.ttl(), &attr, 0),
             Err(errno) => reply.error(errno),
@@ -828,6 +1037,7 @@ impl Filesystem for Dbfs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        let _op = stats::op(Op::Getattr);
         match Dbfs::getattr(self, ino) {
             Ok(attr) => reply.attr(&self.ttl(), &attr),
             Err(errno) => reply.error(errno),
@@ -842,6 +1052,7 @@ impl Filesystem for Dbfs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        let _op = stats::op(Op::Readdir);
         let result = self.readdir_stream(ino, offset, |ino, next_offset, kind, name| {
             reply.add(ino, next_offset, kind, OsStr::from_bytes(name))
         });
@@ -852,6 +1063,7 @@ impl Filesystem for Dbfs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        let _op = stats::op(Op::Statfs);
         match Dbfs::statfs(self) {
             Ok(stat) => reply.statfs(
                 stat.blocks,
@@ -876,6 +1088,7 @@ impl Filesystem for Dbfs {
         umask: u32,
         reply: ReplyEntry,
     ) {
+        let _op = stats::op(Op::Mkdir);
         match Dbfs::mkdir(
             self,
             parent,
@@ -900,6 +1113,7 @@ impl Filesystem for Dbfs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let _op = stats::op(Op::Create);
         match self.create_open(parent, name.as_bytes(), mode, umask, req.uid(), req.gid()) {
             // Pass 0 for FOPEN flags (not syscall open flags). The kernel validates
             // these against known FOPEN_* constants and rejects other values with EIO.
@@ -916,6 +1130,7 @@ impl Filesystem for Dbfs {
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        let _op = stats::op(Op::Other);
         match Dbfs::symlink(
             self,
             parent,
@@ -930,6 +1145,7 @@ impl Filesystem for Dbfs {
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let _op = stats::op(Op::Other);
         match Dbfs::readlink(self, ino) {
             Ok(target) => reply.data(&target),
             Err(errno) => reply.error(errno),
@@ -944,6 +1160,7 @@ impl Filesystem for Dbfs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let _op = stats::op(Op::Link);
         match Dbfs::link(self, ino, newparent, newname.as_bytes()) {
             Ok(attr) => reply.entry(&self.ttl(), &attr, 0),
             Err(errno) => reply.error(errno),
@@ -969,6 +1186,7 @@ impl Filesystem for Dbfs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let _op = stats::op(Op::Setattr);
         match Dbfs::setattr(
             self,
             ino,
@@ -992,6 +1210,7 @@ impl Filesystem for Dbfs {
         size: u32,
         reply: ReplyXattr,
     ) {
+        let _op = stats::op(Op::Getxattr);
         match Dbfs::getxattr(self, ino, name.as_bytes()) {
             Ok(value) => reply_xattr(&value, size, reply),
             Err(errno) => reply.error(errno),
@@ -999,6 +1218,7 @@ impl Filesystem for Dbfs {
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        let _op = stats::op(Op::Other);
         match Dbfs::listxattr(self, ino) {
             Ok(names) => reply_xattr(&names, size, reply),
             Err(errno) => reply.error(errno),
@@ -1015,6 +1235,7 @@ impl Filesystem for Dbfs {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Other);
         match Dbfs::setxattr(self, ino, name.as_bytes()) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1022,6 +1243,7 @@ impl Filesystem for Dbfs {
     }
 
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _op = stats::op(Op::Other);
         match Dbfs::removexattr(self, ino, name.as_bytes()) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1029,6 +1251,7 @@ impl Filesystem for Dbfs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let _op = stats::op(Op::Open);
         match Dbfs::open(self, ino) {
             Ok(fh) => reply.opened(fh, self.open_flags()),
             Err(errno) => reply.error(errno),
@@ -1045,6 +1268,7 @@ impl Filesystem for Dbfs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Release);
         match self.release_fh(fh) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1059,6 +1283,7 @@ impl Filesystem for Dbfs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Flush);
         match self.flush_fh(fh) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1073,7 +1298,23 @@ impl Filesystem for Dbfs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Fsync);
         match self.sync_fh(fh) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let _op = stats::op(Op::Fsyncdir);
+        match self.sync_dir() {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
@@ -1090,6 +1331,7 @@ impl Filesystem for Dbfs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let _op = stats::op(Op::Read);
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -1113,6 +1355,7 @@ impl Filesystem for Dbfs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        let _op = stats::op(Op::Write);
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -1134,6 +1377,7 @@ impl Filesystem for Dbfs {
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Other);
         match Dbfs::fallocate(self, ino, offset, length, mode) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1141,6 +1385,7 @@ impl Filesystem for Dbfs {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _op = stats::op(Op::Unlink);
         match Dbfs::unlink(self, parent, name.as_bytes()) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1148,6 +1393,7 @@ impl Filesystem for Dbfs {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _op = stats::op(Op::Rmdir);
         match Dbfs::rmdir(self, parent, name.as_bytes()) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1164,6 +1410,7 @@ impl Filesystem for Dbfs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        let _op = stats::op(Op::Mknod);
         let file_type = mode & libc::S_IFMT;
         const S_IFREG: u32 = libc::S_IFREG;
         match file_type {
@@ -1197,6 +1444,7 @@ impl Filesystem for Dbfs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Rename);
         match Dbfs::rename(
             self,
             parent,
@@ -1261,6 +1509,7 @@ fn errno_from_db_error(error: DbError) -> i32 {
         DbError::NoSpace => libc::ENOSPC,
         DbError::NotDirectory => libc::ENOTDIR,
         DbError::FileTooLarge => libc::EFBIG,
+        DbError::DatabaseInUse => libc::EBUSY,
         DbError::Corrupt | DbError::UnsupportedSchema(_) | DbError::Sqlite(_) => libc::EIO,
     }
 }
@@ -1509,6 +1758,102 @@ mod tests {
         );
     }
 
+    /// One byte at the start of each of `chunks` chunks, so a write needs a new
+    /// slot per chunk and stores almost nothing.
+    fn one_byte_per_chunk(fs: &Dbfs, fh: u64, chunks: usize) {
+        for c in 0..chunks {
+            let byte = [(c % 251) as u8 + 1];
+            fs.write_fh(fh, (c * CHUNK_SIZE) as u64, &byte)
+                .expect("buffer write");
+        }
+    }
+
+    #[test]
+    fn an_eviction_writes_one_slice_and_the_rest_stays_buffered() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"big.bin", 0o644, 1, 1)
+            .expect("create file");
+        let budget = FLUSH_SLICE_CHUNKS + 44;
+        let fs = Dbfs::with_write_buffer(db, budget * CHUNK_SIZE);
+        let fh = fs.open(file.ino).expect("open");
+
+        // Chunks 0..=budget fill the arena. Writing chunk `budget` evicts.
+        one_byte_per_chunk(&fs, fh, budget + 1);
+        assert_eq!(fs.table().evicted_chunks, [FLUSH_SLICE_CHUNKS]);
+        let stored = |c: usize| fs.db.read_file(file.ino, (c * CHUNK_SIZE) as u64, 1);
+        assert_eq!(
+            stored(FLUSH_SLICE_CHUNKS - 1).expect("read"),
+            [((FLUSH_SLICE_CHUNKS - 1) % 251) as u8 + 1],
+            "the lowest slice reached the database"
+        );
+        assert_eq!(
+            stored(FLUSH_SLICE_CHUNKS).expect("read"),
+            [0],
+            "the next chunk is still buffered, so the database has a hole"
+        );
+        assert_eq!(fs.arena_stats().1, budget + 1 - FLUSH_SLICE_CHUNKS);
+
+        // Keep going well past the budget: every eviction is one slice.
+        let total = 3 * budget;
+        for c in budget + 1..total {
+            fs.write_fh(fh, (c * CHUNK_SIZE) as u64, &[(c % 251) as u8 + 1])
+                .expect("buffer write");
+        }
+        let evicted = fs.table().evicted_chunks.clone();
+        assert!(evicted.len() >= 3, "{evicted:?}");
+        assert!(
+            evicted.iter().all(|&n| n == FLUSH_SLICE_CHUNKS),
+            "every eviction writes one slice: {evicted:?}"
+        );
+
+        fs.release_file(fh).expect("release");
+        for c in 0..total {
+            let byte = (c % 251) as u8 + 1;
+            assert_eq!(
+                fs.db
+                    .read_file(file.ino, (c * CHUNK_SIZE) as u64, 1)
+                    .expect("read stored"),
+                [byte],
+                "chunk {c} is stored"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_slice_keeps_every_buffered_chunk() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"full.bin", 0o644, 1, 1)
+            .expect("create file");
+        db.cap_page_count_at_current()
+            .expect("cap sqlite page count");
+        let budget = FLUSH_SLICE_CHUNKS + 44;
+        let fs = Dbfs::with_write_buffer(db, budget * CHUNK_SIZE);
+        let fh = fs.open(file.ino).expect("open");
+        // Half-chunk writes, so the slice needs new database pages and the cap bites.
+        for c in 0..budget {
+            let half = vec![(c % 251) as u8 + 1; CHUNK_SIZE / 2];
+            fs.write_fh(fh, (c * CHUNK_SIZE) as u64, &half)
+                .expect("buffer write");
+        }
+
+        assert_eq!(
+            fs.write_fh(fh, (budget * CHUNK_SIZE) as u64, b"x"),
+            Err(libc::ENOSPC),
+            "the slice cannot be stored"
+        );
+        assert!(fs.table().evicted_chunks.is_empty(), "nothing was counted");
+        assert_eq!(fs.arena_stats().1, budget, "no slot was freed");
+        for c in 0..budget {
+            assert_eq!(
+                fs.read_fh(fh, (c * CHUNK_SIZE) as u64, 1).expect("read"),
+                [(c % 251) as u8 + 1],
+                "chunk {c} is still buffered"
+            );
+        }
+    }
+
     #[test]
     fn a_failed_eviction_keeps_the_buffered_data() {
         let db = Db::open_in_memory().expect("open in-memory database");
@@ -1532,5 +1877,195 @@ mod tests {
             first,
             "the earlier buffered data is intact"
         );
+    }
+
+    #[test]
+    fn a_write_that_fails_part_way_reports_the_bytes_already_applied() {
+        // Offset 0 starts on a chunk boundary; offset 100 starts with a partial chunk.
+        for offset in [0u64, 100] {
+            let db = Db::open_in_memory().expect("open in-memory database");
+            let file = db
+                .create_file(1, b"partial.bin", 0o644, 1, 1)
+                .expect("create file");
+            db.cap_page_count_at_current()
+                .expect("cap sqlite page count");
+            // Room for one chunk. The second chunk needs a flush of the first, which fails.
+            let fs = Dbfs::with_write_buffer(db, CHUNK_SIZE);
+            let fh = fs.open(file.ino).expect("open");
+            let data = vec![7u8; 2 * CHUNK_SIZE];
+
+            let written = fs
+                .write_fh(fh, offset, &data)
+                .expect("the applied chunk is reported as a short write");
+
+            let applied = CHUNK_SIZE - offset as usize;
+            assert_eq!(written as usize, applied, "offset {offset}");
+            assert_eq!(
+                fs.getattr(file.ino).expect("attr").size,
+                offset + written as u64,
+                "offset {offset}: size covers exactly the reported bytes"
+            );
+            assert_eq!(
+                fs.read_fh(fh, offset, data.len() as u32).expect("read"),
+                &data[..applied],
+                "offset {offset}: the reported bytes are visible"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_that_applies_nothing_leaves_size_and_mtime_alone() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"full.bin", 0o644, 1, 1)
+            .expect("create file");
+        db.cap_page_count_at_current()
+            .expect("cap sqlite page count");
+        let fs = Dbfs::with_write_buffer(db, CHUNK_SIZE);
+        let fh = fs.open(file.ino).expect("open");
+        // A whole chunk, so flushing it needs pages the capped database does not have.
+        fs.write_fh(fh, 0, &vec![5u8; CHUNK_SIZE])
+            .expect("fills the budget");
+        let before = fs.getattr(file.ino).expect("attr before");
+
+        // The next chunk needs a flush of the first, which fails: nothing is applied.
+        assert_eq!(
+            fs.write_fh(fh, CHUNK_SIZE as u64, b"more"),
+            Err(libc::ENOSPC)
+        );
+
+        let after = fs.getattr(file.ino).expect("attr after");
+        assert_eq!(after.size, before.size);
+        assert_eq!(after.mtime, before.mtime, "a failed write keeps the mtime");
+    }
+
+    #[test]
+    fn keep_cache_is_the_default_and_no_keep_cache_restores_one_second_timeouts() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let fs = Dbfs::new(db);
+        assert_eq!(fs.ttl(), KERNEL_CACHE_TTL);
+        assert_eq!(fs.open_flags(), fuser::consts::FOPEN_KEEP_CACHE);
+
+        let fs = fs.with_keep_cache(false);
+        assert_eq!(fs.ttl(), ATTR_TTL);
+        assert_eq!(fs.open_flags(), 0);
+    }
+
+    #[test]
+    fn kernel_cache_implies_keep_cache() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let fs = Dbfs::new(db).with_kernel_cache(true).with_keep_cache(false);
+        assert_eq!(fs.ttl(), KERNEL_CACHE_TTL);
+        assert_eq!(fs.open_flags(), fuser::consts::FOPEN_KEEP_CACHE);
+    }
+
+    /// The dirty blocks of chunk `chunk` of `ino`, or `None` if it has no slot.
+    fn chunk_dirty(fs: &Dbfs, ino: u64, chunk: u64) -> Option<BlockMask> {
+        let t = fs.table();
+        let idx = &t.inodes.dirty[t.inodes.find(ino)? as usize];
+        let position = idx.find(chunk).ok()?;
+        Some(t.arena.dirty(idx.slot_at(position)))
+    }
+
+    #[test]
+    fn partial_writes_mark_only_the_blocks_they_touch() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"sparse.bin", 0o644, 1, 1)
+            .expect("create file");
+        let fs = Dbfs::new(db);
+        let fh = fs.open(file.ino).expect("open");
+
+        // Block 1 is covered whole, so it needs no read. Block 0 is covered in part.
+        fs.write_fh(fh, CHUNK_SIZE as u64 + 4096, &[1; 4096])
+            .expect("whole block");
+        assert_eq!(chunk_dirty(&fs, file.ino, 1), Some(0b10));
+        fs.write_fh(fh, CHUNK_SIZE as u64 + 100, &[2; 10])
+            .expect("part of block 0");
+        assert_eq!(chunk_dirty(&fs, file.ino, 1), Some(0b11));
+
+        // Blocks 0 and 2 are covered in part, block 1 whole.
+        fs.write_fh(fh, 2 * CHUNK_SIZE as u64 + 4000, &[3; 6000])
+            .expect("crosses three blocks");
+        assert_eq!(chunk_dirty(&fs, file.ino, 2), Some(0b111));
+        assert_eq!(
+            chunk_dirty(&fs, file.ino, 0),
+            None,
+            "chunk 0 is not buffered"
+        );
+
+        let mut want = vec![0u8; 4096];
+        want[100..110].fill(2);
+        assert_eq!(
+            fs.read_fh(fh, CHUNK_SIZE as u64 + 4096, 4096)
+                .expect("read"),
+            vec![1u8; 4096]
+        );
+        assert_eq!(
+            fs.read_fh(fh, CHUNK_SIZE as u64, 4096).expect("read"),
+            want,
+            "block 0 keeps the zeros around the bytes written"
+        );
+    }
+
+    #[test]
+    fn a_reused_slot_never_shows_the_stale_bytes_of_an_unknown_block() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"reuse.bin", 0o644, 1, 1)
+            .expect("create file");
+        // One slot. Chunk 0 fills it with 0x77, and the flush releases it with
+        // those bytes still in the buffer.
+        let fs = Dbfs::with_write_buffer(db, CHUNK_SIZE);
+        let fh = fs.open(file.ino).expect("open");
+        fs.write_fh(fh, 0, &vec![0x77; CHUNK_SIZE])
+            .expect("chunk 0");
+        fs.flush_file(file.ino).expect("flush");
+
+        // Chunk 1 is a hole that takes the same slot. Only its block 0 is loaded,
+        // and only its bytes 5 and 9000 are written. Block 1 is unknown.
+        let chunk1 = CHUNK_SIZE as u64;
+        fs.write_fh(fh, chunk1 + 5, &[0x42]).expect("first byte");
+        fs.write_fh(fh, chunk1 + 9000, &[0x43])
+            .expect("second byte");
+        assert_eq!(chunk_dirty(&fs, file.ino, 1), Some(0b101));
+
+        let mut want = vec![0u8; 9001];
+        want[5] = 0x42;
+        want[9000] = 0x43;
+        assert_eq!(
+            fs.read_fh(fh, chunk1, 9001).expect("read while buffered"),
+            want,
+            "the unknown block 1 reads as a hole, not as stale 0x77"
+        );
+        fs.release_file(fh).expect("release");
+        fs.flush_all().expect("flush");
+        assert_eq!(
+            fs.db
+                .read_file(file.ino, chunk1, 9001)
+                .expect("read stored"),
+            want
+        );
+    }
+
+    #[test]
+    fn a_partial_flush_patches_the_stored_chunk_and_keeps_its_length() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"patch.bin", 0o644, 1, 1)
+            .expect("create file");
+        let fs = Dbfs::new(db);
+        let fh = fs.open(file.ino).expect("open");
+        let original: Vec<u8> = (0..CHUNK_SIZE).map(|i| (i % 253) as u8 + 1).collect();
+        fs.write_fh(fh, 0, &original).expect("whole chunk");
+        fs.flush_file(file.ino).expect("store it");
+
+        // One byte in block 3. The flush stores the chunk, patched in place.
+        fs.write_fh(fh, 3 * 4096 + 7, &[0xEE]).expect("patch");
+        fs.flush_file(file.ino).expect("flush the patch");
+        let mut want = original;
+        want[3 * 4096 + 7] = 0xEE;
+        assert_eq!(fs.db.read_file(file.ino, 0, u32::MAX).expect("read"), want);
+        fs.release_file(fh).expect("release");
     }
 }

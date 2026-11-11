@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dbfs::{
-    Db, DbError, Dbfs, FileKind, MetadataUpdate, SCHEMA_VERSION, Timestamp, file_attr_from_inode,
+    Db, DbError, Dbfs, FileKind, MetadataUpdate, OpenOptions, SCHEMA_VERSION, Timestamp,
+    file_attr_from_inode,
 };
 use rusqlite::{Connection, params};
 
@@ -52,6 +53,7 @@ fn file_backed_database_persists_entries_after_reopen() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -76,6 +78,59 @@ fn file_backed_database_enables_wal_and_foreign_keys() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+}
+
+#[test]
+fn new_database_gets_16_kib_pages_and_keeps_them_on_reopen() {
+    let path = temp_db_path("new-page-size");
+    // An empty file, not a missing one: both count as new.
+    std::fs::File::create(&path).expect("create empty database file");
+    {
+        let db = Db::open(&path).expect("open new file-backed database");
+        db.create_dir(1, b"docs", 0o755, 1000, 1000)
+            .expect("create directory");
+    }
+    assert_eq!(raw_page_size(&path), 16384);
+
+    drop(Db::open(&path).expect("reopen file-backed database"));
+    assert_eq!(raw_page_size(&path), 16384);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+}
+
+#[test]
+fn existing_database_keeps_its_page_size() {
+    let path = temp_db_path("existing-page-size");
+    {
+        let conn = Connection::open(&path).expect("open raw sqlite connection");
+        conn.execute_batch(
+            "
+            PRAGMA page_size = 4096;
+            CREATE TABLE marker (a INTEGER);
+            INSERT INTO marker VALUES (1);
+            ",
+        )
+        .expect("create 4 KiB database");
+    }
+
+    drop(Db::open(&path).expect("open existing database"));
+    assert_eq!(raw_page_size(&path), 4096);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+}
+
+/// The page size of the file, read through a plain SQLite connection.
+fn raw_page_size(path: &Path) -> i64 {
+    let conn = Connection::open(path).expect("open raw sqlite connection");
+    conn.query_row("PRAGMA page_size", [], |row| row.get(0))
+        .expect("read page size")
 }
 
 #[test]
@@ -114,6 +169,7 @@ fn opening_legacy_database_migrates_root_owner_to_mount_user() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -156,6 +212,7 @@ fn legacy_second_timestamps_read_back_with_zero_nsec() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -202,6 +259,7 @@ fn legacy_directory_nlink_counts_subdirectories() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -602,6 +660,59 @@ fn rename_over_hardlink_only_removes_destination_name() {
 }
 
 #[test]
+fn rename_over_a_non_empty_directory_is_refused() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let source = db
+        .create_dir(1, b"source", 0o755, 1000, 1000)
+        .expect("create source directory");
+    let target = db
+        .create_dir(1, b"target", 0o755, 1000, 1000)
+        .expect("create target directory");
+    db.create_file(target.ino, b"keep.txt", 0o644, 1000, 1000)
+        .expect("create entry inside target");
+
+    let result = db
+        .rename(1, b"source", 1, b"target")
+        .expect_err("a non-empty directory cannot be replaced");
+
+    assert_eq!(result, DbError::DirectoryNotEmpty);
+    assert_eq!(
+        db.lookup(1, b"source").expect("source stays").ino,
+        source.ino
+    );
+    assert_eq!(
+        db.lookup(target.ino, b"keep.txt")
+            .expect("target kept")
+            .kind,
+        FileKind::RegularFile
+    );
+}
+
+#[test]
+fn rename_onto_another_name_of_the_same_inode_changes_nothing() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"a", 0o644, 1000, 1000)
+        .expect("create file");
+    db.link(file.ino, 1, b"b").expect("create second name");
+    let dir = db
+        .create_dir(1, b"dir", 0o755, 1000, 1000)
+        .expect("create directory");
+    db.link(file.ino, dir.ino, b"c")
+        .expect("create name in another directory");
+
+    db.rename(1, b"a", 1, b"b")
+        .expect("POSIX: renaming onto a link to the same inode is a no-op");
+    db.rename(1, b"b", dir.ino, b"c")
+        .expect("same no-op across directories");
+
+    assert_eq!(db.lookup(1, b"a").expect("a stays").ino, file.ino);
+    assert_eq!(db.lookup(1, b"b").expect("b stays").ino, file.ino);
+    assert_eq!(db.lookup(dir.ino, b"c").expect("c stays").ino, file.ino);
+    assert_eq!(db.get_inode(file.ino).expect("inode").nlink, 3);
+}
+
+#[test]
 fn rejects_moving_directory_into_its_descendant() {
     let db = Db::open_in_memory().expect("open in-memory database");
     let parent = db
@@ -878,12 +989,42 @@ fn unversioned_legacy_database_migrates_to_current_schema() {
 #[test]
 fn database_from_newer_dbfs_is_rejected_untouched() {
     let path = disk_db_path("schema-newer");
-    drop(Db::open(&path).expect("create database"));
     let newer = SCHEMA_VERSION + 1;
-    exec_sql(&path, &format!("PRAGMA user_version = {newer}"));
+    // A rollback-journal database (not WAL) with a table of its own.
+    exec_sql(
+        &path,
+        &format!(
+            "CREATE TABLE future_only (id INTEGER PRIMARY KEY, note BLOB);
+             INSERT INTO future_only (note) VALUES (X'0102');
+             PRAGMA user_version = {newer};"
+        ),
+    );
+    let before = std::fs::read(&path).expect("read database bytes");
+
     assert_eq!(
         Db::open(&path).err(),
         Some(DbError::UnsupportedSchema(newer))
+    );
+
+    assert_eq!(
+        std::fs::read(&path).expect("read database bytes"),
+        before,
+        "the refused database file is byte-for-byte unchanged"
+    );
+    assert_eq!(
+        query_string(&path, "PRAGMA journal_mode"),
+        "delete",
+        "no switch to WAL"
+    );
+    assert!(!path.with_extension("sqlite-wal").exists(), "no -wal file");
+    assert!(!path.with_extension("sqlite-shm").exists(), "no -shm file");
+    assert_eq!(
+        query_string(
+            &path,
+            "SELECT group_concat(name) FROM sqlite_master WHERE type = 'table'"
+        ),
+        "future_only",
+        "no dbfs tables were created"
     );
     assert_eq!(query_i64(&path, "PRAGMA user_version"), newer);
     remove_db(&path);
@@ -993,6 +1134,53 @@ fn directory_listing_query_uses_the_scan_index_without_sorting() {
     remove_db(&path);
 }
 
+#[test]
+fn second_open_of_a_database_in_use_is_refused() {
+    let path = disk_db_path("lock-refused");
+    let first = Db::open(&path).expect("open first");
+
+    match Db::open(&path) {
+        Ok(_) => panic!("a second open must not share the database"),
+        Err(error) => assert_eq!(error, DbError::DatabaseInUse),
+    }
+
+    drop(first);
+    drop(Db::open(&path).expect("open again once the first is dropped"));
+    remove_db(&path);
+}
+
+#[test]
+fn refused_second_open_leaves_the_database_files_unchanged() {
+    let path = disk_db_path("lock-untouched");
+    let wal = path.with_extension("sqlite-wal");
+    let first = Db::open(&path).expect("open first");
+    let snapshot = |file: &Path| std::fs::read(file).unwrap_or_default();
+    let before = (snapshot(&path), snapshot(&wal));
+
+    assert!(Db::open(&path).is_err(), "a second open must be refused");
+
+    assert_eq!((snapshot(&path), snapshot(&wal)), before);
+    drop(first);
+    remove_db(&path);
+}
+
+#[test]
+fn databases_without_a_file_take_no_lock() {
+    let first = Db::open_in_memory().expect("open first in-memory database");
+    let second = Db::open_in_memory().expect("open second in-memory database");
+    let third = Db::open(":memory:").expect("open first ':memory:' database");
+    let fourth = Db::open(":memory:").expect("open second ':memory:' database");
+    drop((first, second, third, fourth));
+}
+
+#[test]
+fn database_in_use_has_a_clear_message() {
+    assert_eq!(
+        DbError::DatabaseInUse.to_string(),
+        "database is already in use by another dbfs"
+    );
+}
+
 fn disk_db_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1009,6 +1197,7 @@ fn remove_db(path: &Path) {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 /// Chunk rows stored for `ino` (keys are `(ino << 24) | chunk_index`).
@@ -1030,6 +1219,12 @@ fn query_i64(path: &Path, sql: &str) -> i64 {
     let conn = Connection::open(path).expect("open raw sqlite");
     conn.query_row(sql, [], |row| row.get(0))
         .expect("query scalar")
+}
+
+fn query_string(path: &Path, sql: &str) -> String {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    conn.query_row(sql, [], |row| row.get(0))
+        .expect("query text")
 }
 
 fn exec_sql(path: &Path, sql: &str) {
@@ -1246,6 +1441,80 @@ fn timestamps_outside_the_nanosecond_range_are_clamped_not_rejected() {
 }
 
 #[test]
+fn timestamps_just_before_the_epoch_keep_their_sign_in_the_database() {
+    // Per-operation commits: the test reads the raw columns while its Db is open.
+    let options = OpenOptions {
+        sync_metadata: true,
+        ..OpenOptions::default()
+    };
+    let path = disk_db_path("timestamps-pre-epoch");
+    let file = {
+        let db = Db::open_with(&path, options).expect("open database");
+        db.create_file(1, b"pre-epoch", 0o644, 1000, 1000)
+            .expect("create file")
+    };
+    let cases = [
+        (UNIX_EPOCH - Duration::from_nanos(1), -1),
+        (UNIX_EPOCH - Duration::from_millis(500), -500_000_000),
+        (UNIX_EPOCH - Duration::from_secs(1), -1_000_000_000),
+        (UNIX_EPOCH - Duration::from_millis(1500), -1_500_000_000),
+        (UNIX_EPOCH, 0),
+    ];
+    for (time, ns) in cases {
+        {
+            let db = Db::open_with(&path, options).expect("open database");
+            db.update_metadata(
+                file.ino,
+                MetadataUpdate {
+                    mtime: Some(Timestamp::from_system_time(time)),
+                    ..MetadataUpdate::default()
+                },
+            )
+            .expect("set mtime");
+        }
+        assert_eq!(
+            query_i64(
+                &path,
+                &format!("SELECT mtime_ns FROM inodes WHERE ino = {}", file.ino)
+            ),
+            ns,
+            "stored nanoseconds for {time:?}"
+        );
+        let db = Db::open_with(&path, options).expect("reopen database");
+        let mtime = db.get_inode(file.ino).expect("read inode").mtime;
+        assert_eq!(mtime.to_system_time(), time, "read back after reopen");
+        assert_eq!(mtime.to_ns(), ns);
+    }
+
+    // The ends of the stored range are kept exactly, not wrapped or sign-flipped.
+    let db = Db::open_with(&path, options).expect("open database");
+    for (ns, time) in [(i64::MIN, "far past"), (i64::MAX, "far future")] {
+        db.update_metadata(
+            file.ino,
+            MetadataUpdate {
+                atime: Some(Timestamp::from_ns(ns)),
+                ..MetadataUpdate::default()
+            },
+        )
+        .expect("set atime");
+        assert_eq!(
+            query_i64(
+                &path,
+                &format!("SELECT atime_ns FROM inodes WHERE ino = {}", file.ino)
+            ),
+            ns,
+            "stored nanoseconds at the {time} end"
+        );
+        assert_eq!(
+            db.get_inode(file.ino).expect("read inode").atime,
+            Timestamp::from_ns(ns)
+        );
+    }
+    drop(db);
+    remove_db(&path);
+}
+
+#[test]
 fn version_3_database_is_rekeyed_with_contents_intact() {
     let path = disk_db_path("schema-v3-chunks");
     // Build a version 3 database by hand: split timestamps, composite chunk key.
@@ -1302,7 +1571,14 @@ fn version_3_database_is_rekeyed_with_contents_intact() {
                 nsec: 123_456_789
             }
         );
-        assert_eq!(data.mtime, Timestamp { secs: -5, nsec: 7 });
+        // Stored as -5_000_000_007 ns: -5.000000007 s, floored to secs -6.
+        assert_eq!(
+            data.mtime,
+            Timestamp {
+                secs: -6,
+                nsec: 999_999_993
+            }
+        );
         let bytes = db.read_file(2, 0, 200_000).expect("read file");
         assert_eq!(bytes.len(), 131_077);
         assert_eq!(&bytes[..2], b"xx");
@@ -1332,6 +1608,228 @@ fn version_3_database_is_rekeyed_with_contents_intact() {
             "SELECT COUNT(*) FROM pragma_table_info('file_chunks') WHERE name = 'chunk_index'"
         ),
         0
+    );
+    remove_db(&path);
+}
+
+#[test]
+fn deleting_the_highest_inode_does_not_reuse_its_number() {
+    let path = disk_db_path("inode-no-reuse");
+    let deleted = {
+        let db = Db::open(&path).expect("open database");
+        db.create_file(1, b"kept", 0o644, 1000, 1000)
+            .expect("create kept");
+        let top = db
+            .create_file(1, b"top", 0o644, 1000, 1000)
+            .expect("create top");
+        db.unlink_file(1, b"top").expect("unlink the highest inode");
+        let next = db
+            .create_file(1, b"next", 0o644, 1000, 1000)
+            .expect("create after the delete");
+        assert!(next.ino > top.ino, "inode {} was reused", top.ino);
+        top.ino
+    };
+
+    let db = Db::open(&path).expect("reopen database");
+    let later = db
+        .create_file(1, b"later", 0o644, 1000, 1000)
+        .expect("create after reopen");
+    assert!(
+        later.ino > deleted,
+        "inode {deleted} was reused after reopen"
+    );
+    drop(db);
+    remove_db(&path);
+}
+
+fn foreign_key_violations(path: &Path) -> usize {
+    let conn = Connection::open(path).expect("open raw sqlite");
+    let mut stmt = conn
+        .prepare("PRAGMA foreign_key_check")
+        .expect("prepare foreign_key_check");
+    stmt.query_map([], |_| Ok(()))
+        .expect("run foreign_key_check")
+        .count()
+}
+
+#[test]
+fn version_4_database_keeps_its_contents_and_stops_reusing_inode_numbers() {
+    let path = disk_db_path("schema-v4-autoincrement");
+    // The version 4 layout: plain INTEGER PRIMARY KEY, one `*_ns` column per time.
+    exec_sql(
+        &path,
+        "CREATE TABLE inodes (
+           ino INTEGER PRIMARY KEY, kind INTEGER NOT NULL, mode INTEGER NOT NULL,
+           uid INTEGER NOT NULL, gid INTEGER NOT NULL, size INTEGER NOT NULL,
+           atime_ns INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL,
+           nlink INTEGER NOT NULL
+         );
+         CREATE TABLE dirents (
+           id INTEGER PRIMARY KEY, parent_ino INTEGER NOT NULL, name BLOB NOT NULL,
+           child_ino INTEGER NOT NULL,
+           FOREIGN KEY (parent_ino) REFERENCES inodes(ino) ON DELETE CASCADE,
+           FOREIGN KEY (child_ino) REFERENCES inodes(ino) ON DELETE CASCADE
+         );
+         CREATE UNIQUE INDEX dirents_name ON dirents(parent_ino, name);
+         CREATE INDEX dirents_child ON dirents(child_ino);
+         CREATE INDEX dirents_scan ON dirents(parent_ino);
+         CREATE TABLE file_chunks (id INTEGER PRIMARY KEY, data BLOB NOT NULL);
+         CREATE TABLE symlink_targets (
+           ino INTEGER PRIMARY KEY, target BLOB NOT NULL,
+           FOREIGN KEY (ino) REFERENCES inodes(ino) ON DELETE CASCADE
+         );
+         INSERT INTO inodes VALUES (1, 2, 493, 1000, 1000, 0, 1, 1, 1, 3);
+         INSERT INTO inodes VALUES (2, 2, 493, 1000, 1000, 0, 1, 1, 1, 2);
+         INSERT INTO inodes VALUES (3, 1, 420, 1000, 1000, 6, 1, 1, 1, 1);
+         INSERT INTO inodes VALUES (4, 3, 511, 1000, 1000, 14, 1, 1, 1, 1);
+         INSERT INTO inodes VALUES (5, 1, 420, 1000, 1000, 65539, 1, 1, 1, 1);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, CAST('docs' AS BLOB), 2);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (2, CAST('notes.txt' AS BLOB), 3);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, CAST('link' AS BLOB), 4);
+         INSERT INTO dirents (parent_ino, name, child_ino) VALUES (1, CAST('big.bin' AS BLOB), 5);
+         INSERT INTO symlink_targets VALUES (4, CAST('docs/notes.txt' AS BLOB));
+         INSERT INTO file_chunks VALUES ((3 << 24) | 0, CAST('hello!' AS BLOB));
+         INSERT INTO file_chunks VALUES ((5 << 24) | 0, zeroblob(65536));
+         INSERT INTO file_chunks VALUES ((5 << 24) | 1, CAST('abc' AS BLOB));
+         PRAGMA user_version = 4;",
+    );
+
+    {
+        let db = Db::open(&path).expect("upgrade version 4 database");
+        assert_eq!(db.lookup(1, b"docs").expect("docs").ino, 2);
+        assert_eq!(db.lookup(2, b"notes.txt").expect("notes").ino, 3);
+        assert_eq!(db.read_file(3, 0, 6).expect("read notes"), b"hello!");
+        assert_eq!(db.read_symlink(4).expect("symlink"), b"docs/notes.txt");
+        assert_eq!(db.list_dir(1).expect("root").len(), 3);
+        assert_eq!(db.get_inode(1).expect("root").ino, 1);
+        assert_eq!(db.read_file(5, 65_536, 3).expect("big.bin tail"), b"abc");
+        assert_eq!(db.get_inode(5).expect("big.bin").size, 65_539);
+    }
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    assert!(
+        query_string(
+            &path,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inodes'"
+        )
+        .contains("AUTOINCREMENT")
+    );
+    assert_eq!(count_chunks(&path, 3), 1);
+    assert_eq!(count_chunks(&path, 5), 2, "chunks are kept by the rebuild");
+    assert_eq!(foreign_key_violations(&path), 0);
+
+    {
+        let db = Db::open(&path).expect("reopen upgraded database");
+        db.unlink_file(1, b"big.bin")
+            .expect("delete the highest inode, 5");
+        let next = db
+            .create_file(1, b"after-upgrade", 0o644, 1000, 1000)
+            .expect("create after the upgrade");
+        assert!(next.ino > 5, "inode 5 was reused as {}", next.ino);
+    }
+    assert_eq!(count_chunks(&path, 5), 0);
+    remove_db(&path);
+}
+
+#[test]
+fn upgrade_keeps_the_constraints_and_indexes_of_inodes() {
+    let path = disk_db_path("schema-v4-constraints");
+    exec_sql(
+        &path,
+        "CREATE TABLE inodes (
+           ino INTEGER PRIMARY KEY, kind INTEGER NOT NULL, mode INTEGER NOT NULL,
+           uid INTEGER NOT NULL CHECK (uid < 100000), gid INTEGER NOT NULL,
+           size INTEGER NOT NULL, atime_ns INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+           ctime_ns INTEGER NOT NULL, nlink INTEGER NOT NULL
+         );
+         CREATE INDEX inodes_kind ON inodes(kind);
+         INSERT INTO inodes VALUES (1, 2, 493, 1000, 1000, 0, 1, 1, 1, 2);
+         PRAGMA user_version = 4;",
+    );
+
+    drop(Db::open(&path).expect("upgrade version 4 database"));
+
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    let definition = query_string(
+        &path,
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inodes'",
+    );
+    assert!(definition.contains("AUTOINCREMENT"), "{definition}");
+    assert!(definition.contains("CHECK (uid < 100000)"), "{definition}");
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'inodes_kind'"
+        ),
+        1,
+        "the index on inodes survives the rebuild"
+    );
+    let conn = Connection::open(&path).expect("open raw sqlite");
+    assert!(
+        conn.execute(
+            "INSERT INTO inodes (kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink)
+             VALUES (1, 420, 200000, 1, 0, 0, 0, 0, 1)",
+            [],
+        )
+        .is_err(),
+        "the CHECK constraint still rejects out-of-range uids"
+    );
+    drop(conn);
+    remove_db(&path);
+}
+
+#[test]
+fn reopening_a_current_database_does_not_rebuild_inodes() {
+    let path = disk_db_path("schema-v5-noop");
+    drop(Db::open(&path).expect("create database"));
+    // A rebuild of `inodes` would drop this index along with the old table.
+    exec_sql(&path, "CREATE INDEX layout_marker ON inodes(kind);");
+    let sequence = query_i64(
+        &path,
+        "SELECT seq FROM sqlite_sequence WHERE name = 'inodes'",
+    );
+
+    drop(Db::open(&path).expect("reopen current database"));
+    drop(Db::open(&path).expect("reopen again"));
+
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'layout_marker'"
+        ),
+        1,
+        "inodes was not rebuilt"
+    );
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT seq FROM sqlite_sequence WHERE name = 'inodes'"
+        ),
+        sequence
+    );
+    remove_db(&path);
+}
+
+#[test]
+fn inode_layout_is_detected_not_trusted_from_the_version_number() {
+    let path = disk_db_path("schema-v5-layout");
+    drop(Db::open(&path).expect("create database"));
+    // The current layout, but a stamp that claims version 4.
+    exec_sql(
+        &path,
+        "CREATE INDEX layout_marker ON inodes(kind); PRAGMA user_version = 4;",
+    );
+
+    drop(Db::open(&path).expect("open database stamped as version 4"));
+
+    assert_eq!(query_i64(&path, "PRAGMA user_version"), SCHEMA_VERSION);
+    assert_eq!(
+        query_i64(
+            &path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'layout_marker'"
+        ),
+        1,
+        "a table already in the current layout is not rebuilt"
     );
     remove_db(&path);
 }

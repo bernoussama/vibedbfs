@@ -21,6 +21,16 @@ pub enum Command {
         #[command(flatten)]
         config: MountConfig,
     },
+    /// Rewrite a database with another SQLite page size. A database that is mounted,
+    /// or open in another dbfs, is refused. The old file is replaced only after the
+    /// copy is checked.
+    Migrate {
+        /// SQLite database file to rewrite.
+        database: PathBuf,
+        /// Page size of the rewritten file: a power of two from 512 bytes to 64K.
+        #[arg(long, value_name = "SIZE", value_parser = parse_page_size)]
+        page_size: u32,
+    },
 }
 
 /// Opt-in mount options. With no flags, the mount is accessible only to the
@@ -53,29 +63,92 @@ pub struct MountConfig {
     #[arg(short = 'o', long = "option", value_name = "OPT[,OPT...]")]
     pub extra: Vec<String>,
 
-    /// Memory for buffered writes, shared by all open files (default 64M).
+    /// Memory for buffered writes, shared by all open files (default 256M).
     ///
     /// Takes a byte count with an optional K, M or G suffix (powers of 1024),
     /// for example `8M` in a small container. The memory is reserved as it is
-    /// used, never up front. When it is full, the file with the most buffered
-    /// data is written to the database. Minimum 64K.
+    /// used, never up front, and is kept until unmount. When it is full, up to
+    /// 16 MiB of the file with the most buffered data is written to the database,
+    /// and the rest of that file stays buffered. Minimum 64K.
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub write_buffer: Option<usize>,
 
     /// Let the kernel cache more: writeback cache, parallel directory
-    /// operations, 1 MiB requests, cached symlinks, attributes and entries
-    /// cached for a day, and page cache kept across opens.
+    /// operations, 1 MiB requests, cached symlinks and async direct I/O.
     ///
-    /// Faster for small writes and repeated reads. With the writeback cache,
-    /// written data can sit in the kernel's page cache until the file is closed
-    /// or synced, so a crash or `docker stop` with files still open can lose
-    /// data that dbfs never saw. Off by default.
-    #[arg(long)]
+    /// With the writeback cache, written data can sit in the kernel's page cache
+    /// until the file is closed or synced, so a crash or `docker stop` with files
+    /// still open can lose data that dbfs never saw. Off by default. Conflicts with
+    /// `--no-keep-cache`.
+    #[arg(long, conflicts_with = "no_keep_cache")]
     pub kernel_cache: bool,
+
+    /// Restore the caching of earlier releases: the kernel drops a file's cached
+    /// data on every open, and attributes and names expire after one second.
+    ///
+    /// Repeated reads then go through FUSE and SQLite again. By default the
+    /// kernel keeps the page cache across opens and caches attributes and names
+    /// for a day, which is safe because dbfs is the only writer of its database.
+    /// Conflicts with `--kernel-cache`.
+    #[arg(long, conflicts_with = "kernel_cache")]
+    pub no_keep_cache: bool,
+
+    /// Largest part of the database file that SQLite may map into memory
+    /// (`PRAGMA mmap_size`). Takes the same sizes as `--write-buffer`, but `0` is
+    /// allowed and turns the map off. Default 2G on 64-bit systems, 0 on 32-bit.
+    ///
+    /// Random reads are faster with the map. An I/O error on the database file
+    /// can then end dbfs with SIGBUS instead of returning EIO; `--mmap-size 0`
+    /// avoids that.
+    #[arg(long, value_name = "SIZE", value_parser = parse_bytes)]
+    pub mmap_size: Option<usize>,
+
+    /// Print counters to stderr as one JSON line when the mount ends.
+    ///
+    /// The line is `{"dbfs_stats": {...}}`. `DBFS_STATS=1` also turns this on.
+    /// Off by default.
+    #[arg(long)]
+    pub stats: bool,
+
+    /// Largest the write-ahead log may grow before a writer checkpoints it itself
+    /// (default 1G). Normally a background thread checkpoints the WAL, so writers
+    /// do not wait for it. Past this size, the writer that finds it checkpoints it
+    /// and waits, so the WAL stays bounded. Takes the same sizes as `--write-buffer`.
+    /// Minimum 64K. Read-only mounts do not checkpoint.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    pub wal_cap: Option<usize>,
+
+    /// Commit every metadata change (create, rename, unlink, and so on) as its
+    /// operation returns, instead of sharing a commit with the operations that
+    /// follow it within 5 ms. Slower for metadata-heavy work. A crash (kill -9) then
+    /// loses no completed operation, even one not yet fsynced. Off by default.
+    /// Read-only mounts always commit this way.
+    #[arg(long)]
+    pub sync_metadata: bool,
 }
 
 /// Parses `N`, `NK`, `NM` or `NG` (powers of 1024), at least 64 KiB.
 fn parse_size(text: &str) -> Result<usize, String> {
+    let bytes = parse_bytes(text)?;
+    if bytes < 64 * 1024 {
+        return Err(format!("`{text}` is below the 64K minimum (one chunk)"));
+    }
+    Ok(bytes)
+}
+
+/// Parses a SQLite page size: `N`, `NK` or `NM` bytes, a power of two from 512 to 64K.
+fn parse_page_size(text: &str) -> Result<u32, String> {
+    let bytes = parse_bytes(text)?;
+    u32::try_from(bytes)
+        .ok()
+        .filter(|&size| crate::migrate::is_valid_page_size(size))
+        .ok_or_else(|| {
+            format!("`{text}` is not a SQLite page size: a power of two from 512 to 64K")
+        })
+}
+
+/// Parses `N`, `NK`, `NM` or `NG` (powers of 1024) with no minimum, so `0` is valid.
+fn parse_bytes(text: &str) -> Result<usize, String> {
     let text = text.trim();
     let (digits, shift) = match text.chars().last().map(|c| c.to_ascii_uppercase()) {
         Some('K') => (&text[..text.len() - 1], 10),
@@ -86,11 +159,7 @@ fn parse_size(text: &str) -> Result<usize, String> {
     let value: usize = digits
         .parse()
         .map_err(|_| format!("`{text}` is not a size such as 65536, 512K, 8M or 1G"))?;
-    let bytes = value
+    value
         .checked_mul(1 << shift)
-        .ok_or_else(|| format!("`{text}` is too large"))?;
-    if bytes < 64 * 1024 {
-        return Err(format!("`{text}` is below the 64K minimum (one chunk)"));
-    }
-    Ok(bytes)
+        .ok_or_else(|| format!("`{text}` is too large"))
 }

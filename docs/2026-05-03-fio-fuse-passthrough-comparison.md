@@ -1,5 +1,9 @@
 # fio FUSE Passthrough Comparison
 
+> **Note (2026-11-10):** These results predate commit `89da6ec` (`fix(fuse): fdatasync the WAL when fsync flushes`). Before that commit, dbfs `fsync` returned without a host sync. This run used `fsync=0`, so it does not test fsync.
+>
+> The passthrough runs used `passthrough_ll -o no_writeback -o cache=never`. In libfuse's `passthrough_ll`, `cache=never` opens files with direct I/O, and `no_writeback` disables the writeback cache. dbfs used the page cache and its own write buffer, so the comparison is not like-for-like, even though the Goal section calls it the closest one.
+
 Date: 2026-05-03
 
 ## Goal

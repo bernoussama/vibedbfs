@@ -2,10 +2,11 @@
 #
 # Jobs:
 #   clippy         cargo clippy --all-targets with warnings denied.
-#   test           cargo test. FUSE mount tests stay ignored here.
-#   fuse-tests     FUSE mount tests (DBFS_RUN_FUSE_TESTS=1, --include-ignored).
-#                  The two strace-based durability tests are skipped when
-#                  /proc/sys/kernel/yama/ptrace_scope >= 1.
+#   test           cargo test --locked. Every FUSE test is #[ignore]d and stays skipped.
+#   fuse-tests     Every ignored test in every test binary, with DBFS_RUN_FUSE_TESTS=1
+#                  and --include-ignored. That covers mount_integration, durability,
+#                  shutdown and mount_options. The two strace-based durability tests
+#                  are skipped when /proc/sys/kernel/yama/ptrace_scope >= 1.
 #   pytest         libfuse-adapted harness run against target/release/dbfs.
 #   musl-bundled   Static x86_64-musl build with bundled SQLite; asserts no
 #                  shared library dependencies.
@@ -45,7 +46,7 @@ jobs:
       - name: Install clippy
         run: rustup component add clippy
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -53,28 +54,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system packages
-        # strace is needed by the durability tests, which also run in plain `cargo test`.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev libfuse3-dev fuse3 pkg-config strace
-      - name: Read ptrace policy
-        # A missing file means no Yama restriction, so treat it as 0.
-        run: |
-          scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)
-          echo "ptrace_scope=${scope}"
-          if [ "${scope}" -ge 1 ]; then
-            echo "DBFS_SKIP_PTRACE_TESTS=1" >> "$GITHUB_ENV"
-          else
-            echo "DBFS_SKIP_PTRACE_TESTS=0" >> "$GITHUB_ENV"
-          fi
+          sudo apt-get install -y libsqlite3-dev libfuse3-dev fuse3 pkg-config
       - name: Test
-        run: |
-          skip_args=()
-          if [ "${DBFS_SKIP_PTRACE_TESTS}" = "1" ]; then
-            # These two tests attach strace, which Yama ptrace_scope >= 1 forbids.
-            skip_args=(--skip fsync_of_a_clean_file_fdatasyncs_the_wal --skip fsync_of_dirty_data_fdatasyncs_the_wal)
-          fi
-          cargo test -- "${skip_args[@]}"
+        # The FUSE tests are #[ignore]d, so this run skips them. fuse-tests runs them.
+        run: cargo test --locked
 
   fuse-tests:
     runs-on: ubuntu-latest
@@ -82,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system packages
-        # strace is needed by the durability tests; without it they skip silently.
+        # strace is needed by the durability fsync tests, which fail without it.
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev libfuse3-dev fuse3 pkg-config strace
@@ -114,6 +99,8 @@ jobs:
             echo "DBFS_SKIP_PTRACE_TESTS=0" >> "$GITHUB_ENV"
           fi
       - name: FUSE-enabled tests
+        # Runs every ignored test in every test binary. --no-fail-fast keeps a failure
+        # in one binary from stopping the others.
         env:
           DBFS_RUN_FUSE_TESTS: "1"
         run: |
@@ -122,7 +109,7 @@ jobs:
             # These two tests attach strace, which Yama ptrace_scope >= 1 forbids.
             skip_args=(--skip fsync_of_a_clean_file_fdatasyncs_the_wal --skip fsync_of_dirty_data_fdatasyncs_the_wal)
           fi
-          cargo test -- --include-ignored "${skip_args[@]}"
+          cargo test --locked --no-fail-fast -- --include-ignored "${skip_args[@]}"
 
   pytest:
     runs-on: ubuntu-latest
@@ -140,7 +127,7 @@ jobs:
       - name: Install pytest
         run: pip install pytest
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --locked --release
       - name: libfuse-adapted tests
         run: pytest tests/test_with_libfuse.py -v -k "not syscall"
 
@@ -157,7 +144,7 @@ jobs:
       - name: Build static binary with bundled SQLite
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --features bundled-sqlite --target x86_64-unknown-linux-musl
+        run: cargo build --locked --release --features bundled-sqlite --target x86_64-unknown-linux-musl
       - name: Assert static linkage
         run: |
           bin=target/x86_64-unknown-linux-musl/release/dbfs
@@ -179,7 +166,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev libfuse3-dev fuse3 pkg-config
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --locked --release
       - name: Create compat workspace
         run: mkdir -p .bench/compat
       - name: Allow user_allow_other (compat S2 test)

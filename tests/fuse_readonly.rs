@@ -1,8 +1,8 @@
 use dbfs::{Db, Dbfs, DbfsDirEntry, FileKind, mount_options};
 use fuser::{FileType, MountOption};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temp_db_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -334,6 +334,7 @@ fn check_constraint_is_not_reported_as_eexist() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -598,15 +599,19 @@ fn buffers_fuse_writes_until_flush() {
         b"hello"
     );
     assert_eq!(fs.getattr(file.ino).expect("dirty attr").size, 5);
-    assert_eq!(raw_inode_size(&path, file.ino), 0);
+    // The create commits within about 5 ms. The buffered write has not reached
+    // the database, so the stored size is still 0.
+    wait_for_raw_inode_size(&path, file.ino, 0);
 
     fs.flush_file(file.ino).expect("flush file");
 
-    assert_eq!(raw_inode_size(&path, file.ino), 5);
+    // Flush writes into the open batch, which commits within about 5 ms.
+    wait_for_raw_inode_size(&path, file.ino, 5);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -622,11 +627,12 @@ fn release_flushes_buffered_fuse_writes() {
     fs.write(file.ino, 0, b"hello").expect("write file");
     fs.release_file(fh).expect("release file");
 
-    assert_eq!(raw_inode_size(&path, file.ino), 5);
+    wait_for_raw_inode_size(&path, file.ino, 5);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 #[test]
@@ -752,6 +758,7 @@ fn remove_db(path: &Path) {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
 }
 
 fn exec_sql(path: &Path, sql: &str) {
@@ -761,15 +768,30 @@ fn exec_sql(path: &Path, sql: &str) {
     conn.execute_batch(sql).expect("execute sql");
 }
 
-fn raw_inode_size(path: &std::path::Path, ino: u64) -> i64 {
-    Connection::open(path)
-        .expect("open raw sqlite connection")
-        .query_row(
-            "SELECT size FROM inodes WHERE ino = ?1",
-            params![ino as i64],
-            |row| row.get(0),
-        )
-        .expect("read raw inode size")
+/// Waits until a raw connection sees `ino` with size `want`. The batch commits
+/// within about 5 ms of its first uncommitted operation, so a row can lag the
+/// operation that changed it. Panics after five seconds.
+fn wait_for_raw_inode_size(path: &std::path::Path, ino: u64, want: i64) {
+    let conn = Connection::open(path).expect("open raw sqlite connection");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let size: Option<i64> = conn
+            .query_row(
+                "SELECT size FROM inodes WHERE ino = ?1",
+                params![ino as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("read raw inode size");
+        if size == Some(want) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "inode {ino} has size {size:?} in the database, want {want}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -1006,4 +1028,126 @@ fn setattr_after_a_buffered_write_reports_and_keeps_both() {
         "closing does not overwrite the set mtime"
     );
     assert_eq!(fs.read(file.ino, 0, 16).expect("read"), b"hello\n");
+}
+
+#[test]
+fn directory_sync_is_ok_on_an_in_memory_database() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let fs = Dbfs::new(db);
+
+    assert_eq!(fs.sync_dir(), Ok(()), "there is no file to sync");
+}
+
+#[test]
+fn directory_sync_makes_commits_durable_and_reports_a_failed_sync() {
+    let path = disk_db_path("dir-sync");
+    let db = Db::open(&path).expect("open file-backed database");
+    db.create_dir(1, b"docs", 0o755, 1000, 1000)
+        .expect("create directory");
+    let fs = Dbfs::new(db);
+    assert_eq!(fs.sync_dir(), Ok(()), "a file database syncs");
+
+    // Hide the database and its WAL, so the durable sync can open neither file.
+    let wal = path.with_extension("sqlite-wal");
+    let hidden = path.with_extension("hidden");
+    let hidden_wal = path.with_extension("hidden-wal");
+    let had_wal = wal.exists();
+    std::fs::rename(&path, &hidden).expect("hide database");
+    if had_wal {
+        std::fs::rename(&wal, &hidden_wal).expect("hide wal");
+    }
+    let hidden_result = fs.sync_dir();
+    std::fs::rename(&hidden, &path).expect("restore database");
+    if had_wal {
+        std::fs::rename(&hidden_wal, &wal).expect("restore wal");
+    }
+
+    assert_eq!(hidden_result, Err(libc::EIO), "the failed sync is reported");
+    assert_eq!(
+        fs.sync_dir(),
+        Ok(()),
+        "syncing works once the files are back"
+    );
+    remove_db(&path);
+}
+
+#[test]
+fn link_reports_the_buffered_size_and_a_ctime_after_the_write() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write(file.ino, 0, b"0123456789").expect("buffer write");
+    let before_link = fs.getattr(file.ino).expect("attr before link");
+
+    let attr = fs.link(file.ino, 1, b"alias.txt").expect("link");
+
+    assert_eq!(attr.size, 10, "the buffered size, not the stored 0");
+    assert_eq!(attr.nlink, 2);
+    assert!(
+        attr.ctime > before_link.ctime,
+        "the link is a change after the write"
+    );
+    assert_eq!(
+        fs.getattr(file.ino).expect("attr after link").ctime,
+        attr.ctime
+    );
+    fs.release_file(fh).expect("release");
+}
+
+#[test]
+fn lookup_reports_the_buffered_size_of_an_open_file() {
+    let db = Db::open_in_memory().expect("open in-memory database");
+    let file = db
+        .create_file(1, b"notes.txt", 0o644, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write_fh(fh, 0, b"0123456789").expect("buffer write");
+
+    let attr = fs.lookup(1, b"notes.txt").expect("lookup");
+
+    assert_eq!(attr.size, 10, "the buffered size, not the stored 0");
+    fs.release_file(fh).expect("release");
+}
+
+#[test]
+fn timestamp_setattr_keeps_buffered_data_buffered() {
+    // With the writeback cache the kernel sends timestamp-only setattr calls
+    // during writeback. They must not flush the file each time.
+    let path = disk_db_path("setattr-no-flush");
+    let db = Db::open(&path).expect("open file-backed database");
+    let file = db
+        .create_file(1, b"buffered.bin", 0o600, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write_fh(fh, 0, &[7u8; 200_000]).expect("write");
+    let before = fs.getattr(file.ino).expect("attr").ctime;
+    let mtime = UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+    let attr = fs
+        .setattr(file.ino, None, None, None, None, Some(mtime), Some(mtime))
+        .expect("set times");
+    assert_eq!(attr.size, 200_000, "the reply carries the buffered size");
+    assert_eq!(attr.mtime, mtime);
+    fs.sync_dir().expect("commit metadata");
+    assert_eq!(
+        count_chunk_rows(&path, file.ino),
+        0,
+        "a timestamp-only setattr does not flush buffered chunks"
+    );
+
+    fs.release_file(fh).expect("release");
+    let attr = fs.getattr(file.ino).expect("attr after close");
+    assert_eq!(
+        attr.mtime, mtime,
+        "the flush keeps the mtime set by setattr"
+    );
+    assert!(attr.ctime >= before, "ctime does not move backwards");
+    assert_eq!(fs.read(file.ino, 199_990, 20).expect("read"), vec![7u8; 10]);
+    drop(fs);
+    assert_eq!(count_chunk_rows(&path, file.ino), 4);
 }
