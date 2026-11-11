@@ -128,6 +128,18 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Sets `PRAGMA max_page_count`. A write that needs a page beyond the limit
+    /// fails with `SQLITE_FULL`, which is `DbError::NoSpace` (`ENOSPC`). The
+    /// pragma is per connection, so `Dbfs::set_max_page_count` is the public hook.
+    pub(crate) fn set_max_page_count(&self, pages: u64) -> Result<(), DbError> {
+        let pages = i64::try_from(pages).map_err(|_| DbError::InvalidInput)?;
+        self.conn
+            .lock()
+            .unwrap()
+            .pragma_update(None, "max_page_count", pages)?;
+        Ok(())
+    }
+
     fn initialize(conn: Connection) -> Result<Self, DbError> {
         conn.execute_batch(
             "
