@@ -13,8 +13,10 @@
 //!
 //! Failure messages name the seed and the operation index.
 //!
-//! The generator never issues the operations behind the known bugs. Those are
-//! the `#[ignore]` tests at the end of this file, each with a minimal repro.
+//! The generator issues every edge case the model covers: renames between two
+//! names of one inode, links to unlinked open files, opens of directories, and
+//! offsets and sizes past the file size limit or near `u64::MAX`. Each of those
+//! also has a focused regression test at the end of this file.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -150,6 +152,9 @@ struct Model {
     /// Live file handles: fh to inode.
     handles: BTreeMap<u64, u64>,
     seq: u64,
+    /// The number the next inode gets. It only grows, as SQLite's AUTOINCREMENT
+    /// does (schema v5): a deleted inode's number is never reused.
+    next_inode: u64,
 }
 
 impl Model {
@@ -160,6 +165,7 @@ impl Model {
             nodes,
             handles: BTreeMap::new(),
             seq: 0,
+            next_inode: ROOT + 1,
         }
     }
 
@@ -167,9 +173,11 @@ impl Model {
         self.nodes.get(&ino).map(|node| node.kind)
     }
 
-    /// The next inode number: SQLite picks max(rowid) + 1.
-    fn next_ino(&self) -> u64 {
-        self.nodes.keys().next_back().map_or(ROOT, |max| max + 1)
+    /// The number for a new inode. Numbers are never reused, so this only grows.
+    fn next_ino(&mut self) -> u64 {
+        let ino = self.next_inode;
+        self.next_inode += 1;
+        ino
     }
 
     fn refs(&self, ino: u64) -> usize {
@@ -292,9 +300,13 @@ impl Model {
         Ok(ino)
     }
 
-    /// `open` accepts any inode. The runner only opens regular files.
+    /// Directories are refused: the kernel opens them with OPENDIR, not OPEN.
     fn open(&self, ino: u64) -> Result<(), i32> {
-        self.nodes.get(&ino).map(|_| ()).ok_or(libc::ENOENT)
+        match self.nodes.get(&ino) {
+            None => Err(libc::ENOENT),
+            Some(node) if node.kind == DIR => Err(libc::EISDIR),
+            Some(_) => Ok(()),
+        }
     }
 
     fn handle(&self, fh: u64) -> Result<u64, i32> {
@@ -446,6 +458,10 @@ impl Model {
         if flags & NOREPLACE != 0 && target.is_some() {
             return Err(libc::EEXIST);
         }
+        // Another name of the source inode: POSIX makes this a no-op.
+        if target == Some(src) {
+            return Ok(());
+        }
         if let Some(target) = target {
             match (src_kind, self.kind(target)) {
                 (FILE, Some(DIR)) => return Err(libc::EISDIR),
@@ -455,10 +471,6 @@ impl Model {
                 }
                 _ => {}
             }
-            // Renaming onto another name of the same inode is the known bug in
-            // the `hard_link_rename_onto_its_own_inode_is_a_noop` test. The
-            // generator skips that case, so reaching it means a generator bug.
-            assert_ne!(target, src, "generator issued a same-inode rename");
         }
         if let Some(target) = target {
             self.remove_entry(new_parent, new_name);
@@ -493,6 +505,10 @@ impl Model {
             None => return Err(libc::ENOENT),
             Some(FILE) => return Err(libc::ENOTDIR),
             Some(_) => {}
+        }
+        // Unlinked but still open: no names left, and it cannot get one back.
+        if self.links(ino) == 0 {
+            return Err(libc::ENOENT);
         }
         if self.nodes[&dir].entries.contains_key(name) {
             return Err(libc::EEXIST);
@@ -605,7 +621,6 @@ struct Run {
     too_long: Vec<u8>,
     last_released: Option<u64>,
     tallies: BTreeMap<&'static str, u64>,
-    skipped_same_inode_renames: u64,
 }
 
 impl Run {
@@ -623,7 +638,6 @@ impl Run {
             too_long: vec![b'T'; 256],
             last_released: None,
             tallies: BTreeMap::new(),
-            skipped_same_inode_renames: 0,
         }
     }
 
@@ -737,24 +751,35 @@ impl Run {
         }
     }
 
-    /// A file that still has a name. Linking an unnamed (open, unlinked) inode is
-    /// the known bug, so the generator avoids it.
-    fn pick_linkable(&mut self) -> Option<u64> {
-        let candidates: Vec<u64> = self
+    /// Another name of the inode that `(dir, name)` names, if it has one.
+    fn pick_alias(&mut self, dir: u64, name: &[u8]) -> Option<(u64, Vec<u8>)> {
+        let ino = self.model.lookup(dir, name).ok()?;
+        let others: Vec<(u64, Vec<u8>)> = self
             .model
-            .files()
+            .all_entries()
             .into_iter()
-            .filter(|&ino| self.model.links(ino) > 0)
+            .filter(|(d, n, child)| *child == ino && (*d != dir || n.as_slice() != name))
+            .map(|(d, n, _)| (d, n))
             .collect();
-        if candidates.is_empty() {
+        if others.is_empty() {
             None
         } else {
-            Some(candidates[self.rng.index(candidates.len())])
+            Some(others[self.rng.index(others.len())].clone())
+        }
+    }
+
+    /// An offset or size that no file can hold: at or past the size limit, or so
+    /// close to `u64::MAX` that `offset + len` overflows.
+    fn pick_huge(&mut self) -> u64 {
+        if self.rng.chance(50) {
+            MAX_FILE + self.rng.below(CHUNK)
+        } else {
+            u64::MAX - self.rng.below(CHUNK)
         }
     }
 
     fn ghost_ino(&mut self) -> u64 {
-        let candidates = [u64::MAX, self.model.next_ino(), 1 << 30];
+        let candidates = [u64::MAX, self.model.next_inode, 1 << 30];
         let ino = candidates[self.rng.index(candidates.len())];
         if self.model.nodes.contains_key(&ino) {
             u64::MAX
@@ -816,6 +841,9 @@ impl Run {
     /// Unaligned offsets, offsets that straddle a chunk boundary, and sparse
     /// offsets beyond the end of the file.
     fn pick_offset(&mut self, size: u64, len: usize) -> u64 {
+        if self.rng.chance(3) {
+            return self.pick_huge();
+        }
         let raw = match self.rng.below(100) {
             0..=39 => self.rng.below(size + 1),
             40..=59 => {
@@ -830,6 +858,9 @@ impl Run {
     }
 
     fn pick_size(&mut self, size: u64) -> u64 {
+        if self.rng.chance(3) {
+            return self.pick_huge();
+        }
         let raw = match self.rng.below(100) {
             0..=39 => self.rng.below(size + 1),
             40..=59 => {
@@ -946,8 +977,9 @@ impl Run {
 
     fn op_open(&mut self) {
         self.tally("open");
-        let ino = match self.pick_file() {
-            Some(file) if self.rng.chance(90) => file,
+        let ino = match self.rng.below(100) {
+            0..=84 => self.pick_file().unwrap_or(ROOT),
+            85..=94 => self.pick_dir(),
             _ => self.ghost_ino(),
         };
         let want = self.model.open(ino);
@@ -1070,10 +1102,10 @@ impl Run {
     fn op_rename(&mut self) {
         self.tally("rename");
         let (parent, name) = self.pick_entry();
-        let (new_parent, new_name) = if self.rng.chance(60) {
-            self.pick_entry()
-        } else {
-            (self.pick_dir(), self.pick_name())
+        let (new_parent, new_name) = match self.pick_alias(parent, &name) {
+            Some(alias) if self.rng.chance(40) => alias,
+            _ if self.rng.chance(60) => self.pick_entry(),
+            _ => (self.pick_dir(), self.pick_name()),
         };
         let flags = match self.rng.below(100) {
             0..=4 => NOREPLACE,
@@ -1081,14 +1113,10 @@ impl Run {
             8..=9 => WHITEOUT,
             _ => 0,
         };
-        // Two names of one inode (hard links): the known bug. Skip it.
-        if flags == 0 && (parent, &name) != (new_parent, &new_name) {
-            let source = self.model.lookup(parent, &name);
-            let target = self.model.lookup(new_parent, &new_name);
-            if source.is_ok() && source == target {
-                self.skipped_same_inode_renames += 1;
-                return;
-            }
+        // Two names of one inode (hard links): rename does nothing.
+        let source = self.model.lookup(parent, &name);
+        if source.is_ok() && source == self.model.lookup(new_parent, &new_name) {
+            self.tally("rename (two names of one inode)");
         }
         let want = self
             .model
@@ -1129,10 +1157,13 @@ impl Run {
     fn op_link(&mut self) {
         self.tally("link");
         let src = match self.rng.below(100) {
-            0..=84 => self.pick_linkable().unwrap_or(ROOT),
+            0..=84 => self.pick_file().unwrap_or(ROOT),
             85..=92 => self.pick_dir(),
             _ => self.ghost_ino(),
         };
+        if self.model.kind(src) == Some(FILE) && self.model.links(src) == 0 {
+            self.tally("link (unlinked, still open)");
+        }
         let dir = self.pick_dir();
         let name = self.pick_name();
         let want = self.model.link(src, dir, &name);
@@ -1351,11 +1382,7 @@ fn run_seed(seed: u64, ops: usize) {
         .iter()
         .map(|(name, count)| format!("{name}={count}"))
         .collect();
-    eprintln!(
-        "model_ops seed {seed}: {ops} ops, {} same-inode renames skipped; {}",
-        run.skipped_same_inode_renames,
-        summary.join(" ")
-    );
+    eprintln!("model_ops seed {seed}: {ops} ops; {}", summary.join(" "));
     drop(run);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1442,8 +1469,9 @@ fn readdir_resumes_correctly_when_entries_change_between_pages() {
     }
 }
 
+/// rename(2) onto another name of the same inode does nothing (POSIX): both names
+/// stay and the link count is unchanged.
 #[test]
-#[ignore = "known bug: rename(a, b) where a and b are hard links to one inode deletes b and renames a, instead of doing nothing (POSIX). Repro: create a; link a b; rename a b; then lookup a fails."]
 fn hard_link_rename_onto_its_own_inode_is_a_noop() {
     let (fs, a) = file_fs(b"a");
     fs.link(a, 1, b"b").expect("link");
@@ -1454,8 +1482,9 @@ fn hard_link_rename_onto_its_own_inode_is_a_noop() {
     assert_eq!(fs.getattr(a).expect("getattr").nlink, 2);
 }
 
+/// The link reply carries the size a reader sees, buffered (unflushed) writes
+/// included, as the other attribute replies do.
 #[test]
-#[ignore = "known bug: link() replies with the size stored in the database, so a buffered (unflushed) write is missing from the reply. Repro: create f; write f 0 'abcdef'; link f; reply size is 0, getattr says 6."]
 fn link_reply_size_includes_buffered_writes() {
     let (fs, f) = file_fs(b"f");
     fs.write(f, 0, b"abcdef").expect("buffered write");
@@ -1464,8 +1493,9 @@ fn link_reply_size_includes_buffered_writes() {
     assert_eq!(reply.size, 6);
 }
 
+/// An inode whose last name is gone but which is still open has nlink 0. Linux
+/// never gives it a new name: link(2) fails with ENOENT.
 #[test]
-#[ignore = "known bug: link() accepts an inode whose last name was removed while it is still open (nlink 0). Linux returns ENOENT. Repro: create f; open f; unlink f; link f g returns Ok(nlink 1); lookup g works; release f then makes lookup g fail (ENOENT), so the new name vanishes."]
 fn link_to_an_unlinked_open_file_is_enoent() {
     let (fs, f) = file_fs(b"f");
     let fh = fs.open(f).expect("open");
@@ -1475,27 +1505,51 @@ fn link_to_an_unlinked_open_file_is_enoent() {
     fs.release_file(fh).expect("release");
 }
 
+/// `open` refuses a directory with EISDIR, since the kernel opens directories with
+/// OPENDIR. So no open slot can outlive `rmdir`: a removed directory opens as
+/// ENOENT, and the next create is clean.
 #[test]
-#[ignore = "known bug (debug builds only; the kernel never sends OPEN for a directory): open() accepts a directory and rmdir() does not clear its open-table slot. The next create reuses the inode number and OpenInodes::insert trips its debug_assert at src/open_table.rs:46. Repro: mkdir d; open d; rmdir d; create_open x."]
-fn open_directory_then_rmdir_then_create_panics_in_debug() {
+fn open_directory_then_rmdir_then_create_is_clean() {
     let db = Db::open_in_memory().expect("open in-memory database");
     let fs = Dbfs::new(db);
     let dir = fs.mkdir(1, b"d", 0o755, 0, 0, 0).expect("mkdir").ino;
-    let _fh = fs.open(dir).expect("open directory");
+    assert_eq!(fs.open(dir).err(), Some(libc::EISDIR));
     fs.rmdir(1, b"d").expect("rmdir");
+    assert_eq!(fs.open(dir).err(), Some(libc::ENOENT));
 
-    let (attr, _fh) = fs
+    let (attr, fh) = fs
         .create_open(1, b"x", 0o644, 0, 0, 0)
         .expect("create after rmdir");
     assert_eq!(attr.kind, FILE);
+    fs.release_file(fh).expect("release");
 }
 
+/// An offset whose `offset + len` overflows u64 is EFBIG, not a wrapped sum or a
+/// panic. Reads there return nothing. fallocate and truncate past the limit are
+/// EFBIG too.
 #[test]
-#[ignore = "known bug (API only, not reachable through a mount: the kernel caps writes below the file size limit): write() computes offset + length in ChunkSpan::new, so an offset near u64::MAX overflows (debug panic, release wraps). Repro: write(file, u64::MAX - 1, b\"abc\")."]
 fn write_near_u64_max_is_efbig_not_an_overflow() {
     let (fs, file) = file_fs(b"f");
     assert_eq!(
         fs.write(file, u64::MAX - 1, b"abc").err(),
         Some(libc::EFBIG)
     );
+    let fh = fs.open(file).expect("open");
+    assert_eq!(
+        fs.write_fh(fh, u64::MAX - 1, b"abc").err(),
+        Some(libc::EFBIG)
+    );
+    assert_eq!(fs.read(file, u64::MAX - 1, 8), Ok(Vec::new()));
+    assert_eq!(fs.read_fh(fh, u64::MAX - 1, 8), Ok(Vec::new()));
+    assert_eq!(
+        fs.fallocate(file, i64::MAX - 1, 2, 0).err(),
+        Some(libc::EFBIG)
+    );
+    assert_eq!(
+        fs.setattr(file, None, None, None, Some(u64::MAX), None, None)
+            .err(),
+        Some(libc::EFBIG)
+    );
+    assert_eq!(fs.getattr(file).expect("getattr").size, 0);
+    fs.release_file(fh).expect("release");
 }

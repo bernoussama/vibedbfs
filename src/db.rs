@@ -445,6 +445,11 @@ impl Db {
         if self.inode_kind_of(new_parent_ino)? != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
+        // Unlinked but still open: the inode has no names and is kept only for its
+        // handles. Linux never gives such an inode a new name (linkat: ENOENT).
+        if inode.nlink == 0 {
+            return Err(DbError::NotFound);
+        }
 
         let now = now_ts();
         let mut conn = self.conn.lock().unwrap();
@@ -1014,11 +1019,13 @@ impl ChunkPiece {
 }
 
 impl ChunkSpan {
+    /// `None` if `len` is zero or `offset + len` does not fit in a `u64`. Callers
+    /// that write must treat the overflow as `EFBIG`.
     pub fn new(offset: u64, len: usize) -> Option<Self> {
         if len == 0 {
             return None;
         }
-        let end = offset + len as u64;
+        let end = offset.checked_add(len as u64)?;
         let chunk = CHUNK_SIZE as u64;
         Some(Self {
             start: offset,
@@ -1213,8 +1220,11 @@ fn pragma_query(name: &str) -> Result<String, DbError> {
 fn apply_mmap_size(conn: &Connection, bytes: u64) -> Result<u64, DbError> {
     let requested = i64::try_from(bytes).map_err(|_| DbError::InvalidInput)?;
     conn.pragma_update(None, "mmap_size", requested)?;
-    let effective: i64 = conn.query_row("PRAGMA mmap_size", [], |row| row.get(0))?;
-    Ok(effective.max(0) as u64)
+    // An in-memory database has no map, and SQLite returns no row for the pragma.
+    let effective: Option<i64> = conn
+        .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+        .optional()?;
+    Ok(effective.unwrap_or(0).max(0) as u64)
 }
 
 fn inode_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Inode> {
