@@ -528,10 +528,14 @@ impl Dbfs {
     pub fn statfs(&self) -> Result<FsStats, i32> {
         let usage = self.db.volume_usage().map_err(errno_from_db_error)?;
         let bsize = usage.page_size as u32;
+        // The WAL file is disk space in use until a checkpoint moves its pages into the
+        // database file, so it counts against the free pages.
+        let wal_pages = self.db.wal_file_bytes().div_ceil(usage.page_size);
+        let free = usage.freelist_count.saturating_sub(wal_pages);
         Ok(FsStats {
             blocks: usage.page_count,
-            bfree: usage.freelist_count,
-            bavail: usage.freelist_count,
+            bfree: free,
+            bavail: free,
             files: usage.files,
             ffree: 0,
             bsize,
@@ -963,6 +967,9 @@ impl Filesystem for Dbfs {
         // `ShutdownHandle::flush_failure`, which `run` checks before exiting.
         let result = self.flush_all();
         self.shared.record_flush(result);
+        // After the flush, so the data is in the WAL and fsynced. Stops the checkpoint
+        // thread, then empties the WAL.
+        self.shared.db.close_checkpoints();
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {

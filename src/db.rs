@@ -1,12 +1,14 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions as FileOpenOptions};
 use std::io::ErrorKind;
+use std::ops::{Deref, DerefMut};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
 
+use crate::checkpoint::{self, Checkpoints, JOURNAL_SIZE_LIMIT};
 use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
 
 pub(crate) const CHUNK_SIZE: usize = 65_536;
@@ -61,14 +63,67 @@ pub(crate) struct VolumeUsage {
     pub files: u64,
 }
 
+/// How `Db::open_with` opens a database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenOptions {
+    /// The largest WAL the writers leave in place. A writer that finds it larger
+    /// checkpoints it itself before returning (`--wal-cap`). At least 64 KiB.
+    pub wal_cap: u64,
+    /// Run the background checkpoint thread, and truncate the WAL when the database
+    /// closes. Read-only mounts turn this off, because they must not write the file.
+    pub background_checkpoints: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            wal_cap: checkpoint::DEFAULT_WAL_CAP,
+            background_checkpoints: true,
+        }
+    }
+}
+
 /// SQL storage. Holds no per-process file state: which inodes are open lives
 /// in the FUSE layer's open-inode table, and callers say so where it matters
 /// (`unlink_entry`, `rename_entry`).
 pub struct Db {
-    conn: Mutex<Connection>,
+    /// Shared with the checkpoint thread, which takes this lock for the reset handshake.
+    conn: Arc<Mutex<Connection>>,
+    /// The commit hook, the WAL cap and the checkpoint thread. `None` for in-memory
+    /// databases.
+    checkpoints: Option<Checkpoints>,
     /// Held as long as the `Db` is alive. Declared after `conn`, so the
     /// connection closes before the lock is released.
     _lock: Option<File>,
+}
+
+/// The main connection, locked for a write. Dropping it runs the WAL check
+/// (`Checkpoints::after_write`), so a write holds one until its commit is done.
+struct WriteConn<'a> {
+    guard: MutexGuard<'a, Connection>,
+    checkpoints: Option<&'a Checkpoints>,
+}
+
+impl Deref for WriteConn<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.guard
+    }
+}
+
+impl DerefMut for WriteConn<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.guard
+    }
+}
+
+impl Drop for WriteConn<'_> {
+    fn drop(&mut self) {
+        if let Some(checkpoints) = self.checkpoints {
+            checkpoints.after_write(&self.guard);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -79,7 +134,16 @@ enum NewNode<'a> {
 }
 
 impl Db {
+    /// Opens a database file with the default options: WAL mode, a 1 GiB WAL cap,
+    /// and background checkpoints.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        Self::open_with(path, OpenOptions::default())
+    }
+
+    pub fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self, DbError> {
+        if options.wal_cap < checkpoint::MIN_WAL_CAP {
+            return Err(DbError::InvalidInput);
+        }
         let path = path.as_ref();
         // Before the database file is opened, so a refused process never touches it.
         let lock = lock_database(path)?;
@@ -93,15 +157,64 @@ impl Db {
         // Before the WAL switch and the table creation in `initialize`, both of
         // which write to the file.
         refuse_newer_schema(&conn)?;
-        conn.execute_batch(
+        // `wal_autocheckpoint = 0`: commits never checkpoint. The checkpoint thread
+        // does that, see `checkpoint`.
+        conn.execute_batch(&format!(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
-            PRAGMA wal_autocheckpoint = 10000;
-            ",
-        )?;
+            PRAGMA wal_autocheckpoint = 0;
+            PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT};
+            "
+        ))?;
         apply_mmap_size(&conn, DEFAULT_MMAP_SIZE)?;
-        Self::initialize(lock, conn)
+        let mut db = Self::initialize(lock, conn)?;
+        db.attach_checkpoints(path, options)?;
+        Ok(db)
+    }
+
+    /// Installs the commit hook and starts the checkpoint thread. Done after
+    /// `initialize`, so its writes run without the WAL machinery.
+    fn attach_checkpoints(&mut self, path: &Path, options: OpenOptions) -> Result<(), DbError> {
+        let checkpoints = {
+            let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+            Checkpoints::install(&conn, path, options.wal_cap, options.background_checkpoints)?
+        };
+        // Stored first: if the thread fails to start, dropping `self` removes the hook.
+        self.checkpoints = Some(checkpoints);
+        if let Some(checkpoints) = &self.checkpoints {
+            checkpoints.start(Arc::clone(&self.conn))?;
+        }
+        Ok(())
+    }
+
+    /// Stops the checkpoint thread, then truncates the WAL to zero bytes. Runs once;
+    /// later calls do nothing. Called when the filesystem is destroyed, and when the
+    /// `Db` drops.
+    pub(crate) fn close_checkpoints(&self) {
+        let Some(checkpoints) = &self.checkpoints else {
+            return;
+        };
+        if !checkpoints.stop() {
+            return;
+        }
+        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        checkpoint::truncate_wal(&conn);
+    }
+
+    /// Locks the connection for a write. See `WriteConn`.
+    fn write_conn(&self) -> WriteConn<'_> {
+        WriteConn {
+            guard: self.conn.lock().unwrap(),
+            checkpoints: self.checkpoints.as_ref(),
+        }
+    }
+
+    /// Size of the `-wal` file on disk. 0 for in-memory databases.
+    pub(crate) fn wal_file_bytes(&self) -> u64 {
+        self.checkpoints
+            .as_ref()
+            .map_or(0, Checkpoints::wal_file_bytes)
     }
 
     /// Sets `PRAGMA mmap_size`, the most of the database file that SQLite maps
@@ -117,15 +230,29 @@ impl Db {
         Self::initialize(None, conn)
     }
 
+    /// Makes committed data durable: `fdatasync` of the WAL, or of the database file
+    /// when there is no WAL. A checkpoint that failed since the last call is reported
+    /// here once, as an error, even when the sync itself succeeds.
     pub(crate) fn sync_durable(&self) -> Result<(), DbError> {
+        let failure = self
+            .checkpoints
+            .as_ref()
+            .and_then(Checkpoints::take_failure);
         let path = {
             let conn = self.conn.lock().unwrap();
             match conn.path() {
-                Some(path) if !path.is_empty() && path != ":memory:" => path.to_owned(),
-                _ => return Ok(()),
+                Some(path) if !path.is_empty() && path != ":memory:" => Some(path.to_owned()),
+                _ => None,
             }
         };
-        sync_database_file(Path::new(&path)).map_err(|error| DbError::Sqlite(error.to_string()))
+        if let Some(path) = path {
+            sync_database_file(Path::new(&path))
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        }
+        match failure {
+            Some(message) => Err(DbError::Sqlite(format!("WAL checkpoint failed: {message}"))),
+            None => Ok(()),
+        }
     }
 
     pub fn pragma_i64(&self, name: &str) -> Result<i64, DbError> {
@@ -245,7 +372,8 @@ impl Db {
         }
 
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
+            checkpoints: None,
             _lock: lock,
         })
     }
@@ -429,7 +557,7 @@ impl Db {
     /// symlink target and any remaining entries. Used when the last handle of an
     /// inode unlinked while open is released.
     pub(crate) fn delete_inode(&self, ino: u64) -> Result<(), DbError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn();
         let tx = conn.transaction()?;
         delete_inode_rows(&tx, ino)?;
         tx.commit()?;
@@ -447,7 +575,7 @@ impl Db {
         }
 
         let now = now_ts();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn();
         let tx = conn.transaction()?;
 
         tx.prepare_cached("INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)")?
@@ -544,7 +672,7 @@ impl Db {
         // One scratch buffer per call, reused for every partial chunk.
         let mut scratch = Vec::with_capacity(CHUNK_SIZE);
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn();
         let tx = conn.transaction()?;
 
         {
@@ -621,7 +749,7 @@ impl Db {
         chunks: impl IntoIterator<Item = (u64, &'a [u8])>,
         now: Timestamp,
     ) -> Result<(), DbError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn();
         let tx = conn.transaction()?;
 
         {
@@ -646,7 +774,7 @@ impl Db {
         }
 
         let now = now_ts();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn();
         let tx = conn.transaction()?;
         let (first_key, last_key) = chunk_keys(ino);
 
@@ -696,7 +824,7 @@ impl Db {
         }
 
         let now = now_ts();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn();
         let tx = conn.transaction()?;
 
         tx.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
@@ -716,7 +844,7 @@ impl Db {
         }
 
         let now = now_ts();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn();
         let tx = conn.transaction()?;
         let child_count: i64 = tx
             .prepare_cached("SELECT COUNT(*) FROM dirents WHERE parent_ino = ?1")?
@@ -811,7 +939,7 @@ impl Db {
             .is_some_and(|target| target.kind == FileKind::Directory);
 
         let now = now_ts();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn();
         let tx = conn.transaction()?;
 
         if let Some(target) = &existing_target {
@@ -854,7 +982,7 @@ impl Db {
         let atime = update.atime.unwrap_or(inode.atime);
         let mtime = update.mtime.unwrap_or(inode.mtime);
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn();
         conn.prepare_cached(
             "UPDATE inodes
              SET mode = ?1, uid = ?2, gid = ?3, atime_ns = ?4, mtime_ns = ?5, ctime_ns = ?6
@@ -895,7 +1023,7 @@ impl Db {
         };
         let nlink: i64 = if kind == FileKind::Directory { 2 } else { 1 };
         let parent_delta: i64 = if kind == FileKind::Directory { 1 } else { 0 };
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn();
         let tx = conn.transaction()?;
 
         tx.prepare_cached(
@@ -1179,7 +1307,7 @@ fn lock_database(path: &Path) -> Result<Option<File>, DbError> {
         return Ok(None);
     }
     let lock_path = path_with_suffix(path, ".lock");
-    let file = OpenOptions::new()
+    let file = FileOpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
@@ -1520,6 +1648,17 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
 
 fn now_ts() -> Timestamp {
     Timestamp::from_system_time(SystemTime::now())
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        // The thread stops before the connection is freed, and the hook is removed
+        // before the state it points to is freed.
+        self.close_checkpoints();
+        if let Some(checkpoints) = &self.checkpoints {
+            checkpoints.uninstall(&self.conn.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+    }
 }
 
 #[cfg(test)]

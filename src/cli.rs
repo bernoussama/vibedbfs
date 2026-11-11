@@ -92,6 +92,14 @@ pub struct MountConfig {
     /// avoids that.
     #[arg(long, value_name = "SIZE", value_parser = parse_bytes)]
     pub mmap_size: Option<usize>,
+
+    /// Largest the write-ahead log may grow before a writer checkpoints it itself
+    /// (default 1G). Normally a background thread checkpoints the WAL, so writers
+    /// do not wait for it. Past this size, the writer that finds it checkpoints it
+    /// and waits, so the WAL stays bounded. Takes the same sizes as `--write-buffer`.
+    /// Minimum 64K. Read-only mounts do not checkpoint.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    pub wal_cap: Option<usize>,
 }
 
 /// Parses `N`, `NK`, `NM` or `NG` (powers of 1024), at least 64 KiB.

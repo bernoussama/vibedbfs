@@ -10,7 +10,7 @@ use fuser::{MountOption, Session, SessionUnmounter};
 
 use crate::fuse::DEFAULT_WRITE_BUFFER;
 use crate::fuse::ShutdownHandle;
-use crate::{Cli, Command, Db, DbError, Dbfs, MountConfig};
+use crate::{Cli, Command, Db, DbError, Dbfs, MountConfig, OpenOptions};
 
 const ALLOW_OTHER_HINT: &str = "hint: allow_other requires 'user_allow_other' in /etc/fuse.conf";
 
@@ -24,6 +24,10 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const SHUTDOWN_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 
 pub fn run(cli: Cli) -> Result<(), RunError> {
+    // Blocked before the database opens, because its checkpoint thread starts there
+    // and inherits this mask. Only the signal waiter in `mount_dbfs` may take these
+    // signals: a thread that did would apply their default action and end the process.
+    block_shutdown_signals().map_err(RunError::Session)?;
     run_with_mounter(cli, mount_dbfs)
 }
 
@@ -39,7 +43,8 @@ pub fn run_with_mounter(
         } => {
             // Validate options before the database is opened or created.
             let options = mount_options_for(&config)?;
-            let db = open_database(database, &config)?;
+            let read_only = options.contains(&MountOption::RO);
+            let db = open_database(database, &config, read_only)?;
             let write_buffer = config.write_buffer.unwrap_or(DEFAULT_WRITE_BUFFER);
             mounter(
                 Dbfs::with_write_buffer(db, write_buffer)
@@ -53,9 +58,22 @@ pub fn run_with_mounter(
 }
 
 /// Opens the database with the SQLite settings the mount asks for. These do not
-/// depend on the mount options, so `-o ro` gets the same settings.
-fn open_database(path: impl AsRef<Path>, config: &MountConfig) -> Result<Db, RunError> {
-    let db = Db::open(path)?;
+/// depend on the mount options, so `-o ro` gets the same settings. A read-only mount
+/// gets no checkpoint thread and no WAL truncation at unmount, since those write the
+/// database file.
+fn open_database(
+    path: impl AsRef<Path>,
+    config: &MountConfig,
+    read_only: bool,
+) -> Result<Db, RunError> {
+    let defaults = OpenOptions::default();
+    let options = OpenOptions {
+        wal_cap: config
+            .wal_cap
+            .map_or(defaults.wal_cap, |bytes| bytes as u64),
+        background_checkpoints: !read_only,
+    };
+    let db = Db::open_with(path, options)?;
     if let Some(bytes) = config.mmap_size {
         db.set_mmap_size(bytes as u64)?;
     }

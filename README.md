@@ -43,7 +43,7 @@ Stopping dbfs with Ctrl-C, or sending it SIGTERM or SIGHUP, also unmounts cleanl
 ## Mount options
 
 ```bash
-dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [--mmap-size SIZE] [--kernel-cache | --no-keep-cache] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
+dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [--mmap-size SIZE] [--wal-cap SIZE] [--kernel-cache | --no-keep-cache] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
 ```
 
 By default only the user who mounted dbfs can access the filesystem. `dbfs mount --help` lists every option.
@@ -55,6 +55,7 @@ By default only the user who mounted dbfs can access the filesystem. `dbfs mount
 | `--auto-unmount` | Unmounts the filesystem when dbfs exits, including after a crash or SIGKILL, so no stale mount is left behind. Requires `--allow-other` or `--allow-root`. On Ubuntu, the AppArmor profile for `fusermount3` blocks this cleanup (`fusermount3: failed to mark mounts private` in the log, an `apparmor="DENIED" ... flags="rw, rprivate"` line in the kernel log), so the mount stays until `fusermount3 -u`. This affects every FUSE filesystem, not just dbfs. |
 | `--write-buffer SIZE` | Memory for buffered writes, shared by all open files. Default `256M`, minimum `64K`; accepts `K`, `M` and `G` suffixes. Memory is reserved as it is used, never up front, and is kept until unmount, so a mount that has filled the budget holds that much RSS. Set `8M` in a container with a small memory limit. |
 | `--mmap-size SIZE` | Largest part of the database file that SQLite may map into memory (`PRAGMA mmap_size`). Default `2G` on 64-bit systems and `0` on 32-bit. `0` turns the map off. Accepts the same suffixes as `--write-buffer`. Random reads are faster with the map. Applies to read-only mounts too. |
+| `--wal-cap SIZE` | Largest the write-ahead log may grow before a writer checkpoints it itself. Default `1G`, minimum `64K`; accepts the same suffixes as `--write-buffer`. A background thread normally checkpoints the WAL, so writers do not wait for it. Past this size, the writer that finds it checkpoints it and waits. Read-only mounts do not checkpoint. See [Storage](#storage). |
 | `--kernel-cache` | Let the kernel cache more: writeback cache, parallel directory operations, 1 MiB requests, cached symlinks and async direct I/O. Off by default. With the writeback cache, written data can sit in the kernel until the file is closed or synced, so a crash or `docker stop` with files still open can lose data that dbfs never saw. Conflicts with `--no-keep-cache`. Each item is explained in [Kernel caching](docs/architecture.md#kernel-caching). |
 | `--no-keep-cache` | Restore the caching of earlier releases: the kernel drops a file's cached data on every open, and attributes and names expire after one second, so repeated reads go through FUSE and SQLite again. Conflicts with `--kernel-cache`. See [Kernel caching](docs/architecture.md#kernel-caching). |
 | `-o OPT[,OPT...]` | Extra options. Repeatable, and each value may be a comma-separated list. Known names map to typed FUSE options: `ro`, `rw`, `atime`, `noatime`, `suid`, `nosuid`, `dev`, `nodev`, `exec`, `noexec`, `dirsync`, `sync`, `async`, `fsname=NAME`, `subtype=NAME`. Any other option is passed to `fusermount3`, which accepts only the options it knows, such as `max_read=N`. An unknown option, such as `context=...`, makes the mount fail with `unknown option`. |
@@ -102,7 +103,8 @@ PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA busy_timeout = 5000;
-PRAGMA wal_autocheckpoint = 10000;
+PRAGMA wal_autocheckpoint = 0;       -- checkpoints run in a background thread, see below
+PRAGMA journal_size_limit = 67108864;
 PRAGMA mmap_size = 2147483648;  -- --mmap-size; SQLite caps it at its own maximum
 ```
 
@@ -113,6 +115,8 @@ FUSE writes are buffered in memory and flushed to SQLite on `flush`, `fsync` or 
 The schema version is kept in `PRAGMA user_version` (currently 5). Older databases are upgraded in place on first mount, in one transaction, so a failed or interrupted upgrade leaves the old version intact. The upgrade from version 3 rewrites every data chunk: about 20 s per GiB on a laptop SSD. It prints a note for databases over 256 MiB. The upgrade from version 4 rebuilds only the `inodes` table and does not rewrite file data; after it, an inode number is never reused. The old pages stay in the file as free pages, which SQLite reuses and `statfs` counts as free. A database written by a newer dbfs is refused before any write. Only one dbfs can have a database open at a time: `mount` holds an exclusive lock on a `<db>.lock` file beside it and refuses to start if another dbfs holds it. The lock does not stop sqlite3. Editing the database with sqlite3 while it is mounted is unsupported: the kernel and dbfs cache its data and attributes, so the mount may show stale data, and a later dbfs write to the same chunk overwrites the edit.
 
 `flush` and `release` commit under `synchronous = NORMAL`. `fsync` also calls `fdatasync` on the WAL file, or on the main database file when no WAL file is present, so the committed bytes reach the host.
+
+Checkpoints run off the write path. Commits never checkpoint. A background thread with its own connection runs a PASSIVE checkpoint when the WAL is over 64 MiB (or half of `--wal-cap`, if that is smaller), and after a second without a commit when the WAL holds frames it has not yet reset. After a full backfill the thread resets the WAL, and the next writer starts it again from the top, so the `-wal` file does not keep growing. `--wal-cap` (default `1G`) bounds the WAL: a writer that leaves it larger runs a RESTART checkpoint before it returns, so that one write waits. Unmount checkpoints everything and truncates the WAL to zero bytes. A checkpoint that fails is reported once: the next `fsync` on the mount returns `EIO`, and dbfs prints the error to stderr. Read-only mounts run no checkpoints and do not write the database file. `statfs` counts the WAL's size as used space.
 
 ## Test
 

@@ -83,6 +83,7 @@
  ├── open_table.rs    OpenTable: handle table and struct-of-arrays open-inode table
  ├── arena.rs         ChunkArena (dirty chunk bytes) and DirtyIdx (per-inode index)
  ├── db.rs            Db: SQLite storage layer, all SQL, chunk I/O, migrations
+ ├── checkpoint.rs    WAL checkpoints: commit hook, background thread, reset, --wal-cap
  └── model.rs         FileKind, Inode, DirEntry, MetadataUpdate, Timestamp, DbError
 ```
 
@@ -222,6 +223,19 @@ RSS for its buffers, even after the data is flushed, because the slots are reuse
 deletes the inode; otherwise the slot is flushed and, with no handles and no dirty
 data left, freed.
 
+## WAL Checkpoints
+
+Commits never checkpoint (`wal_autocheckpoint = 0`), so a write waits for a checkpoint only when the WAL is over its cap. The code is in `src/checkpoint.rs`.
+
+- **Frame count.** A commit hook on the main connection stores how many frames the WAL holds. The hook runs no SQL and takes no lock, so a commit pays for a few atomic stores.
+- **Background thread.** A thread with its own connection runs `PRAGMA wal_checkpoint(PASSIVE)` when the WAL is over 64 MiB, or half of `--wal-cap` if that is smaller, so a small cap still gets background work. It also runs one after a second without a commit, when the WAL holds frames it has not reset.
+- **Reset handshake.** SQLite restarts a WAL only when every frame is backfilled and no reader is in the way. Under sustained writes a PASSIVE pass seldom ends exactly at the last frame. The thread therefore catches up without the database lock until at most 1 MiB is left. Then it takes the main connection's mutex, which means no write transaction is open, runs PASSIVE once more, and releases the mutex. The next writer restarts the WAL at offset 0. SQLite can also restart the WAL on its own when it happens to be fully backfilled; the handshake makes the reset happen when the thread has caught up.
+- **Size bound (`--wal-cap SIZE`).** The default is 1 GiB and the minimum 64 KiB. A writer that leaves the WAL larger than the cap runs `PRAGMA wal_checkpoint(RESTART)` on its own connection before it returns, so that one write waits. A busy RESTART, which happens while the thread is in a long PASSIVE pass, is retried for up to 60 s. Read-only mounts never checkpoint.
+- **File size.** When the next writer restarts the WAL after a reset, SQLite truncates the `-wal` file to `journal_size_limit`, which is 64 MiB. Measured on SQLite 3.46.1 with an 8 MiB limit: a 22 MB WAL, fully backfilled, shrank to 8 MiB at the next write. So an idle database keeps at most 64 MiB of WAL on disk, and unmount truncates it to zero (see [Shutdown](#shutdown)).
+- **Sticky errors.** A checkpoint that fails, other than by being busy, is logged to stderr and recorded. The next `fsync` or `fsyncdir` on the mount returns `EIO`, once. The error therefore reaches an application that syncs, even though the failure happened in the background.
+- **Not checkpointed.** In-memory databases have no WAL. Read-only mounts run no thread and do not truncate the WAL at unmount.
+- **`statfs`.** Free space is the free pages minus the pages the WAL occupies, so the WAL counts as used space.
+
 ## Shutdown
 
 Buffered writes exist only in memory until they are flushed, so shutdown has to flush them. On SIGTERM, SIGINT or SIGHUP, `run` does the following:
@@ -229,10 +243,10 @@ Buffered writes exist only in memory until they are flushed, so shutdown has to 
 1. Refuses new buffered writes. They fail with `EIO`, so nothing is acknowledged and then dropped.
 2. Calls `Dbfs::flush_all`, which writes every dirty inode to SQLite, then runs `sync_durable`.
 3. Detaches the mount with `fusermount -u -z`.
-4. Waits up to 1 s for the FUSE session to end. The session ends at once when nothing has a file open. The kernel then sends `FUSE_DESTROY`, and `Filesystem::destroy` flushes again (normally a no-op).
+4. Waits up to 1 s for the FUSE session to end. The session ends at once when nothing has a file open. The kernel then sends `FUSE_DESTROY`, and `Filesystem::destroy` flushes again (normally a no-op). Then it stops and joins the checkpoint thread, and truncates the WAL to zero bytes with `PRAGMA wal_checkpoint(TRUNCATE)`. The thread stops before the connection closes, so it never runs on a closed connection.
 5. Exits 0. If a flush failed, it prints the error to stderr and exits 1.
 
-Step 2 runs on the signal path, not only in `destroy`, because a process that still has a file open keeps the session alive after a lazy detach. An external `fusermount3 -u` skips steps 1–3: the session ends, `destroy` flushes, and dbfs exits 0.
+Step 2 runs on the signal path, not only in `destroy`, because a process that still has a file open keeps the session alive after a lazy detach. An external `fusermount3 -u` skips steps 1–3: the session ends, `destroy` flushes, truncates the WAL and stops the thread, and dbfs exits 0.
 
 ## Read Data Flow
 
@@ -504,4 +518,4 @@ Do not edit the database file with `sqlite3` while dbfs has it mounted. The lock
 | Chunk table | `file_chunks` is a rowid table keyed `(ino << 24) \| chunk_index`: one B-tree, no separate index, and a file is one contiguous key range. |
 | Unlink | The resolved inode is passed to `unlink_entry` (no second lookup); an unlinked closed file's dirty data is dropped, not flushed. |
 | Readdir | Keyset scan `id > cookie` on `dirents_scan`; names are borrowed from SQLite into the reply. |
-| SQLite | WAL mode, `wal_autocheckpoint = 10000`, `mmap_size` 2 GiB by default (`--mmap-size`; with the map an I/O error can raise SIGBUS, see README), every statement through `prepare_cached`. |
+| SQLite | WAL mode, `wal_autocheckpoint = 0` with checkpoints on a background thread bounded by `--wal-cap` (see [WAL Checkpoints](#wal-checkpoints)), `mmap_size` 2 GiB by default (`--mmap-size`; with the map an I/O error can raise SIGBUS, see README), every statement through `prepare_cached`. |
