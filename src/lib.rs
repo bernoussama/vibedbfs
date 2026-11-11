@@ -5,6 +5,7 @@ mod fuse;
 mod model;
 mod open_table;
 mod run;
+mod stats;
 
 pub use cli::{Cli, Command, MountConfig};
 pub use db::{Db, SCHEMA_VERSION};

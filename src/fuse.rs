@@ -13,6 +13,7 @@ use fuser::{
 
 use crate::db::{CHUNK_SIZE, ChunkPiece, ChunkSpan, MAX_FILE_SIZE};
 use crate::open_table::{OpenTable, Slot};
+use crate::stats::{self, Op};
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
@@ -217,6 +218,7 @@ impl Shared {
             let victim = t.inodes.largest_dirty().ok_or(libc::EIO)?;
             let written = self.flush_chunks(t, victim, Unlinked::Persist, EVICTION_SLICE_CHUNKS)?;
             debug_assert!(written > 0, "a victim has dirty chunks");
+            stats::eviction(written);
             #[cfg(test)]
             t.evicted_chunks.push(written);
             if victim != writing {
@@ -901,6 +903,7 @@ impl Filesystem for Dbfs {
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let _op = stats::op(Op::Lookup);
         match Dbfs::lookup(self, parent, name.as_bytes()) {
             Ok(attr) => reply.entry(&self.ttl(), &attr, 0),
             Err(errno) => reply.error(errno),
@@ -908,6 +911,7 @@ impl Filesystem for Dbfs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        let _op = stats::op(Op::Getattr);
         match Dbfs::getattr(self, ino) {
             Ok(attr) => reply.attr(&self.ttl(), &attr),
             Err(errno) => reply.error(errno),
@@ -922,6 +926,7 @@ impl Filesystem for Dbfs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        let _op = stats::op(Op::Readdir);
         let result = self.readdir_stream(ino, offset, |ino, next_offset, kind, name| {
             reply.add(ino, next_offset, kind, OsStr::from_bytes(name))
         });
@@ -932,6 +937,7 @@ impl Filesystem for Dbfs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        let _op = stats::op(Op::Statfs);
         match Dbfs::statfs(self) {
             Ok(stat) => reply.statfs(
                 stat.blocks,
@@ -956,6 +962,7 @@ impl Filesystem for Dbfs {
         umask: u32,
         reply: ReplyEntry,
     ) {
+        let _op = stats::op(Op::Mkdir);
         match Dbfs::mkdir(
             self,
             parent,
@@ -980,6 +987,7 @@ impl Filesystem for Dbfs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let _op = stats::op(Op::Create);
         match self.create_open(parent, name.as_bytes(), mode, umask, req.uid(), req.gid()) {
             // Pass 0 for FOPEN flags (not syscall open flags). The kernel validates
             // these against known FOPEN_* constants and rejects other values with EIO.
@@ -996,6 +1004,7 @@ impl Filesystem for Dbfs {
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        let _op = stats::op(Op::Other);
         match Dbfs::symlink(
             self,
             parent,
@@ -1010,6 +1019,7 @@ impl Filesystem for Dbfs {
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let _op = stats::op(Op::Other);
         match Dbfs::readlink(self, ino) {
             Ok(target) => reply.data(&target),
             Err(errno) => reply.error(errno),
@@ -1024,6 +1034,7 @@ impl Filesystem for Dbfs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let _op = stats::op(Op::Link);
         match Dbfs::link(self, ino, newparent, newname.as_bytes()) {
             Ok(attr) => reply.entry(&self.ttl(), &attr, 0),
             Err(errno) => reply.error(errno),
@@ -1049,6 +1060,7 @@ impl Filesystem for Dbfs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let _op = stats::op(Op::Setattr);
         match Dbfs::setattr(
             self,
             ino,
@@ -1072,6 +1084,7 @@ impl Filesystem for Dbfs {
         size: u32,
         reply: ReplyXattr,
     ) {
+        let _op = stats::op(Op::Getxattr);
         match Dbfs::getxattr(self, ino, name.as_bytes()) {
             Ok(value) => reply_xattr(&value, size, reply),
             Err(errno) => reply.error(errno),
@@ -1079,6 +1092,7 @@ impl Filesystem for Dbfs {
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        let _op = stats::op(Op::Other);
         match Dbfs::listxattr(self, ino) {
             Ok(names) => reply_xattr(&names, size, reply),
             Err(errno) => reply.error(errno),
@@ -1095,6 +1109,7 @@ impl Filesystem for Dbfs {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Other);
         match Dbfs::setxattr(self, ino, name.as_bytes()) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1102,6 +1117,7 @@ impl Filesystem for Dbfs {
     }
 
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _op = stats::op(Op::Other);
         match Dbfs::removexattr(self, ino, name.as_bytes()) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1109,6 +1125,7 @@ impl Filesystem for Dbfs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let _op = stats::op(Op::Open);
         match Dbfs::open(self, ino) {
             Ok(fh) => reply.opened(fh, self.open_flags()),
             Err(errno) => reply.error(errno),
@@ -1125,6 +1142,7 @@ impl Filesystem for Dbfs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Release);
         match self.release_fh(fh) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1139,6 +1157,7 @@ impl Filesystem for Dbfs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Flush);
         match self.flush_fh(fh) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1153,6 +1172,7 @@ impl Filesystem for Dbfs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Fsync);
         match self.sync_fh(fh) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1167,6 +1187,7 @@ impl Filesystem for Dbfs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Fsyncdir);
         match self.sync_dir() {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1184,6 +1205,7 @@ impl Filesystem for Dbfs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let _op = stats::op(Op::Read);
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -1207,6 +1229,7 @@ impl Filesystem for Dbfs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        let _op = stats::op(Op::Write);
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -1228,6 +1251,7 @@ impl Filesystem for Dbfs {
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Other);
         match Dbfs::fallocate(self, ino, offset, length, mode) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1235,6 +1259,7 @@ impl Filesystem for Dbfs {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _op = stats::op(Op::Unlink);
         match Dbfs::unlink(self, parent, name.as_bytes()) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1242,6 +1267,7 @@ impl Filesystem for Dbfs {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _op = stats::op(Op::Rmdir);
         match Dbfs::rmdir(self, parent, name.as_bytes()) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -1258,6 +1284,7 @@ impl Filesystem for Dbfs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        let _op = stats::op(Op::Mknod);
         let file_type = mode & libc::S_IFMT;
         const S_IFREG: u32 = libc::S_IFREG;
         match file_type {
@@ -1291,6 +1318,7 @@ impl Filesystem for Dbfs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        let _op = stats::op(Op::Rename);
         match Dbfs::rename(
             self,
             parent,
