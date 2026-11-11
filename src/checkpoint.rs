@@ -14,9 +14,13 @@
 //!   the database lock, takes the main connection's mutex (no write transaction can
 //!   be open while it is held), runs PASSIVE once more, and releases it. The next
 //!   writer then restarts the WAL at its beginning. This is the reset handshake.
+//! - The catch-up also stops once the WAL reaches `forced_at`: three times
+//!   `passive_at`, and at most three quarters of the cap. The WAL cannot grow while
+//!   the lock is held, so the handshake runs at once, and the lock is held only for
+//!   the frames still unbackfilled.
 //! - Hard cap: a writer that leaves the WAL over `wal_cap` runs
 //!   `wal_checkpoint(RESTART)` on the main connection before it returns. That blocks,
-//!   but it bounds the WAL when the thread falls behind.
+//!   but it bounds the WAL when the thread falls far behind.
 //! - A checkpoint error is sticky: the next fsync or fsyncdir reports it once as EIO.
 //!
 //! A reset rewinds the WAL without shrinking the file. The next writer after a reset
@@ -28,7 +32,7 @@ use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -38,6 +42,8 @@ use crate::DbError;
 
 /// The background thread checkpoints (PASSIVE) once the WAL is this large.
 const PASSIVE_THRESHOLD: u64 = 64 << 20;
+/// The handshake is forced at this many `PASSIVE_THRESHOLD`s (see `WalState::forced_at`).
+const FORCED_MULTIPLE: u64 = 3;
 /// A WAL with unreset work, and no commit for this long, is checkpointed.
 const IDLE: Duration = Duration::from_secs(1);
 /// The reset handshake catches up without the database lock until at most this
@@ -49,8 +55,14 @@ const CATCH_UP_ROUNDS: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Pause between RESTART attempts while the WAL is busy.
 const RESTART_RETRY: Duration = Duration::from_millis(1);
+/// Pause after a round that did not reset the WAL, so busy rounds do not spin while
+/// writers keep kicking the thread.
+const ROUND_RETRY: Duration = Duration::from_millis(1);
 /// How long a writer over the cap keeps retrying a busy RESTART before it gives up.
 const RESTART_WAIT: Duration = Duration::from_secs(60);
+/// While the checkpoint thread waits for the database lock, a writer pauses this long
+/// before taking it again. See `Checkpoints::yield_to_handshake`.
+const HANDOFF_PAUSE: Duration = Duration::from_micros(50);
 /// `PRAGMA journal_size_limit`: when the next writer restarts the WAL after a
 /// reset, SQLite shrinks the WAL file to at most this size.
 pub(crate) const JOURNAL_SIZE_LIMIT: u64 = 64 << 20;
@@ -60,6 +72,15 @@ pub const DEFAULT_WAL_CAP: u64 = 1 << 30;
 pub const MIN_WAL_CAP: u64 = 64 << 10;
 const WAL_HEADER_BYTES: u64 = 32;
 const WAL_FRAME_HEADER_BYTES: u64 = 24;
+
+/// Checkpoint activity since the database was opened. See `Db::checkpoint_counts`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointCounts {
+    /// WAL resets done by the reset handshake.
+    pub resets: u64,
+    /// Writer RESTARTs at the cap that completed.
+    pub writer_restarts: u64,
+}
 
 /// What the writers, the commit hook and the thread share. The hook gets a pointer
 /// to it, so `Checkpoints` keeps it alive for as long as the hook is installed.
@@ -75,6 +96,13 @@ pub(crate) struct WalState {
     wal_cap: u64,
     /// The WAL size above which the thread checkpoints.
     passive_at: u64,
+    /// The WAL size at which the handshake stops catching up and takes the lock.
+    forced_at: u64,
+    /// Handshakes that reset the WAL, and writer RESTARTs that completed.
+    resets: AtomicU64,
+    writer_restarts: AtomicU64,
+    /// The thread is about to wait for the database lock. See `yield_to_handshake`.
+    handshake_wanted: AtomicBool,
     wake: Mutex<Wake>,
     woken: Condvar,
     /// Set by a failed checkpoint. Read without the lock as a fast path; the lock
@@ -98,12 +126,17 @@ struct Wakeup {
 
 impl WalState {
     fn new(page_size: u64, wal_cap: u64) -> Self {
+        let passive_at = PASSIVE_THRESHOLD.min(wal_cap / 2);
         Self {
             frames: AtomicU32::new(0),
             commits: AtomicU64::new(0),
             frame_bytes: page_size + WAL_FRAME_HEADER_BYTES,
             wal_cap,
-            passive_at: PASSIVE_THRESHOLD.min(wal_cap / 2),
+            passive_at,
+            forced_at: (FORCED_MULTIPLE * passive_at).min(wal_cap / 4 * 3),
+            resets: AtomicU64::new(0),
+            writer_restarts: AtomicU64::new(0),
+            handshake_wanted: AtomicBool::new(false),
             wake: Mutex::new(Wake::default()),
             woken: Condvar::new(),
             failed: AtomicBool::new(false),
@@ -238,6 +271,17 @@ impl Checkpoints {
         unsafe { ffi::sqlite3_wal_hook(conn.handle(), None, ptr::null_mut()) };
     }
 
+    /// Called by a writer before it takes the main connection's lock. While the thread
+    /// is waiting for that lock, the writer pauses, so the thread gets it. A std mutex
+    /// does not hand over to a waiter, and a writer that relocks at once after each
+    /// slice could hold the thread off for the whole burst, so the WAL would grow past
+    /// `forced_at`.
+    pub(crate) fn yield_to_handshake(&self) {
+        while self.state.handshake_wanted.load(Ordering::Acquire) {
+            thread::sleep(HANDOFF_PAUSE);
+        }
+    }
+
     /// Runs after every write, while the main connection is still locked and the
     /// commit is done. Above the cap it checkpoints the WAL itself. Otherwise, past
     /// `passive_at`, it wakes the thread.
@@ -262,6 +306,7 @@ impl Checkpoints {
                     // A completed RESTART leaves nothing for the next writer to backfill.
                     if backfilled == log {
                         self.state.frames.store(0, Ordering::Release);
+                        self.state.writer_restarts.fetch_add(1, Ordering::Relaxed);
                     }
                     return;
                 }
@@ -290,6 +335,14 @@ impl Checkpoints {
     /// Size of the `-wal` file on disk, or 0 when there is none.
     pub(crate) fn wal_file_bytes(&self) -> u64 {
         std::fs::metadata(wal_path(&self.path)).map_or(0, |metadata| metadata.len())
+    }
+
+    /// See `Db::checkpoint_counts`.
+    pub(crate) fn counts(&self) -> CheckpointCounts {
+        CheckpointCounts {
+            resets: self.state.resets.load(Ordering::Relaxed),
+            writer_restarts: self.state.writer_restarts.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -325,8 +378,13 @@ fn run(state: Arc<WalState>, main: Arc<Mutex<Connection>>, conn: Connection) {
         seen = commits;
         let over = state.wal_bytes() > state.passive_at;
         let due = over || (quiet && commits != reset_at);
-        if due && round(&state, &conn, &main) {
+        if !due {
+            continue;
+        }
+        if round(&state, &conn, &main) {
             reset_at = commits;
+        } else {
+            thread::sleep(ROUND_RETRY);
         }
     }
 }
@@ -355,22 +413,26 @@ fn try_round(
         return Ok(true);
     }
 
-    // Reset handshake. Catch up without the lock first, so the lock is held for only
-    // the last few frames.
+    // Catch up without the lock, so the lock is held for only the last few frames.
+    // The WAL grows while a pass runs, so stop at `forced_at` and take the lock: the
+    // writers are then blocked and the WAL stops growing.
     for _ in 0..CATCH_UP_ROUNDS {
         let behind = u64::from(state.frames.load(Ordering::Acquire)).saturating_sub(backfilled);
-        if behind * state.frame_bytes <= CATCH_UP_BYTES {
+        if behind * state.frame_bytes <= CATCH_UP_BYTES || state.wal_bytes() >= state.forced_at {
             break;
         }
         backfilled = checkpoint(conn, "PASSIVE")?.2;
     }
     // No write transaction is open while the lock is held, so the WAL can finish
-    // backfilling and then restart.
-    let guard = main.lock().unwrap();
+    // backfilling and then restart. Writers see `handshake_wanted` and let this in.
+    state.handshake_wanted.store(true, Ordering::Release);
+    let guard = main.lock().unwrap_or_else(PoisonError::into_inner);
+    state.handshake_wanted.store(false, Ordering::Release);
     let (busy, log, backfilled) = checkpoint(conn, "PASSIVE")?;
     let reset = !busy && backfilled == log;
     if reset {
         state.frames.store(0, Ordering::Release);
+        state.resets.fetch_add(1, Ordering::Relaxed);
     }
     drop(guard);
     Ok(reset)
@@ -451,5 +513,16 @@ mod tests {
             PASSIVE_THRESHOLD
         );
         assert_eq!(WalState::new(4096, 1 << 20).passive_at, 512 << 10);
+    }
+
+    #[test]
+    fn the_handshake_is_forced_well_below_the_cap() {
+        // Three passive thresholds with the default cap.
+        let default = WalState::new(4096, DEFAULT_WAL_CAP);
+        assert_eq!(default.forced_at, 192 << 20);
+        // A small cap cannot fit three thresholds, so it takes three quarters of it.
+        let small = WalState::new(4096, 1 << 20);
+        assert_eq!(small.forced_at, 768 << 10);
+        assert!(small.passive_at < small.forced_at && small.forced_at < small.wal_cap);
     }
 }

@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
 
 use crate::blocks::{self, ALL_BLOCKS, BlockMask, block_range};
-use crate::checkpoint::{self, Checkpoints, JOURNAL_SIZE_LIMIT};
+use crate::checkpoint::{self, CheckpointCounts, Checkpoints, JOURNAL_SIZE_LIMIT};
 use crate::stats::{self, SqlGroup};
 use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
 
@@ -207,6 +207,9 @@ impl Db {
 
     /// Locks the connection for a write. See `WriteConn`.
     fn write_conn(&self) -> WriteConn<'_> {
+        if let Some(checkpoints) = &self.checkpoints {
+            checkpoints.yield_to_handshake();
+        }
         WriteConn {
             guard: self.conn.lock().unwrap(),
             checkpoints: self.checkpoints.as_ref(),
@@ -218,6 +221,17 @@ impl Db {
         self.checkpoints
             .as_ref()
             .map_or(0, Checkpoints::wal_file_bytes)
+    }
+
+    /// Reset handshakes and writer RESTARTs since the database was opened. A reset by
+    /// the handshake, rather than by a writer at the cap, is what keeps the WAL below
+    /// `wal_cap` under sustained writes, so the tests check both. Zero for in-memory
+    /// databases.
+    #[doc(hidden)]
+    pub fn checkpoint_counts(&self) -> CheckpointCounts {
+        self.checkpoints
+            .as_ref()
+            .map_or_else(CheckpointCounts::default, Checkpoints::counts)
     }
 
     /// Sets `PRAGMA mmap_size`, the most of the database file that SQLite maps

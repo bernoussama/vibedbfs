@@ -34,13 +34,14 @@ const KERNEL_CACHE_MAX_REQUEST: u32 = 1024 * 1024;
 /// Default budget for buffered writes, shared by all open files. Memory is taken
 /// as dirty chunks need it and is never given back. When the budget is used up,
 /// the file with the most dirty chunks is partly written out (see
-/// `EVICTION_SLICE_CHUNKS`).
+/// `FLUSH_SLICE_CHUNKS`).
 pub const DEFAULT_WRITE_BUFFER: usize = 256 * 1024 * 1024;
 
-/// Most chunks one eviction writes in one transaction (16 MiB). A file with more
-/// dirty data is written out over several evictions, so a request that needs a
-/// free slot waits for at most this much data to be stored.
-const EVICTION_SLICE_CHUNKS: usize = 16 * 1024 * 1024 / CHUNK_SIZE;
+/// Most chunks one flush transaction stores (16 MiB). An eviction writes one slice,
+/// and a flush, fsync or close of a file with more dirty data writes it in slices.
+/// So a commit adds at most this much to the WAL, and a request that needs a free
+/// slot waits for at most this much data to be stored.
+const FLUSH_SLICE_CHUNKS: usize = 16 * 1024 * 1024 / CHUNK_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsStats {
@@ -103,10 +104,13 @@ impl Shared {
         self.table.lock().unwrap()
     }
 
-    /// Writes every dirty chunk of `slot` to the database, in one transaction. On
-    /// failure they stay buffered, so a later flush can retry.
+    /// Writes every dirty chunk of `slot` to the database, one transaction per slice of
+    /// at most `FLUSH_SLICE_CHUNKS` chunks. A transaction is what the WAL grows by, so
+    /// slicing bounds that growth. On failure the chunks not yet stored stay buffered,
+    /// so a later flush can retry.
     fn flush_slot(&self, t: &mut OpenTable, slot: Slot, unlinked: Unlinked) -> Result<(), i32> {
-        self.flush_chunks(t, slot, unlinked, usize::MAX).map(|_| ())
+        while self.flush_chunks(t, slot, unlinked, FLUSH_SLICE_CHUNKS)? > 0 {}
+        Ok(())
     }
 
     /// Writes the `limit` lowest-indexed dirty chunks of `slot`, in one
@@ -226,7 +230,7 @@ impl Shared {
 
     /// An empty arena slot. When the write budget is used up, the inode with the
     /// most dirty chunks (possibly `writing`, the one being written) gives up its
-    /// lowest `EVICTION_SLICE_CHUNKS` dirty chunks, in one transaction, which
+    /// lowest `FLUSH_SLICE_CHUNKS` dirty chunks, in one transaction, which
     /// frees at least one slot.
     fn alloc_chunk(&self, t: &mut OpenTable, writing: Slot) -> Result<u32, i32> {
         loop {
@@ -234,7 +238,7 @@ impl Shared {
                 return Ok(a);
             }
             let victim = t.inodes.largest_dirty().ok_or(libc::EIO)?;
-            let written = self.flush_chunks(t, victim, Unlinked::Persist, EVICTION_SLICE_CHUNKS)?;
+            let written = self.flush_chunks(t, victim, Unlinked::Persist, FLUSH_SLICE_CHUNKS)?;
             debug_assert!(written > 0, "a victim has dirty chunks");
             stats::eviction(written);
             #[cfg(test)]
@@ -1758,25 +1762,25 @@ mod tests {
         let file = db
             .create_file(1, b"big.bin", 0o644, 1, 1)
             .expect("create file");
-        let budget = EVICTION_SLICE_CHUNKS + 44;
+        let budget = FLUSH_SLICE_CHUNKS + 44;
         let fs = Dbfs::with_write_buffer(db, budget * CHUNK_SIZE);
         let fh = fs.open(file.ino).expect("open");
 
         // Chunks 0..=budget fill the arena. Writing chunk `budget` evicts.
         one_byte_per_chunk(&fs, fh, budget + 1);
-        assert_eq!(fs.table().evicted_chunks, [EVICTION_SLICE_CHUNKS]);
+        assert_eq!(fs.table().evicted_chunks, [FLUSH_SLICE_CHUNKS]);
         let stored = |c: usize| fs.db.read_file(file.ino, (c * CHUNK_SIZE) as u64, 1);
         assert_eq!(
-            stored(EVICTION_SLICE_CHUNKS - 1).expect("read"),
-            [((EVICTION_SLICE_CHUNKS - 1) % 251) as u8 + 1],
+            stored(FLUSH_SLICE_CHUNKS - 1).expect("read"),
+            [((FLUSH_SLICE_CHUNKS - 1) % 251) as u8 + 1],
             "the lowest slice reached the database"
         );
         assert_eq!(
-            stored(EVICTION_SLICE_CHUNKS).expect("read"),
+            stored(FLUSH_SLICE_CHUNKS).expect("read"),
             [0],
             "the next chunk is still buffered, so the database has a hole"
         );
-        assert_eq!(fs.arena_stats().1, budget + 1 - EVICTION_SLICE_CHUNKS);
+        assert_eq!(fs.arena_stats().1, budget + 1 - FLUSH_SLICE_CHUNKS);
 
         // Keep going well past the budget: every eviction is one slice.
         let total = 3 * budget;
@@ -1787,7 +1791,7 @@ mod tests {
         let evicted = fs.table().evicted_chunks.clone();
         assert!(evicted.len() >= 3, "{evicted:?}");
         assert!(
-            evicted.iter().all(|&n| n == EVICTION_SLICE_CHUNKS),
+            evicted.iter().all(|&n| n == FLUSH_SLICE_CHUNKS),
             "every eviction writes one slice: {evicted:?}"
         );
 
@@ -1812,7 +1816,7 @@ mod tests {
             .expect("create file");
         db.cap_page_count_at_current()
             .expect("cap sqlite page count");
-        let budget = EVICTION_SLICE_CHUNKS + 44;
+        let budget = FLUSH_SLICE_CHUNKS + 44;
         let fs = Dbfs::with_write_buffer(db, budget * CHUNK_SIZE);
         let fh = fs.open(file.ino).expect("open");
         // Half-chunk writes, so the slice needs new database pages and the cap bites.

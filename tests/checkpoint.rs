@@ -159,6 +159,40 @@ fn background_checkpoints_keep_the_wal_below_the_cap() {
     assert_integrity_ok(&db_path);
 }
 
+/// Under sustained writes the reset is done by the handshake: the thread resets the
+/// WAL, no writer restarts it at the cap, and the WAL stays near the forced threshold.
+#[test]
+fn the_handshake_resets_the_wal_under_sustained_writes() {
+    let dir = work_dir("handshake");
+    let db_path = dir.join("db.sqlite");
+    // Passive at 16 MiB. The handshake is forced at three quarters of the cap, 24 MiB.
+    let cap = 32 * MIB;
+    let forced = 24 * MIB;
+    let chunks = 128 * MIB / CHUNK as u64;
+
+    let db = open(&db_path, cap, true);
+    let largest = write_stream(&db, &db_path, b"stream.bin", chunks);
+    let counts = db.checkpoint_counts();
+    assert!(counts.resets > 0, "the handshake never reset the WAL");
+    assert_eq!(
+        counts.writer_restarts, 0,
+        "a writer restarted the WAL at the cap"
+    );
+    // Writers keep appending while a pass runs, so the WAL can pass the forced
+    // threshold by what one pass lets in.
+    assert!(
+        largest <= forced + 8 * MIB,
+        "the WAL reached {largest} bytes, past the {forced}-byte forced threshold"
+    );
+    drop(db);
+    assert_integrity_ok(&db_path);
+
+    let db = open(&db_path, cap, true);
+    assert_stream(&db, b"stream.bin", chunks);
+    drop(db);
+    assert_integrity_ok(&db_path);
+}
+
 /// After an idle period the WAL is reset, so a write does not grow the `-wal` file.
 #[test]
 fn an_idle_database_resets_its_wal() {
