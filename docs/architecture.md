@@ -135,6 +135,13 @@
 Deleting an inode (`delete_inode_rows`) deletes its chunk key range and then the
 inode row; entries and the symlink target follow through their cascades.
 
+**Page size.** A new database file gets 16 KiB SQLite pages (`NEW_DATABASE_PAGE_SIZE`
+in `db.rs`). `open_with` sets `PRAGMA page_size` only when the file has no pages,
+before the WAL switch and before `initialize`. SQLite ignores `page_size` on a
+non-empty file, so an existing database keeps its page size. `statfs` reports the
+page size as `f_bsize`. The 4 KiB dirty-block masks of the write buffer (`blocks.rs`)
+do not depend on the SQLite page size.
+
 ## Write Data Flow
 
 ```

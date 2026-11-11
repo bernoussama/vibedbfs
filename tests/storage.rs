@@ -82,6 +82,58 @@ fn file_backed_database_enables_wal_and_foreign_keys() {
 }
 
 #[test]
+fn new_database_gets_16_kib_pages_and_keeps_them_on_reopen() {
+    let path = temp_db_path("new-page-size");
+    // An empty file, not a missing one: both count as new.
+    std::fs::File::create(&path).expect("create empty database file");
+    {
+        let db = Db::open(&path).expect("open new file-backed database");
+        db.create_dir(1, b"docs", 0o755, 1000, 1000)
+            .expect("create directory");
+    }
+    assert_eq!(raw_page_size(&path), 16384);
+
+    drop(Db::open(&path).expect("reopen file-backed database"));
+    assert_eq!(raw_page_size(&path), 16384);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+}
+
+#[test]
+fn existing_database_keeps_its_page_size() {
+    let path = temp_db_path("existing-page-size");
+    {
+        let conn = Connection::open(&path).expect("open raw sqlite connection");
+        conn.execute_batch(
+            "
+            PRAGMA page_size = 4096;
+            CREATE TABLE marker (a INTEGER);
+            INSERT INTO marker VALUES (1);
+            ",
+        )
+        .expect("create 4 KiB database");
+    }
+
+    drop(Db::open(&path).expect("open existing database"));
+    assert_eq!(raw_page_size(&path), 4096);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+}
+
+/// The page size of the file, read through a plain SQLite connection.
+fn raw_page_size(path: &Path) -> i64 {
+    let conn = Connection::open(path).expect("open raw sqlite connection");
+    conn.query_row("PRAGMA page_size", [], |row| row.get(0))
+        .expect("read page size")
+}
+
+#[test]
 fn opening_legacy_database_migrates_root_owner_to_mount_user() {
     let path = temp_db_path("legacy-root-owner");
     {

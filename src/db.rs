@@ -58,6 +58,12 @@ fn chunk_index_of(key: i64) -> u64 {
 ///   after the highest one is deleted
 pub const SCHEMA_VERSION: i64 = 5;
 
+/// Page size of a database that dbfs creates. SQLite honours `page_size` only on
+/// an empty file, before the WAL switch, so `open_with` sets it only when the file
+/// has no pages. An existing database keeps its own page size; `dbfs migrate`
+/// changes it.
+const NEW_DATABASE_PAGE_SIZE: u32 = 16384;
+
 pub(crate) struct VolumeUsage {
     pub page_size: u64,
     pub page_count: u64,
@@ -127,7 +133,7 @@ enum NewNode<'a> {
 
 impl Db {
     /// Opens a database file with the default options: WAL mode, a 1 GiB WAL cap,
-    /// background checkpoints, and batched commits.
+    /// background checkpoints, and batched commits. A new file gets 16 KiB pages.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         Self::open_with(path, OpenOptions::default())
     }
@@ -150,6 +156,11 @@ impl Db {
         // Before the WAL switch and the table creation in `initialize`, both of
         // which write to the file.
         refuse_newer_schema(&conn)?;
+        // A file with no pages yet is new. Only a new file takes the new page size.
+        let pages: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        if pages == 0 {
+            conn.pragma_update(None, "page_size", NEW_DATABASE_PAGE_SIZE)?;
+        }
         // `wal_autocheckpoint = 0`: commits never checkpoint. The checkpoint thread
         // does that, see `checkpoint`.
         conn.execute_batch(&format!(
