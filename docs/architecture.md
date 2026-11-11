@@ -187,13 +187,17 @@ crash leaves the copy, which the next run removes first.
 
 Each buffered chunk keeps a 16-bit mask with one bit per 4 KiB block (`blocks.rs`). A write sets the bits of the blocks it touches. A block that the write covers only in part is first read from SQLite, one blob read of that block (zeros for a hole), so a dirty block always holds its complete contents. A block the write covers whole needs no read. The blocks that are not dirty are unknown: their bytes in the slot may be stale or zero. Reads take them from SQLite, and a flush keeps their stored bytes.
 
-## Flush Data Flow (on close, fsync, setattr, or a full write buffer)
+## Flush Data Flow (on close, fsync, a size change, or a full write buffer)
 
 Close flushes dirty bytes into the open metadata batch, which does not commit them
 (see [Metadata Batches](#metadata-batches)). `fsync` does that flush, commits the
 batch, and then calls `fdatasync` on the WAL file, or on the main database file when
 no WAL file is present. A file unlinked while open is not flushed on close or fsync: its data
-dies with its last handle, which deletes the inode.
+dies with its last handle, which deletes the inode. A `setattr` flushes only when it changes
+the size. Timestamp, mode and owner changes leave the data buffered, and a new mtime is kept in
+the open-table slot so the later flush stores it. With the writeback cache the kernel sends a
+timestamp `setattr` during writeback; flushing on each one wrote a 256 MiB random-write file
+about 12 times over.
 
 ```
  User: close(fd)  or  fsync(fd)  or  a write that finds the arena full
@@ -597,7 +601,7 @@ writes one line to stderr:
   flushes, truncate, inode deletion), `metadata` (lookups and directory and inode
   changes) and `sync` (the WAL `fdatasync`). Only the outermost call on a thread is
   counted. These totals sit inside the FUSE operations, so they overlap with `ops`.
-- `flush_transactions`: transactions that wrote dirty chunks (on close, fsync, setattr,
+- `flush_transactions`: transactions that wrote dirty chunks (on close, fsync, a size change,
   a full write buffer, or shutdown).
 - `chunks`: chunk rows and bytes written by flushes, and 4 KiB blocks read from SQLite before
   a partial write could be buffered (only the partly covered blocks at a write's edges).

@@ -1411,10 +1411,12 @@ fn delete_inode_rows(conn: &Connection, ino: u64) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Sets size, mtime and ctime of `ino` after a data change.
+/// Sets size, mtime and ctime of `ino` after a data change. `modified` can be
+/// earlier than the stored ctime when a `setattr` set an older mtime on buffered
+/// data (`cp -a`), so ctime never moves backwards.
 fn set_size(conn: &Connection, ino: u64, size: u64, modified: Timestamp) -> Result<(), DbError> {
     conn.prepare_cached(
-        "UPDATE inodes SET size = ?1, mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?3",
+        "UPDATE inodes SET size = ?1, mtime_ns = ?2, ctime_ns = MAX(ctime_ns, ?2) WHERE ino = ?3",
     )?
     .execute(params![size as i64, modified.to_ns(), ino as i64])?;
     Ok(())

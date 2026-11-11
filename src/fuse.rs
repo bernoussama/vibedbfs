@@ -724,19 +724,19 @@ impl Dbfs {
         atime: Option<SystemTime>,
         mtime: Option<SystemTime>,
     ) -> Result<FileAttr, i32> {
-        // Persist buffered writes first: the returned attributes must include
-        // them, and a later flush must not overwrite the mtime set here (`cp -a`
+        // A size change flushes buffered writes first (`truncate_locked`). Any other
+        // change leaves them buffered: with the writeback cache the kernel sends a
+        // timestamp-only setattr during writeback, and flushing the whole file each
+        // time multiplied the data written. A new mtime is also kept in the slot, so
+        // the later flush stores it instead of the time of the last write (`cp -a`
         // writes, then calls utimensat, then closes).
+        let mtime = mtime.map(Timestamp::from_system_time);
         let mut t = self.table();
-        if let Some(slot) = t.inodes.find(ino) {
-            self.flush_slot(&mut t, slot, Unlinked::Persist)?;
-            Shared::free_if_idle(&mut t, slot);
-        }
         if let Some(size) = size {
             self.truncate_locked(&mut t, ino, size)?;
         }
-
-        self.db
+        let attr = self
+            .db
             .update_metadata(
                 ino,
                 MetadataUpdate {
@@ -744,11 +744,18 @@ impl Dbfs {
                     uid,
                     gid,
                     atime: atime.map(Timestamp::from_system_time),
-                    mtime: mtime.map(Timestamp::from_system_time),
+                    mtime,
                 },
             )
             .map(|inode| file_attr_from_inode(&inode))
-            .map_err(errno_from_db_error)
+            .map_err(errno_from_db_error)?;
+        if let (Some(mtime), Some(slot)) = (mtime, t.inodes.find(ino)) {
+            t.inodes.mtime[slot as usize] = mtime;
+        }
+        drop(t);
+        let mut attr = attr;
+        self.overlay_attr(&mut attr);
+        Ok(attr)
     }
 
     /// Extended attributes are not stored. An existing inode answers `ENOSYS` on

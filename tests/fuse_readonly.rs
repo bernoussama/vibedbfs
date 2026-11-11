@@ -1112,3 +1112,42 @@ fn lookup_reports_the_buffered_size_of_an_open_file() {
     assert_eq!(attr.size, 10, "the buffered size, not the stored 0");
     fs.release_file(fh).expect("release");
 }
+
+#[test]
+fn timestamp_setattr_keeps_buffered_data_buffered() {
+    // With the writeback cache the kernel sends timestamp-only setattr calls
+    // during writeback. They must not flush the file each time.
+    let path = disk_db_path("setattr-no-flush");
+    let db = Db::open(&path).expect("open file-backed database");
+    let file = db
+        .create_file(1, b"buffered.bin", 0o600, 1000, 1000)
+        .expect("create file");
+    let fs = Dbfs::new(db);
+    let fh = fs.open(file.ino).expect("open");
+    fs.write_fh(fh, 0, &[7u8; 200_000]).expect("write");
+    let before = fs.getattr(file.ino).expect("attr").ctime;
+    let mtime = UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+    let attr = fs
+        .setattr(file.ino, None, None, None, None, Some(mtime), Some(mtime))
+        .expect("set times");
+    assert_eq!(attr.size, 200_000, "the reply carries the buffered size");
+    assert_eq!(attr.mtime, mtime);
+    fs.sync_dir().expect("commit metadata");
+    assert_eq!(
+        count_chunk_rows(&path, file.ino),
+        0,
+        "a timestamp-only setattr does not flush buffered chunks"
+    );
+
+    fs.release_file(fh).expect("release");
+    let attr = fs.getattr(file.ino).expect("attr after close");
+    assert_eq!(
+        attr.mtime, mtime,
+        "the flush keeps the mtime set by setattr"
+    );
+    assert!(attr.ctime >= before, "ctime does not move backwards");
+    assert_eq!(fs.read(file.ino, 199_990, 20).expect("read"), vec![7u8; 10]);
+    drop(fs);
+    assert_eq!(count_chunk_rows(&path, file.ino), 4);
+}
