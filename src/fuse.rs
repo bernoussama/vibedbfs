@@ -255,9 +255,11 @@ impl Shared {
             // acknowledge a write that nothing will persist.
             return Err(libc::EIO);
         }
-        let Some(span) = ChunkSpan::new(offset, data.len()) else {
+        if data.is_empty() {
             return Ok(0);
-        };
+        }
+        // An `offset + len` that overflows u64 is past the size limit as well.
+        let span = ChunkSpan::new(offset, data.len()).ok_or(libc::EFBIG)?;
         if span.end > MAX_FILE_SIZE {
             return Err(libc::EFBIG);
         }
@@ -731,10 +733,16 @@ impl Dbfs {
         Err(libc::ENODATA)
     }
 
-    /// Opens `ino` and returns a new file handle for it.
+    /// Opens `ino` and returns a new file handle for it. A directory is refused
+    /// with `EISDIR`: the kernel opens directories with OPENDIR, never OPEN, and a
+    /// directory handle would keep an open slot alive after `rmdir`.
     pub fn open(&self, ino: u64) -> Result<u64, i32> {
         let mut t = self.table();
         let slot = self.slot_for(&mut t, ino)?;
+        if t.inodes.kind[slot as usize] == FileKind::Directory {
+            Shared::free_if_idle(&mut t, slot);
+            return Err(libc::EISDIR);
+        }
         Ok(Shared::open_slot(&mut t, slot))
     }
 
