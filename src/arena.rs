@@ -2,11 +2,14 @@
 //!
 //! All dirty chunks of all open inodes share one [`ChunkArena`]: a byte buffer
 //! carved into `CHUNK_SIZE` slots, grown on demand up to a global budget and
-//! never shrunk, so steady-state writes do not allocate. Each inode keeps a
-//! [`DirtyIdx`], a vector of `(chunk_index, arena_slot)` sorted by chunk index.
+//! never shrunk, so steady-state writes do not allocate. Each slot records which
+//! of its 4 KiB blocks are dirty (see `blocks`); only those bytes are meaningful.
+//! Each inode keeps a [`DirtyIdx`], a vector of `(chunk_index, arena_slot)` sorted
+//! by chunk index.
 
 use std::ops::Range;
 
+use crate::blocks::{self, BlockMask};
 use crate::db::CHUNK_SIZE;
 use crate::stats;
 
@@ -14,10 +17,10 @@ use crate::stats;
 pub(crate) type ArenaSlot = u32;
 
 pub(crate) struct ChunkArena {
-    /// `len.len() * CHUNK_SIZE` bytes, grown one slot at a time.
+    /// `dirty.len() * CHUNK_SIZE` bytes, grown one slot at a time.
     bytes: Vec<u8>,
-    /// Valid bytes in each slot.
-    len: Vec<u32>,
+    /// The dirty blocks of each slot. Bytes outside them are not meaningful.
+    dirty: Vec<BlockMask>,
     free: Vec<ArenaSlot>,
     /// Slot limit: the write buffer budget divided by `CHUNK_SIZE`.
     max_slots: usize,
@@ -28,25 +31,25 @@ impl ChunkArena {
     pub fn new(budget: usize) -> Self {
         Self {
             bytes: Vec::new(),
-            len: Vec::new(),
+            dirty: Vec::new(),
             free: Vec::new(),
             max_slots: (budget / CHUNK_SIZE).max(1),
         }
     }
 
-    /// A slot with no valid bytes, or `None` when the budget is used up.
+    /// A slot with no dirty blocks, or `None` when the budget is used up.
     pub fn alloc(&mut self) -> Option<ArenaSlot> {
         let slot = match self.free.pop() {
             Some(slot) => slot,
-            None if self.len.len() < self.max_slots => {
+            None if self.dirty.len() < self.max_slots => {
                 self.bytes.resize(self.bytes.len() + CHUNK_SIZE, 0);
-                self.len.push(0);
-                (self.len.len() - 1) as ArenaSlot
+                self.dirty.push(0);
+                (self.dirty.len() - 1) as ArenaSlot
             }
             None => return None,
         };
-        self.len[slot as usize] = 0;
-        stats::arena_slots_in_use(self.len.len() - self.free.len());
+        self.dirty[slot as usize] = 0;
+        stats::arena_slots_in_use(self.dirty.len() - self.free.len());
         Some(slot)
     }
 
@@ -54,34 +57,33 @@ impl ChunkArena {
         self.free.push(slot);
     }
 
-    /// The valid bytes of `slot`.
-    pub fn chunk(&self, slot: ArenaSlot) -> &[u8] {
+    /// The whole `CHUNK_SIZE` buffer of `slot`. Only its dirty blocks hold the
+    /// chunk's bytes.
+    pub fn buffer(&self, slot: ArenaSlot) -> &[u8] {
         let start = slot as usize * CHUNK_SIZE;
-        &self.bytes[start..start + self.len[slot as usize] as usize]
+        &self.bytes[start..start + CHUNK_SIZE]
     }
 
-    /// The whole `CHUNK_SIZE` buffer of `slot`, to fill from storage. Follow
-    /// with `set_len`.
+    /// The whole buffer of `slot`, to fill blocks from storage before they are
+    /// marked dirty.
     pub fn buffer_mut(&mut self, slot: ArenaSlot) -> &mut [u8] {
         let start = slot as usize * CHUNK_SIZE;
         &mut self.bytes[start..start + CHUNK_SIZE]
     }
 
-    pub fn set_len(&mut self, slot: ArenaSlot, len: usize) {
-        debug_assert!(len <= CHUNK_SIZE);
-        self.len[slot as usize] = len as u32;
+    /// The dirty blocks of `slot`.
+    pub fn dirty(&self, slot: ArenaSlot) -> BlockMask {
+        self.dirty[slot as usize]
     }
 
-    /// Copies `data` to `range` of `slot`. A gap between the old end and
-    /// `range.start` is zeroed, so a reused slot never shows stale bytes.
+    /// Copies `data` to `range` of `slot` and marks every block that `range`
+    /// touches dirty. A block that `range` covers only in part must already hold
+    /// its stored bytes, which the caller reads first. Otherwise a dirty block
+    /// would hold unknown bytes.
     pub fn write(&mut self, slot: ArenaSlot, range: Range<usize>, data: &[u8]) {
         let base = slot as usize * CHUNK_SIZE;
-        let len = self.len[slot as usize] as usize;
-        if range.start > len {
-            self.bytes[base + len..base + range.start].fill(0);
-        }
+        self.dirty[slot as usize] |= blocks::touched(range.clone());
         self.bytes[base + range.start..base + range.end].copy_from_slice(data);
-        self.len[slot as usize] = len.max(range.end) as u32;
     }
 
     /// Bytes reserved so far. Never shrinks.
@@ -92,7 +94,7 @@ impl ChunkArena {
 
     #[cfg(test)]
     pub fn slots_in_use(&self) -> usize {
-        self.len.len() - self.free.len()
+        self.dirty.len() - self.free.len()
     }
 }
 
@@ -173,15 +175,35 @@ mod tests {
         assert_eq!(arena.capacity_bytes(), 2 * CHUNK_SIZE);
 
         arena.write(a, 0..4, b"abcd");
+        assert_eq!(arena.dirty(a), 0b1, "the write touches block 0 only");
         arena.release(a);
         let c = arena.alloc().expect("reused slot");
         assert_eq!(c, a);
-        assert_eq!(arena.chunk(c), b"", "a reused slot starts empty");
+        assert_eq!(
+            arena.dirty(c),
+            0,
+            "a reused slot starts with no dirty block"
+        );
         arena.write(c, 2..3, b"x");
-        assert_eq!(arena.chunk(c), b"\0\0x", "stale bytes are zeroed");
+        assert_eq!(arena.dirty(c), 0b1);
+        assert_eq!(&arena.buffer(c)[2..3], b"x");
         assert_eq!(arena.capacity_bytes(), 2 * CHUNK_SIZE, "no growth on reuse");
         assert_eq!(arena.slots_in_use(), 2);
         let _ = b;
+    }
+
+    #[test]
+    fn a_write_marks_every_block_it_touches() {
+        let mut arena = ChunkArena::new(CHUNK_SIZE);
+        let slot = arena.alloc().expect("slot");
+        arena.write(slot, 4000..8200, &vec![1u8; 4200]);
+        assert_eq!(arena.dirty(slot), 0b111, "blocks 0, 1 and 2");
+        arena.write(slot, 20_000..20_001, b"z");
+        assert_eq!(
+            arena.dirty(slot),
+            0b1_0111,
+            "block 4 is touched by the second write"
+        );
     }
 
     #[test]
@@ -228,7 +250,11 @@ mod tests {
         assert_eq!(idx.find(7), Ok(1));
         assert_eq!(idx.find(2), Err(0));
         let reused = arena.alloc().expect("a released slot");
-        assert_eq!(arena.chunk(reused), b"", "a released slot starts empty");
+        assert_eq!(
+            arena.dirty(reused),
+            0,
+            "a released slot starts with no dirty block"
+        );
         assert_eq!(arena.capacity_bytes(), 5 * CHUNK_SIZE, "no growth on reuse");
     }
 

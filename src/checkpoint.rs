@@ -258,7 +258,6 @@ impl Checkpoints {
         let deadline = Instant::now() + RESTART_WAIT;
         loop {
             match checkpoint(conn, "RESTART") {
-                // stats: checkpoint_done(dur, ok)
                 Ok((false, log, backfilled)) => {
                     // A completed RESTART leaves nothing for the next writer to backfill.
                     if backfilled == log {
@@ -349,7 +348,6 @@ fn try_round(
     main: &Mutex<Connection>,
 ) -> rusqlite::Result<bool> {
     let (busy, log, mut backfilled) = checkpoint(conn, "PASSIVE")?;
-    // stats: checkpoint_done(dur, ok)
     if busy || backfilled < log {
         return Ok(false);
     }
@@ -381,10 +379,13 @@ fn try_round(
 /// `PRAGMA wal_checkpoint(mode)` as (busy, frames in the WAL, frames backfilled).
 /// `mode` is always one of this module's literals.
 fn checkpoint(conn: &Connection, mode: &str) -> rusqlite::Result<(bool, u64, u64)> {
-    let (busy, log, backfilled): (i64, i64, i64) =
+    let start = Instant::now();
+    let result: rusqlite::Result<(i64, i64, i64)> =
         conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
+        });
+    crate::stats::checkpoint_done(start.elapsed(), result.is_ok());
+    let (busy, log, backfilled) = result?;
     Ok((busy != 0, log.max(0) as u64, backfilled.max(0) as u64))
 }
 

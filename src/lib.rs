@@ -1,4 +1,5 @@
 mod arena;
+mod blocks;
 mod checkpoint;
 mod cli;
 mod db;
