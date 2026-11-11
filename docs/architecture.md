@@ -346,16 +346,28 @@ does, never skips or repeats the remaining ones.
 
 dbfs stores no extended attributes and reserves no space. Both are answered
 explicitly, so tools see "no xattrs on this filesystem" rather than the `ENOSYS`
-that fuser returns for unimplemented operations.
+that fuser returns for unimplemented operations. The one deliberate `ENOSYS` is
+`getxattr`'s own reply, explained below.
 
 ### Extended attributes
 
 | Call | Existing inode | Missing inode |
 |---|---|---|
-| `getxattr` | `ENODATA` (size probe and buffer alike) | `ENOENT` |
+| `getxattr` | dbfs replies `ENOSYS`; the caller sees `EOPNOTSUPP` | `ENOENT` |
 | `listxattr` | empty list (size probe returns 0) | `ENOENT` |
 | `setxattr` | `EOPNOTSUPP` | `ENOENT` |
 | `removexattr` | `ENODATA` | `ENOENT` |
+
+`getxattr` replies `ENOSYS` on purpose. The kernel reads that as "not implemented",
+sets `fc->no_getxattr` for the mount, and from then on answers `getxattr(2)` with
+`EOPNOTSUPP` itself without sending a request. This matters because
+`file_remove_privs` probes `security.capability` with `getxattr` before every
+`write(2)`. With the earlier `ENODATA` reply, each write cost a round trip to the
+daemon (measured: 4 KiB random writes +11%, creating 5,000 files 12% less time with
+`ENOSYS`). Through a mount, the first `getxattr` is the only one dbfs sees. The
+`ENOENT` row is what the `Dbfs` API returns for a missing inode. `listxattr`,
+`setxattr` and `removexattr` are unchanged. `setxattr` returns `EOPNOTSUPP`, not
+`ENOSYS`, so it sets no latch.
 
 On a real mount, `cp -a`, `cp --preserve=all`, `tar --xattrs` (create and extract),
 and `rsync -aX` all succeed on trees without xattrs. Python's `os.listxattr` returns

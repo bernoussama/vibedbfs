@@ -569,11 +569,13 @@ impl Dbfs {
             .map_err(errno_from_db_error)
     }
 
-    /// Extended attributes are not stored, so no name exists on any inode. An
-    /// existing inode answers `ENODATA`, which tools read as "no such attribute".
+    /// Extended attributes are not stored. An existing inode answers `ENOSYS` on
+    /// purpose: the kernel then sets `fc->no_getxattr` and stops sending
+    /// `getxattr` for the mount, so the `security.capability` probe no longer
+    /// costs a round trip per write. Callers see `EOPNOTSUPP`.
     pub fn getxattr(&self, ino: u64, _name: &[u8]) -> Result<Vec<u8>, i32> {
         self.getattr(ino)?;
-        Err(libc::ENODATA)
+        Err(libc::ENOSYS)
     }
 
     /// The name list is always empty: there are no extended attributes to list.

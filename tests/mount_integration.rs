@@ -224,7 +224,7 @@ fn mounted_fallocate_extends_size_and_reads_zeros_when_enabled() {
 
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
-fn mounted_xattr_calls_return_enodata_eopnotsupp_and_an_empty_list_when_enabled() {
+fn mounted_xattr_calls_return_the_documented_errnos_and_an_empty_list_when_enabled() {
     let mount = BenchMount::start("xattr");
     let path = mount.mountpoint().join("notes.txt");
     fs::write(&path, b"hello").expect("create file through mount");
@@ -234,13 +234,15 @@ fn mounted_xattr_calls_return_enodata_eopnotsupp_and_an_empty_list_when_enabled(
     let name = CString::new("user.x").expect("attribute name");
     let value = b"1";
 
-    // getxattr: the size probe and a real buffer both report ENODATA.
+    // getxattr: the first call reaches dbfs, which replies ENOSYS. The kernel
+    // reports EOPNOTSUPP and stops sending getxattr for the mount, so the second
+    // call (a real buffer) fails the same way without a request.
     for size in [0usize, 64] {
         let mut buf = vec![0u8; size];
         let rc =
             unsafe { libc::getxattr(file.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), size) };
         assert_eq!(rc, -1, "getxattr with size {size} must fail");
-        assert_eq!(libc_errno(), libc::ENODATA, "getxattr with size {size}");
+        assert_eq!(libc_errno(), libc::EOPNOTSUPP, "getxattr with size {size}");
     }
 
     // listxattr: the size probe returns 0 (an empty list) on files and the root.
