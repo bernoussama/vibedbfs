@@ -4,7 +4,8 @@
 //!
 //! Run with: `DBFS_RUN_FUSE_TESTS=1 cargo test --locked --test crash -- --include-ignored --test-threads=1`
 //!
-//! No fsync is issued on directories: dbfs does not implement `fsyncdir`.
+//! Directory entries are made durable with fsync on the directory, which commits
+//! the open metadata batch.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -276,6 +277,104 @@ fn kill_during_heavy_unsynced_writes(name: &str, extra: &[&str], wal_bound: Opti
     assert_integrity_ok(&db);
 }
 
+/// Creates, renames and unlinks entries in `dir` until `stop` is set, or until an
+/// operation fails, which happens once dbfs is killed.
+fn metadata_churn(dir: &Path, ops: &AtomicU64, stop: &AtomicBool) {
+    const KEEP: u64 = 50;
+    for i in 0.. {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let made = dir.join(format!("churn-{i}"));
+        let moved = dir.join(format!("moved-{i}"));
+        if File::create(&made).is_err() || fs::rename(&made, &moved).is_err() {
+            return;
+        }
+        ops.fetch_add(2, Ordering::Relaxed);
+        if i >= KEEP {
+            if fs::remove_file(dir.join(format!("moved-{}", i - KEEP))).is_err() {
+                return;
+            }
+            ops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Makes the entries of `dir` durable with fsync on the directory.
+fn sync_dir(dir: &Path) {
+    File::open(dir)
+        .expect("open directory")
+        .sync_all()
+        .expect("fsync directory");
+}
+
+/// Kills dbfs during create, rename and unlink churn. Entries that were fsynced, or
+/// whose directory was fsynced after the change, must survive, and the database
+/// must pass integrity_check. Commits can lag by about 5 ms, so the churn entries
+/// themselves are not checked.
+fn kill_during_metadata_churn(name: &str, extra: &[&str]) {
+    require_fuse();
+    let dir = work_dir(name);
+    let db = dir.join("db.sqlite");
+    let kept = pattern(20_000, 4);
+
+    let mut mounted = Mounted::start(&db, &dir.join("mnt-1"), &dir.join("dbfs-1.log"), extra);
+    let stable = mounted.path().join("stable");
+    fs::create_dir(&stable).expect("create stable directory");
+    write_synced(&stable.join("kept.bin"), &kept);
+    write_synced(&stable.join("rename-src.txt"), b"renamed");
+    fs::rename(stable.join("rename-src.txt"), stable.join("rename-dst.txt")).expect("rename");
+    sync_dir(&stable);
+
+    let churn = mounted.path().join("churn");
+    fs::create_dir(&churn).expect("create churn directory");
+    sync_dir(mounted.path());
+
+    let ops = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let churn = churn.clone();
+        let ops = Arc::clone(&ops);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || metadata_churn(&churn, &ops, &stop))
+    };
+    // Kill once 2,000 operations have run, or after 30 seconds.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while ops.load(Ordering::Relaxed) < 2_000 && Instant::now() < deadline && !writer.is_finished()
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let done = ops.load(Ordering::Relaxed);
+    assert!(
+        done >= 2_000,
+        "churn ran only {done} operations before the kill"
+    );
+    mounted.kill_9();
+    mounted.unmount();
+    stop.store(true, Ordering::Relaxed);
+    join_within(writer, Duration::from_secs(30));
+    assert_integrity_ok(&db);
+
+    let remounted = Mounted::start(&db, &dir.join("mnt-2"), &dir.join("dbfs-2.log"), extra);
+    let stable = remounted.path().join("stable");
+    assert_eq!(
+        fs::read(stable.join("kept.bin")).expect("read kept.bin"),
+        kept,
+        "a file fsynced before the churn must survive the kill"
+    );
+    assert_eq!(
+        fs::read(stable.join("rename-dst.txt")).expect("read rename-dst.txt"),
+        b"renamed",
+        "a rename made durable by fsyncdir must survive the kill"
+    );
+    assert!(
+        !stable.join("rename-src.txt").exists(),
+        "the renamed-away name must not come back"
+    );
+    drop(remounted);
+    assert_integrity_ok(&db);
+}
+
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn kill_after_fsync_keeps_synced_files_default_mount() {
@@ -316,4 +415,10 @@ fn kill_during_checkpointing_keeps_synced_data_and_integrity() {
         &["--write-buffer", "1M", "--wal-cap", "1M"],
         Some(3 * MIB as u64),
     );
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn kill_during_metadata_churn_keeps_synced_entries_default_mount() {
+    kill_during_metadata_churn("churn-default", &[]);
 }

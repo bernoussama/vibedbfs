@@ -5,12 +5,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use dbfs::{Db, Dbfs};
+use dbfs::{Db, Dbfs, OpenOptions};
 use rusqlite::Connection;
 
 const CHUNK: usize = 65_536;
 /// A cap that lets the filesystem run again.
 const NO_CAP: u64 = 1 << 31;
+
+/// Per-operation commits. These tests check the error of the operation that
+/// hits the cap. Batching reports that error at the next commit instead.
+fn per_op() -> OpenOptions {
+    OpenOptions {
+        sync_metadata: true,
+        ..OpenOptions::default()
+    }
+}
 
 /// A fresh database file under the target dir (disk-backed, not tmpfs).
 fn db_path(name: &str) -> PathBuf {
@@ -58,7 +67,7 @@ fn fsynced_file(fs: &Dbfs, name: &[u8], data: &[u8]) -> u64 {
 fn enospc_is_reported_by_write_flush_and_fsync_and_fsynced_data_survives() {
     let path = db_path("enospc");
     // One 64 KiB buffer: the second chunk of a write evicts the first.
-    let fs = Dbfs::with_write_buffer(Db::open(&path).expect("open"), CHUNK);
+    let fs = Dbfs::with_write_buffer(Db::open_with(&path, per_op()).expect("open"), CHUNK);
     let keep_data = pattern(3 * CHUNK + 1000, 3);
     let keep = fsynced_file(&fs, b"keep", &keep_data);
 
@@ -106,7 +115,7 @@ fn enospc_is_reported_by_write_flush_and_fsync_and_fsynced_data_survives() {
     drop(fs);
 
     assert_integrity_ok(&path);
-    let fs = Dbfs::new(Db::open(&path).expect("reopen"));
+    let fs = Dbfs::new(Db::open_with(&path, per_op()).expect("reopen"));
     let keep = fs.lookup(1, b"keep").expect("lookup keep").ino;
     let big = fs.lookup(1, b"big").expect("lookup big").ino;
     assert_eq!(
@@ -122,7 +131,7 @@ fn enospc_is_reported_by_write_flush_and_fsync_and_fsynced_data_survives() {
 #[test]
 fn release_reports_enospc_and_keeps_the_data_for_a_later_fsync() {
     let path = db_path("release");
-    let fs = Dbfs::new(Db::open(&path).expect("open"));
+    let fs = Dbfs::new(Db::open_with(&path, per_op()).expect("open"));
     let file = fs.create(1, b"file", 0o644, 0, 0, 0).expect("create").ino;
     let fh = fs.open(file).expect("open");
     let data = pattern(CHUNK + 10, 5);
@@ -147,7 +156,7 @@ fn release_reports_enospc_and_keeps_the_data_for_a_later_fsync() {
     drop(fs);
 
     assert_integrity_ok(&path);
-    let fs = Dbfs::new(Db::open(&path).expect("reopen"));
+    let fs = Dbfs::new(Db::open_with(&path, per_op()).expect("reopen"));
     let file = fs.lookup(1, b"file").expect("lookup").ino;
     assert_eq!(fs.read(file, 0, data.len() as u32).expect("read"), data);
 }
@@ -155,7 +164,7 @@ fn release_reports_enospc_and_keeps_the_data_for_a_later_fsync() {
 #[test]
 fn crash_after_enospc_keeps_fsynced_data_and_drops_the_failed_write() {
     let path = db_path("crash");
-    let fs = Dbfs::with_write_buffer(Db::open(&path).expect("open"), CHUNK);
+    let fs = Dbfs::with_write_buffer(Db::open_with(&path, per_op()).expect("open"), CHUNK);
     let keep_data = pattern(200_000, 11);
     fsynced_file(&fs, b"keep", &keep_data);
 
@@ -171,7 +180,7 @@ fn crash_after_enospc_keeps_fsynced_data_and_drops_the_failed_write() {
     drop(fs);
 
     assert_integrity_ok(&path);
-    let fs = Dbfs::new(Db::open(&path).expect("reopen"));
+    let fs = Dbfs::new(Db::open_with(&path, per_op()).expect("reopen"));
     let keep = fs.lookup(1, b"keep").expect("lookup keep").ino;
     assert_eq!(
         fs.read(keep, 0, keep_data.len() as u32).expect("read"),

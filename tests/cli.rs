@@ -446,3 +446,9 @@ fn rejects_wal_cap_below_one_chunk() {
 
     assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
 }
+
+#[test]
+fn sync_metadata_is_off_unless_requested() {
+    assert!(!parse_mount(&[]).sync_metadata);
+    assert!(parse_mount(&["--sync-metadata"]).sync_metadata);
+}

@@ -53,6 +53,7 @@ fn open(db: &Path, wal_cap: u64, background_checkpoints: bool) -> Db {
         OpenOptions {
             wal_cap,
             background_checkpoints,
+            sync_metadata: false,
         },
     )
     .expect("open database")
@@ -297,6 +298,7 @@ fn a_wal_cap_below_one_chunk_is_refused() {
         OpenOptions {
             wal_cap: 1024,
             background_checkpoints: true,
+            sync_metadata: false,
         },
     );
     assert!(matches!(result, Err(DbError::InvalidInput)));

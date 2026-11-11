@@ -62,7 +62,8 @@ pub fn run_with_mounter(
 /// Opens the database with the SQLite settings the mount asks for. These do not
 /// depend on the mount options, so `-o ro` gets the same settings. A read-only mount
 /// gets no checkpoint thread and no WAL truncation at unmount, since those write the
-/// database file.
+/// database file. It also commits every operation as it returns, since with no
+/// background checkpoints the database is opened per operation (see `Db::open_with`).
 fn open_database(
     path: impl AsRef<Path>,
     config: &MountConfig,
@@ -74,6 +75,7 @@ fn open_database(
             .wal_cap
             .map_or(defaults.wal_cap, |bytes| bytes as u64),
         background_checkpoints: !read_only,
+        sync_metadata: config.sync_metadata,
     };
     let db = Db::open_with(path, options)?;
     if let Some(bytes) = config.mmap_size {

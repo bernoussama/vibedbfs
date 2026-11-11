@@ -107,6 +107,14 @@ pub struct MountConfig {
     /// Minimum 64K. Read-only mounts do not checkpoint.
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub wal_cap: Option<usize>,
+
+    /// Commit every metadata change (create, rename, unlink, and so on) as its
+    /// operation returns, instead of sharing a commit with the operations that
+    /// follow it within 5 ms. Slower for metadata-heavy work. A crash (kill -9) then
+    /// loses no completed operation, even one not yet fsynced. Off by default.
+    /// Read-only mounts always commit this way.
+    #[arg(long)]
+    pub sync_metadata: bool,
 }
 
 /// Parses `N`, `NK`, `NM` or `NG` (powers of 1024), at least 64 KiB.
