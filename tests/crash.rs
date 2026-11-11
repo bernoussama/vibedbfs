@@ -138,6 +138,13 @@ fn pattern(len: usize, salt: u8) -> Vec<u8> {
         .collect()
 }
 
+/// Size of the `-wal` file, or 0 when there is none.
+fn wal_len(db: &Path) -> u64 {
+    let mut name = db.as_os_str().to_owned();
+    name.push("-wal");
+    fs::metadata(name).map_or(0, |metadata| metadata.len())
+}
+
 fn write_synced(path: &Path, data: &[u8]) {
     let mut file = File::create(path).expect("create file");
     file.write_all(data).expect("write file");
@@ -206,7 +213,9 @@ fn join_within(handle: JoinHandle<()>, limit: Duration) {
     handle.join().expect("writer thread");
 }
 
-fn kill_during_heavy_unsynced_writes(name: &str, extra: &[&str]) {
+/// Kills dbfs during heavy unsynced writes. With `wal_bound`, the `-wal` file must stay
+/// within it while the writes run.
+fn kill_during_heavy_unsynced_writes(name: &str, extra: &[&str], wal_bound: Option<u64>) {
     require_fuse();
     let dir = work_dir(name);
     let db = dir.join("db.sqlite");
@@ -225,10 +234,12 @@ fn kill_during_heavy_unsynced_writes(name: &str, extra: &[&str]) {
     };
     // Kill once 16 MiB of unsynced writes are in, or after 30 seconds.
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut largest_wal = 0;
     while written.load(Ordering::Relaxed) < 16 * MIB as u64
         && Instant::now() < deadline
         && !writer.is_finished()
     {
+        largest_wal = largest_wal.max(wal_len(&db));
         thread::sleep(Duration::from_millis(5));
     }
     let heavy_bytes = written.load(Ordering::Relaxed);
@@ -236,6 +247,12 @@ fn kill_during_heavy_unsynced_writes(name: &str, extra: &[&str]) {
         heavy_bytes >= 4 * MIB as u64,
         "heavy phase wrote only {heavy_bytes} bytes before the kill"
     );
+    if let Some(bound) = wal_bound {
+        assert!(
+            largest_wal <= bound,
+            "the WAL reached {largest_wal} bytes, above its {bound}-byte bound"
+        );
+    }
     mounted.kill_9();
     mounted.unmount();
     stop.store(true, Ordering::Relaxed);
@@ -280,11 +297,23 @@ fn kill_after_fsync_keeps_synced_files_with_kernel_cache() {
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn kill_during_heavy_unsynced_writes_default_mount() {
-    kill_during_heavy_unsynced_writes("heavy-default", &[]);
+    kill_during_heavy_unsynced_writes("heavy-default", &[], None);
 }
 
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn kill_during_heavy_unsynced_writes_with_1m_write_buffer() {
-    kill_during_heavy_unsynced_writes("heavy-1m-buffer", &["--write-buffer", "1M"]);
+    kill_during_heavy_unsynced_writes("heavy-1m-buffer", &["--write-buffer", "1M"], None);
+}
+
+/// A 1 MiB WAL cap with a 1 MiB write buffer: every few MiB of writes commit and
+/// checkpoint, by the writers or by the checkpoint thread. The kill can land in either.
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn kill_during_checkpointing_keeps_synced_data_and_integrity() {
+    kill_during_heavy_unsynced_writes(
+        "checkpoint-small-cap",
+        &["--write-buffer", "1M", "--wal-cap", "1M"],
+        Some(3 * MIB as u64),
+    );
 }

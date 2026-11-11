@@ -431,3 +431,18 @@ fn mmap_size_rejects_bad_sizes() {
         );
     }
 }
+
+#[test]
+fn parses_wal_cap_with_a_size_suffix() {
+    assert_eq!(parse_mount(&["--wal-cap", "512K"]).wal_cap, Some(512 << 10));
+    assert_eq!(parse_mount(&["--wal-cap", "1G"]).wal_cap, Some(1 << 30));
+    assert_eq!(parse_mount(&[]).wal_cap, None);
+}
+
+#[test]
+fn rejects_wal_cap_below_one_chunk() {
+    let error = Cli::try_parse_from(["dbfs", "mount", "--wal-cap", "1K", "dbfs.sqlite", "mnt"])
+        .expect_err("a 1K WAL cap should be refused");
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+}
