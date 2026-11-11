@@ -170,6 +170,61 @@ Pass extra fio arguments after `--`:
 scripts/bench-fio.sh --job randwrite --fsync 0 -- --group_reporting --output-format=json
 ```
 
+### Local harness: `scripts/bench.sh`
+
+Runs `bench_io` workloads (see below) against a fresh database and mount for every run, on disk under `.bench/`. Results are appended to `.bench/results/<label>.jsonl`.
+
+```bash
+scripts/bench.sh --label mine --repeat 3 --workloads "smallfiles tree-cold"
+```
+
+`--raw` runs the same workloads on the plain `.bench/` directory instead of dbfs. The cold workloads drop the page cache, which needs root or passwordless `sudo`.
+
+### bench_io workloads
+
+`examples/bench_io.rs` prints one JSON line per measurement (`workload`, `secs`, and `mib_s` and `iops` where they apply).
+
+| Workload | What is timed |
+| --- | --- |
+| `seqwrite`, `randwrite`, `randwrite-fsync`, `seqread`, `randread` | the fio-style jobs with sizes of 256–512 MiB |
+| `seqwrite-long [SIZE]` | 128 KiB sequential writes totalling 3 GiB (or `SIZE`), with the final fsync included |
+| `seqread-cold`, `randread-cold` | reads of 256 MiB after the data is laid out and the caches are dropped |
+| `smallfiles` | creating 20,000 files of 1–16 KiB in a 20 × 20 × 50 directory tree, each closed after its write |
+| `tree-cold` | on the same 20,000-file tree, after a remount and a cache drop: a timed `lstat` walk, then a timed `rm -rf` |
+| `metadata`, `bigdir` | create, stat, readdir and unlink of 5,000 small files, and create, list and `rm -rf` of 20,000 entries |
+
+The cold workloads run in three steps, so the caller can drop caches and remount in between: `bench_io layout <dir> <SIZE>`, `bench_io read-only <dir> <seq|rand> <SIZE>`, and `bench_io tree-layout|tree-stat|tree-rm <dir>`. `compare.sh` and `bench.sh` run them in that order.
+
+### Docker comparison: `scripts/bench-docker/compare.sh`
+
+Runs dbfs, ext4, btrfs and libfuse's `passthrough_hp` from one privileged container, on the same disk. It needs Docker with `--privileged`.
+
+```bash
+scripts/bench-docker/compare.sh --tag baseline
+scripts/bench-docker/compare.sh --quick --tag smoke
+scripts/bench-docker/compare.sh --tag write-buffer-8M --configs dbfs-ext4 --workloads "seqwrite randwrite" --dbfs-args "--write-buffer 8M"
+```
+
+| Option | Effect |
+| --- | --- |
+| `--quick` | configs `ext4 pt-ext4-user dbfs-ext4 dbfs-ext4-kc`, one bench_io round and one fio round |
+| `--rounds N`, `--fio-rounds N` | bench_io rounds (default 3) and fio rounds (default 2) |
+| `--configs "LIST"` | configs to run (default: all ten) |
+| `--workloads "LIST"` | workloads by name. A name runs the bench_io workload and the fio job of the same name (default: all) |
+| `--dbfs-args "ARGS"` | extra arguments for every dbfs mount, placed after the config's own flags and before the database path, for A/B tests of one flag |
+| `--tag NAME` | results go to `.bench/fscmp2/NAME/` (default: a timestamp). The directory must not exist yet |
+
+fio jobs: `randwrite-nofsync`, `randwrite-fsync`, `randread-cold`, `seqwrite`, and `randwrite-4jobs` (four jobs of 64 MiB each, 4 KiB random writes, no fsync, `group_reporting`).
+
+Each tag directory holds `run.txt` (the command lines, git revision, the dbfs version or, while dbfs has no `--version` flag, its binary's SHA-256, the kernel and the options), `results/<config>.jsonl`, `raw/` (bench_io output as printed), `fio/<config>/` (fio JSON), `logs/` (FUSE server stderr) and `summary.txt`. Everything under `.bench/` is chowned back to the host user when the container exits, failures included.
+
+Summarize one tag, or compare two (`dir2` against `dir1`; above 1 means `dir2` is better for both MiB/s and seconds):
+
+```bash
+scripts/bench-docker/summarize.py .bench/fscmp2/baseline
+scripts/bench-docker/summarize.py .bench/fscmp2/baseline .bench/fscmp2/write-buffer-8M
+```
+
 ## Current fio Results
 
 ### dbfs vs Native vs FUSE Passthrough
