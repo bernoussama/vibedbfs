@@ -1,8 +1,8 @@
 use dbfs::{Db, Dbfs, DbfsDirEntry, FileKind, mount_options};
 use fuser::{FileType, MountOption};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temp_db_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -599,11 +599,14 @@ fn buffers_fuse_writes_until_flush() {
         b"hello"
     );
     assert_eq!(fs.getattr(file.ino).expect("dirty attr").size, 5);
-    assert_eq!(raw_inode_size(&path, file.ino), 0);
+    // The create commits within about 5 ms. The buffered write has not reached
+    // the database, so the stored size is still 0.
+    wait_for_raw_inode_size(&path, file.ino, 0);
 
     fs.flush_file(file.ino).expect("flush file");
 
-    assert_eq!(raw_inode_size(&path, file.ino), 5);
+    // Flush writes into the open batch, which commits within about 5 ms.
+    wait_for_raw_inode_size(&path, file.ino, 5);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
@@ -624,7 +627,7 @@ fn release_flushes_buffered_fuse_writes() {
     fs.write(file.ino, 0, b"hello").expect("write file");
     fs.release_file(fh).expect("release file");
 
-    assert_eq!(raw_inode_size(&path, file.ino), 5);
+    wait_for_raw_inode_size(&path, file.ino, 5);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
@@ -765,15 +768,30 @@ fn exec_sql(path: &Path, sql: &str) {
     conn.execute_batch(sql).expect("execute sql");
 }
 
-fn raw_inode_size(path: &std::path::Path, ino: u64) -> i64 {
-    Connection::open(path)
-        .expect("open raw sqlite connection")
-        .query_row(
-            "SELECT size FROM inodes WHERE ino = ?1",
-            params![ino as i64],
-            |row| row.get(0),
-        )
-        .expect("read raw inode size")
+/// Waits until a raw connection sees `ino` with size `want`. The batch commits
+/// within about 5 ms of its first uncommitted operation, so a row can lag the
+/// operation that changed it. Panics after five seconds.
+fn wait_for_raw_inode_size(path: &std::path::Path, ino: u64, want: i64) {
+    let conn = Connection::open(path).expect("open raw sqlite connection");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let size: Option<i64> = conn
+            .query_row(
+                "SELECT size FROM inodes WHERE ino = ?1",
+                params![ino as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("read raw inode size");
+        if size == Some(want) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "inode {ino} has size {size:?} in the database, want {want}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]

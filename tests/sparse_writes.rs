@@ -572,6 +572,8 @@ fn chunks_that_are_holes_store_only_the_blocks_written() {
     // Chunks 0 to 2 are holes. Chunk 3 gets one byte in block 1.
     run.write(0, 3 * CHUNK + 5_000, &[1]);
     run.flush(0);
+    // Flush does not commit the batch. Reopen so the raw check sees the rows.
+    run.reopen();
     // The row is as long as the file allows, and no other chunk has a row.
     let rows = stored_rows(&run.path, run.inos[0]);
     run.expect_eq("stored rows", rows, vec![(3, 5_001)]);

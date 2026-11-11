@@ -1,13 +1,13 @@
 use std::fs::{File, OpenOptions as FileOpenOptions};
 use std::io::ErrorKind;
-use std::ops::{Deref, DerefMut};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
 
+use crate::batch::{CommitTimer, Main};
 use crate::blocks::{self, ALL_BLOCKS, BlockMask, block_range};
 use crate::checkpoint::{self, Checkpoints, JOURNAL_SIZE_LIMIT};
 use crate::stats::{self, SqlGroup};
@@ -73,7 +73,11 @@ pub struct OpenOptions {
     pub wal_cap: u64,
     /// Run the background checkpoint thread, and truncate the WAL when the database
     /// closes. Read-only mounts turn this off, because they must not write the file.
+    /// Turning it off also commits every operation as it returns, with no batch.
     pub background_checkpoints: bool,
+    /// Commit every operation as it returns (`--sync-metadata`). By default
+    /// operations share a batch, which commits at the points listed in `batch`.
+    pub sync_metadata: bool,
 }
 
 impl Default for OpenOptions {
@@ -81,51 +85,37 @@ impl Default for OpenOptions {
         Self {
             wal_cap: checkpoint::DEFAULT_WAL_CAP,
             background_checkpoints: true,
+            sync_metadata: false,
         }
     }
+}
+
+/// Whether operations commit one by one: `--sync-metadata`, and any database
+/// without background checkpoints (read-only mounts).
+fn per_op(options: OpenOptions) -> bool {
+    options.sync_metadata || !options.background_checkpoints
 }
 
 /// SQL storage. Holds no per-process file state: which inodes are open lives
 /// in the FUSE layer's open-inode table, and callers say so where it matters
 /// (`unlink_entry`, `rename_entry`).
+///
+/// Writes are grouped into batches. Every mutating method checks what it can
+/// before its first write, so that a failure never leaves part of an operation in
+/// the batch. See `batch` for the commit points and the fail-stop rules.
 pub struct Db {
-    /// Shared with the checkpoint thread, which takes this lock for the reset handshake.
-    conn: Arc<Mutex<Connection>>,
+    /// The main connection and its open batch. Shared with the checkpoint thread,
+    /// which takes this lock for the reset handshake, and with the commit timer.
+    main: Arc<Mutex<Main>>,
     /// The commit hook, the WAL cap and the checkpoint thread. `None` for in-memory
     /// databases.
-    checkpoints: Option<Checkpoints>,
-    /// Held as long as the `Db` is alive. Declared after `conn`, so the
-    /// connection closes before the lock is released.
+    checkpoints: Option<Arc<Checkpoints>>,
+    /// Commits a batch `COMMIT_DELAY` after it opens. `None` when operations commit
+    /// one by one.
+    timer: Option<CommitTimer>,
+    /// Held as long as the `Db` is alive. Declared after `main`, so the connection
+    /// closes before the lock is released.
     _lock: Option<File>,
-}
-
-/// The main connection, locked for a write. Dropping it runs the WAL check
-/// (`Checkpoints::after_write`), so a write holds one until its commit is done.
-struct WriteConn<'a> {
-    guard: MutexGuard<'a, Connection>,
-    checkpoints: Option<&'a Checkpoints>,
-}
-
-impl Deref for WriteConn<'_> {
-    type Target = Connection;
-
-    fn deref(&self) -> &Connection {
-        &self.guard
-    }
-}
-
-impl DerefMut for WriteConn<'_> {
-    fn deref_mut(&mut self) -> &mut Connection {
-        &mut self.guard
-    }
-}
-
-impl Drop for WriteConn<'_> {
-    fn drop(&mut self) {
-        if let Some(checkpoints) = self.checkpoints {
-            checkpoints.after_write(&self.guard);
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -137,7 +127,7 @@ enum NewNode<'a> {
 
 impl Db {
     /// Opens a database file with the default options: WAL mode, a 1 GiB WAL cap,
-    /// and background checkpoints.
+    /// background checkpoints, and batched commits.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         Self::open_with(path, OpenOptions::default())
     }
@@ -171,87 +161,106 @@ impl Db {
             "
         ))?;
         apply_mmap_size(&conn, DEFAULT_MMAP_SIZE)?;
-        let mut db = Self::initialize(lock, conn)?;
+        let mut db = Self::initialize(lock, conn, per_op(options))?;
         db.attach_checkpoints(path, options)?;
         Ok(db)
     }
 
-    /// Installs the commit hook and starts the checkpoint thread. Done after
-    /// `initialize`, so its writes run without the WAL machinery.
+    /// Installs the commit hook, starts the checkpoint thread, and starts the commit
+    /// timer when operations are batched. Done after `initialize`, so its writes run
+    /// without the WAL machinery.
     fn attach_checkpoints(&mut self, path: &Path, options: OpenOptions) -> Result<(), DbError> {
         let checkpoints = {
-            let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-            Checkpoints::install(&conn, path, options.wal_cap, options.background_checkpoints)?
+            let main = self.lock_main();
+            Arc::new(Checkpoints::install(
+                &main,
+                path,
+                options.wal_cap,
+                options.background_checkpoints,
+            )?)
         };
-        // Stored first: if the thread fails to start, dropping `self` removes the hook.
-        self.checkpoints = Some(checkpoints);
-        if let Some(checkpoints) = &self.checkpoints {
-            checkpoints.start(Arc::clone(&self.conn))?;
+        // Stored first: if a thread fails to start, dropping `self` removes the hook.
+        self.lock_main()
+            .attach_checkpoints(Arc::clone(&checkpoints));
+        self.checkpoints = Some(Arc::clone(&checkpoints));
+        checkpoints.start(Arc::clone(&self.main))?;
+        if !per_op(options) {
+            let timer = CommitTimer::start(Arc::clone(&self.main))?;
+            self.lock_main().attach_timer(timer.deadline());
+            self.timer = Some(timer);
         }
         Ok(())
     }
 
-    /// Stops the checkpoint thread, then truncates the WAL to zero bytes. Runs once;
-    /// later calls do nothing. Called when the filesystem is destroyed, and when the
-    /// `Db` drops.
+    /// Commits the open batch, stops the commit timer and the checkpoint thread, then
+    /// truncates the WAL to zero bytes. Runs once; later calls do nothing. Called when
+    /// the filesystem is destroyed, and when the `Db` drops.
     pub(crate) fn close_checkpoints(&self) {
         let Some(checkpoints) = &self.checkpoints else {
             return;
         };
+        if let Some(timer) = &self.timer {
+            timer.stop();
+        }
         if !checkpoints.stop() {
             return;
         }
-        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        checkpoint::truncate_wal(&conn);
+        let mut main = self.lock_main();
+        // A failed commit is logged when it happens, and unmount has no caller to
+        // report it to.
+        let _ = main.flush_batch();
+        checkpoint::truncate_wal(&main);
     }
 
-    /// Locks the connection for a write. See `WriteConn`.
-    fn write_conn(&self) -> WriteConn<'_> {
-        WriteConn {
-            guard: self.conn.lock().unwrap(),
-            checkpoints: self.checkpoints.as_ref(),
-        }
+    /// Locks the main connection. A poisoned lock is still used: the batch state is
+    /// checked by `Main` itself.
+    fn lock_main(&self) -> MutexGuard<'_, Main> {
+        self.main.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Size of the `-wal` file on disk. 0 for in-memory databases.
     pub(crate) fn wal_file_bytes(&self) -> u64 {
         self.checkpoints
             .as_ref()
-            .map_or(0, Checkpoints::wal_file_bytes)
+            .map_or(0, |checkpoints| checkpoints.wal_file_bytes())
+    }
+
+    /// Whether writes are refused because a batch failed. Reads still work.
+    pub(crate) fn writes_refused(&self) -> bool {
+        self.lock_main().writes_refused()
     }
 
     /// Sets `PRAGMA mmap_size`, the most of the database file that SQLite maps
     /// into memory, and returns the size in force. SQLite caps the request at its
     /// compiled-in maximum, so the result can be smaller. `0` turns the map off.
     pub fn set_mmap_size(&self, bytes: u64) -> Result<u64, DbError> {
-        apply_mmap_size(&self.conn.lock().unwrap(), bytes)
+        apply_mmap_size(&self.lock_main(), bytes)
     }
 
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        Self::initialize(None, conn)
+        // No WAL and no timer in memory, so every operation commits as it returns.
+        Self::initialize(None, conn, true)
     }
 
-    /// Makes committed data durable: `fdatasync` of the WAL, or of the database file
-    /// when there is no WAL. A checkpoint that failed since the last call is reported
-    /// here once, as an error, even when the sync itself succeeds.
+    /// Makes committed data durable: first the open batch commits, then `fdatasync`
+    /// of the WAL, or of the database file when there is no WAL. Fails if writes are
+    /// refused. A checkpoint that failed since the last call is reported here once, as
+    /// an error, even when the sync itself succeeds.
     pub(crate) fn sync_durable(&self) -> Result<(), DbError> {
         let _sql = stats::sql(SqlGroup::Sync);
+        let path = {
+            let mut main = self.lock_main();
+            main.flush_batch()?;
+            main.file_path().map(Path::to_path_buf)
+        };
         let failure = self
             .checkpoints
             .as_ref()
-            .and_then(Checkpoints::take_failure);
-        let path = {
-            let conn = self.conn.lock().unwrap();
-            match conn.path() {
-                Some(path) if !path.is_empty() && path != ":memory:" => Some(path.to_owned()),
-                _ => None,
-            }
-        };
+            .and_then(|checkpoints| checkpoints.take_failure());
         if let Some(path) = path {
-            sync_database_file(Path::new(&path))
-                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            sync_database_file(&path).map_err(|error| DbError::Sqlite(error.to_string()))?;
         }
         match failure {
             Some(message) => Err(DbError::Sqlite(format!("WAL checkpoint failed: {message}"))),
@@ -261,16 +270,19 @@ impl Db {
 
     pub fn pragma_i64(&self, name: &str) -> Result<i64, DbError> {
         let sql = pragma_query(name)?;
-        self.conn
-            .lock()
-            .unwrap()
+        self.lock_main()
             .query_row(&sql, [], |row| row.get(0))
             .map_err(Into::into)
     }
 
+    /// Page and file counts for statfs. Commits the open batch first, so the page
+    /// counts include the batch. A failed commit is not reported here: it is kept for
+    /// the next fsync, so statfs keeps answering.
     pub(crate) fn volume_usage(&self) -> Result<VolumeUsage, DbError> {
         let _sql = stats::sql(SqlGroup::Metadata);
-        let conn = self.conn.lock().unwrap();
+        let mut main = self.lock_main();
+        let _ = main.flush_batch();
+        let conn: &Connection = &main;
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
         let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
         let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
@@ -285,9 +297,7 @@ impl Db {
 
     pub fn pragma_string(&self, name: &str) -> Result<String, DbError> {
         let sql = pragma_query(name)?;
-        self.conn
-            .lock()
-            .unwrap()
+        self.lock_main()
             .query_row(&sql, [], |row| row.get(0))
             .map_err(Into::into)
     }
@@ -297,14 +307,27 @@ impl Db {
     /// pragma is per connection, so `Dbfs::set_max_page_count` is the public hook.
     pub(crate) fn set_max_page_count(&self, pages: u64) -> Result<(), DbError> {
         let pages = i64::try_from(pages).map_err(|_| DbError::InvalidInput)?;
-        self.conn
-            .lock()
-            .unwrap()
+        self.lock_main()
             .pragma_update(None, "max_page_count", pages)?;
         Ok(())
     }
 
-    fn initialize(lock: Option<File>, conn: Connection) -> Result<Self, DbError> {
+    /// Sets the free space below which every operation commits by itself. A test
+    /// hook: the real floor is 256 MiB.
+    #[doc(hidden)]
+    pub fn set_min_free_space_for_tests(&self, bytes: u64) {
+        self.lock_main().set_free_space_floor(bytes);
+    }
+
+    /// Sets how long a batch may stay open before the timer commits it. A test
+    /// hook: the real delay is 5 ms. A long delay keeps a batch open for the
+    /// whole test, so its operations are not committed by the timer.
+    #[doc(hidden)]
+    pub fn set_commit_delay_for_tests(&self, delay: Duration) {
+        self.lock_main().set_commit_delay(delay);
+    }
+
+    fn initialize(lock: Option<File>, conn: Connection, per_op: bool) -> Result<Self, DbError> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS inodes (
@@ -377,60 +400,34 @@ impl Db {
         }
 
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            main: Arc::new(Mutex::new(Main::new(conn, per_op))),
             checkpoints: None,
+            timer: None,
             _lock: lock,
         })
     }
 
     pub fn get_inode(&self, ino: u64) -> Result<Inode, DbError> {
         let _sql = stats::sql(SqlGroup::Metadata);
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT ino, kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink
-             FROM inodes
-             WHERE ino = ?1",
-        )?;
-        stmt.query_row(params![ino as i64], inode_from_row)
-            .map_err(Into::into)
+        get_inode_in(&self.lock_main(), ino)
     }
 
     /// Kind and size of `ino`: the two columns the data paths need, without
     /// decoding the rest of the row.
     pub fn inode_head(&self, ino: u64) -> Result<(FileKind, u64), DbError> {
         let _sql = stats::sql(SqlGroup::Metadata);
-        let conn = self.conn.lock().unwrap();
-        let (kind, size) = conn
-            .prepare_cached("SELECT kind, size FROM inodes WHERE ino = ?1")?
-            .query_row(params![ino as i64], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })?;
-        Ok((FileKind::from_i64(kind)?, size as u64))
+        inode_head_in(&self.lock_main(), ino)
     }
 
     /// Kind of `ino` only, for "is this a directory?" checks.
     pub fn inode_kind_of(&self, ino: u64) -> Result<FileKind, DbError> {
         let _sql = stats::sql(SqlGroup::Metadata);
-        let conn = self.conn.lock().unwrap();
-        let kind = conn
-            .prepare_cached("SELECT kind FROM inodes WHERE ino = ?1")?
-            .query_row(params![ino as i64], |row| row.get::<_, i64>(0))?;
-        FileKind::from_i64(kind)
+        inode_kind_of_in(&self.lock_main(), ino)
     }
 
     pub fn lookup(&self, parent_ino: u64, name: &[u8]) -> Result<Inode, DbError> {
         let _sql = stats::sql(SqlGroup::Metadata);
-        check_name(name)?;
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size,
-                    i.atime_ns, i.mtime_ns, i.ctime_ns, i.nlink
-             FROM dirents d
-             JOIN inodes i ON i.ino = d.child_ino
-             WHERE d.parent_ino = ?1 AND d.name = ?2",
-        )?;
-        stmt.query_row(params![parent_ino as i64, name], inode_from_row)
-            .map_err(Into::into)
+        lookup_in(&self.lock_main(), parent_ino, name)
     }
 
     pub fn list_dir(&self, ino: u64) -> Result<Vec<DirEntry>, DbError> {
@@ -439,7 +436,7 @@ impl Db {
             return Err(DbError::NotDirectory);
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_main();
         let mut stmt = conn.prepare_cached(
             "SELECT d.name, i.ino, i.kind
              FROM dirents d
@@ -487,7 +484,7 @@ impl Db {
             return Err(DbError::NotDirectory);
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_main();
         let mut stmt = conn.prepare_cached(
             "SELECT d.id, d.name, d.child_ino, i.kind
              FROM dirents d
@@ -514,7 +511,7 @@ impl Db {
         if ino == 1 {
             return Ok(1);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_main();
         conn.prepare_cached("SELECT parent_ino FROM dirents WHERE child_ino = ?1 LIMIT 1")?
             .query_row(params![ino as i64], |row| row.get::<_, i64>(0))
             .map(|parent| parent as u64)
@@ -560,7 +557,7 @@ impl Db {
             return Err(DbError::InvalidInput);
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_main();
         conn.prepare_cached("SELECT target FROM symlink_targets WHERE ino = ?1")?
             .query_row(params![ino as i64], |row| row.get(0))
             .map_err(Into::into)
@@ -571,46 +568,46 @@ impl Db {
     /// inode unlinked while open is released.
     pub(crate) fn delete_inode(&self, ino: u64) -> Result<(), DbError> {
         let _sql = stats::sql(SqlGroup::Write);
-        let mut conn = self.write_conn();
-        let tx = conn.transaction()?;
-        delete_inode_rows(&tx, ino)?;
-        tx.commit()?;
-        Ok(())
+        self.lock_main()
+            .run_op(0, |conn| delete_inode_rows(conn, ino))
     }
 
     pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &[u8]) -> Result<Inode, DbError> {
         let _sql = stats::sql(SqlGroup::Metadata);
         check_name(new_name)?;
-        let inode = self.get_inode(ino)?;
-        if inode.kind == FileKind::Directory {
-            return Err(DbError::IsDirectory);
-        }
-        if self.inode_kind_of(new_parent_ino)? != FileKind::Directory {
-            return Err(DbError::NotDirectory);
-        }
-        // Unlinked but still open: the inode has no names and is kept only for its
-        // handles. Linux never gives such an inode a new name (linkat: ENOENT).
-        if inode.nlink == 0 {
-            return Err(DbError::NotFound);
-        }
+        self.lock_main().run_op(0, |conn| {
+            let inode = get_inode_in(conn, ino)?;
+            if inode.kind == FileKind::Directory {
+                return Err(DbError::IsDirectory);
+            }
+            if inode_kind_of_in(conn, new_parent_ino)? != FileKind::Directory {
+                return Err(DbError::NotDirectory);
+            }
+            // Unlinked but still open: the inode has no names and is kept only for its
+            // handles. Linux never gives such an inode a new name (linkat: ENOENT).
+            if inode.nlink == 0 {
+                return Err(DbError::NotFound);
+            }
+            if entry_exists_in(conn, new_parent_ino, new_name)? {
+                return Err(DbError::AlreadyExists);
+            }
 
-        let now = now_ts();
-        let mut conn = self.write_conn();
-        let tx = conn.transaction()?;
-
-        tx.prepare_cached("INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)")?
+            let now = now_ts();
+            conn.prepare_cached(
+                "INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)",
+            )?
             .execute(params![new_parent_ino as i64, new_name, ino as i64])?;
 
-        let new_nlink = inode.nlink + 1;
-        tx.prepare_cached("UPDATE inodes SET nlink = ?1, ctime_ns = ?2 WHERE ino = ?3")?
-            .execute(params![new_nlink as i64, now.to_ns(), ino as i64])?;
-        touch_dir(&tx, new_parent_ino, now)?;
-        tx.commit()?;
+            let new_nlink = inode.nlink + 1;
+            conn.prepare_cached("UPDATE inodes SET nlink = ?1, ctime_ns = ?2 WHERE ino = ?3")?
+                .execute(params![new_nlink as i64, now.to_ns(), ino as i64])?;
+            touch_dir(conn, new_parent_ino, now)?;
 
-        Ok(Inode {
-            nlink: new_nlink,
-            ctime: now,
-            ..inode
+            Ok(Inode {
+                nlink: new_nlink,
+                ctime: now,
+                ..inode
+            })
         })
     }
 
@@ -645,7 +642,7 @@ impl Db {
         if span.first >= MAX_CHUNKS {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_main();
         if span.first == span.last && !span.piece(span.first).is_full_chunk() {
             return read_chunk_part(&conn, ino, span, out);
         }
@@ -677,73 +674,73 @@ impl Db {
         modified: Timestamp,
     ) -> Result<u32, DbError> {
         let _sql = stats::sql(SqlGroup::Write);
-        let (kind, mut new_size) = self.inode_head(ino)?;
-        if let Some(error) = kind.regular_file_error() {
-            return Err(error);
-        }
-        if writes.iter().all(|(_, data)| data.is_empty()) {
-            return Ok(0);
-        }
-        if writes
-            .iter()
-            .any(|&(offset, data)| offset.saturating_add(data.len() as u64) > MAX_FILE_SIZE)
-        {
-            return Err(DbError::FileTooLarge);
-        }
-
-        let mut written = 0usize;
-        // One scratch buffer per call, reused for every partial chunk.
-        let mut scratch = Vec::with_capacity(CHUNK_SIZE);
-
-        let mut conn = self.write_conn();
-        let tx = conn.transaction()?;
-
-        {
-            let mut read_stmt = tx.prepare_cached("SELECT data FROM file_chunks WHERE id = ?1")?;
-            let mut write_stmt = tx.prepare_cached(UPSERT_CHUNK)?;
-
-            for &(offset, data) in writes {
-                let Some(span) = ChunkSpan::new(offset, data.len()) else {
-                    continue;
-                };
-
-                for chunk_index in span.first..=span.last {
-                    let piece = span.piece(chunk_index);
-                    let input = &data[piece.buf.clone()];
-
-                    let key = chunk_key(ino, chunk_index);
-                    if piece.is_full_chunk() {
-                        write_stmt.execute(params![key, input])?;
-                        continue;
-                    }
-
-                    scratch.clear();
-                    let mut rows = read_stmt.query(params![key])?;
-                    if let Some(row) = rows.next()? {
-                        scratch
-                            .extend_from_slice(row.get_ref(0)?.as_blob().map_err(SqlError::from)?);
-                    }
-                    drop(rows);
-                    let required_len = piece.chunk.end;
-                    if scratch.len() < required_len {
-                        scratch.resize(required_len, 0);
-                    }
-                    scratch[piece.chunk.clone()].copy_from_slice(input);
-                    write_stmt.execute(params![key, &scratch[..]])?;
-                }
-
-                new_size = new_size.max(offset + data.len() as u64);
-                written += data.len();
+        let bytes: u64 = writes.iter().map(|(_, data)| data.len() as u64).sum();
+        self.lock_main().run_op(bytes, |conn| {
+            let (kind, mut new_size) = inode_head_in(conn, ino)?;
+            if let Some(error) = kind.regular_file_error() {
+                return Err(error);
             }
-        }
+            if writes.iter().all(|(_, data)| data.is_empty()) {
+                return Ok(0);
+            }
+            if writes
+                .iter()
+                .any(|&(offset, data)| offset.saturating_add(data.len() as u64) > MAX_FILE_SIZE)
+            {
+                return Err(DbError::FileTooLarge);
+            }
 
-        set_size(&tx, ino, new_size, modified)?;
-        tx.commit()?;
+            let mut written = 0usize;
+            // One scratch buffer per call, reused for every partial chunk.
+            let mut scratch = Vec::with_capacity(CHUNK_SIZE);
 
-        Ok(written as u32)
+            {
+                let mut read_stmt =
+                    conn.prepare_cached("SELECT data FROM file_chunks WHERE id = ?1")?;
+                let mut write_stmt = conn.prepare_cached(UPSERT_CHUNK)?;
+
+                for &(offset, data) in writes {
+                    let Some(span) = ChunkSpan::new(offset, data.len()) else {
+                        continue;
+                    };
+
+                    for chunk_index in span.first..=span.last {
+                        let piece = span.piece(chunk_index);
+                        let input = &data[piece.buf.clone()];
+
+                        let key = chunk_key(ino, chunk_index);
+                        if piece.is_full_chunk() {
+                            write_stmt.execute(params![key, input])?;
+                            continue;
+                        }
+
+                        scratch.clear();
+                        let mut rows = read_stmt.query(params![key])?;
+                        if let Some(row) = rows.next()? {
+                            scratch.extend_from_slice(
+                                row.get_ref(0)?.as_blob().map_err(SqlError::from)?,
+                            );
+                        }
+                        drop(rows);
+                        let required_len = piece.chunk.end;
+                        if scratch.len() < required_len {
+                            scratch.resize(required_len, 0);
+                        }
+                        scratch[piece.chunk.clone()].copy_from_slice(input);
+                        write_stmt.execute(params![key, &scratch[..]])?;
+                    }
+
+                    new_size = new_size.max(offset + data.len() as u64);
+                    written += data.len();
+                }
+            }
+
+            set_size(conn, ino, new_size, modified)?;
+            Ok(written as u32)
+        })
     }
 
-    /// Stores `chunks` and sets size and mtime, in one transaction. A chunk whose
+    /// Stores `chunks` and sets size and mtime, in one batch operation. A chunk whose
     /// blocks are all dirty is stored whole. Any other chunk is patched: its stored
     /// bytes are read, the dirty blocks are copied over them and the result is
     /// stored. Only the blocks that were dirty change, and the row keeps its length
@@ -757,37 +754,38 @@ impl Db {
     ) -> Result<(), DbError> {
         let _sql = stats::sql(SqlGroup::Write);
         let _flush = stats::flush_transaction();
-        let mut conn = self.write_conn();
-        let tx = conn.transaction()?;
-
-        {
-            let mut read_stmt = tx.prepare_cached("SELECT data FROM file_chunks WHERE id = ?1")?;
-            let mut write_stmt = tx.prepare_cached(UPSERT_CHUNK)?;
-            let mut merged = Vec::new();
-            for update in chunks {
-                let key = chunk_key(ino, update.chunk_index);
-                let limit = chunk_limit(size, update.chunk_index);
-                debug_assert!(limit > 0, "a dirty chunk lies inside its file");
-                if update.dirty == ALL_BLOCKS {
-                    stats::chunk_flushed(limit);
-                    write_stmt.execute(params![key, &update.buffer[..limit]])?;
-                    continue;
+        let chunks: Vec<ChunkUpdate<'a>> = chunks.into_iter().collect();
+        let bytes = chunks.len() as u64 * CHUNK_SIZE as u64;
+        self.lock_main().run_op(bytes, |conn| {
+            {
+                let mut read_stmt =
+                    conn.prepare_cached("SELECT data FROM file_chunks WHERE id = ?1")?;
+                let mut write_stmt = conn.prepare_cached(UPSERT_CHUNK)?;
+                let mut merged = Vec::new();
+                for update in chunks {
+                    let key = chunk_key(ino, update.chunk_index);
+                    let limit = chunk_limit(size, update.chunk_index);
+                    debug_assert!(limit > 0, "a dirty chunk lies inside its file");
+                    if update.dirty == ALL_BLOCKS {
+                        stats::chunk_flushed(limit);
+                        write_stmt.execute(params![key, &update.buffer[..limit]])?;
+                        continue;
+                    }
+                    {
+                        let mut rows = read_stmt.query(params![key])?;
+                        let stored: &[u8] = match rows.next()? {
+                            Some(row) => row.get_ref(0)?.as_blob().map_err(SqlError::from)?,
+                            None => &[],
+                        };
+                        blocks::merge(stored, update.dirty, update.buffer, limit, &mut merged);
+                    }
+                    stats::chunk_flushed(merged.len());
+                    write_stmt.execute(params![key, &merged[..]])?;
                 }
-                {
-                    let mut rows = read_stmt.query(params![key])?;
-                    let stored: &[u8] = match rows.next()? {
-                        Some(row) => row.get_ref(0)?.as_blob().map_err(SqlError::from)?,
-                        None => &[],
-                    };
-                    blocks::merge(stored, update.dirty, update.buffer, limit, &mut merged);
-                }
-                stats::chunk_flushed(merged.len());
-                write_stmt.execute(params![key, &merged[..]])?;
             }
-        }
 
-        set_size(&tx, ino, size, now)?;
-        tx.commit()?;
+            set_size(conn, ino, size, now)
+        })?;
         stats::sample_wal();
 
         Ok(())
@@ -795,41 +793,38 @@ impl Db {
 
     pub fn truncate_file(&self, ino: u64, size: u64) -> Result<(), DbError> {
         let _sql = stats::sql(SqlGroup::Write);
-        if let Some(error) = self.inode_kind_of(ino)?.regular_file_error() {
-            return Err(error);
-        }
-        if size > MAX_FILE_SIZE {
-            return Err(DbError::FileTooLarge);
-        }
+        self.lock_main().run_op(0, |conn| {
+            if let Some(error) = inode_kind_of_in(conn, ino)?.regular_file_error() {
+                return Err(error);
+            }
+            if size > MAX_FILE_SIZE {
+                return Err(DbError::FileTooLarge);
+            }
 
-        let now = now_ts();
-        let mut conn = self.write_conn();
-        let tx = conn.transaction()?;
-        let (first_key, last_key) = chunk_keys(ino);
+            let now = now_ts();
+            let (first_key, last_key) = chunk_keys(ino);
 
-        if size == 0 {
-            tx.prepare_cached("DELETE FROM file_chunks WHERE id BETWEEN ?1 AND ?2")?
-                .execute(params![first_key, last_key])?;
-        } else {
-            let final_chunk_index = (size - 1) / CHUNK_SIZE as u64;
-            let final_chunk_len = ((size - 1) as usize % CHUNK_SIZE) + 1;
-            let final_key = chunk_key(ino, final_chunk_index);
+            if size == 0 {
+                conn.prepare_cached("DELETE FROM file_chunks WHERE id BETWEEN ?1 AND ?2")?
+                    .execute(params![first_key, last_key])?;
+            } else {
+                let final_chunk_index = (size - 1) / CHUNK_SIZE as u64;
+                let final_chunk_len = ((size - 1) as usize % CHUNK_SIZE) + 1;
+                let final_key = chunk_key(ino, final_chunk_index);
 
-            tx.prepare_cached("DELETE FROM file_chunks WHERE id > ?1 AND id <= ?2")?
-                .execute(params![final_key, last_key])?;
+                conn.prepare_cached("DELETE FROM file_chunks WHERE id > ?1 AND id <= ?2")?
+                    .execute(params![final_key, last_key])?;
 
-            // Cut the final chunk in SQL; the blob never leaves SQLite.
-            tx.prepare_cached(
-                "UPDATE file_chunks SET data = substr(data, 1, ?1)
-                 WHERE id = ?2 AND length(data) > ?1",
-            )?
-            .execute(params![final_chunk_len as i64, final_key])?;
-        }
+                // Cut the final chunk in SQL; the blob never leaves SQLite.
+                conn.prepare_cached(
+                    "UPDATE file_chunks SET data = substr(data, 1, ?1)
+                     WHERE id = ?2 AND length(data) > ?1",
+                )?
+                .execute(params![final_chunk_len as i64, final_key])?;
+            }
 
-        set_size(&tx, ino, size, now)?;
-        tx.commit()?;
-
-        Ok(())
+            set_size(conn, ino, size, now)
+        })
     }
 
     pub fn unlink_file(&self, parent_ino: u64, name: &[u8]) -> Result<(), DbError> {
@@ -853,45 +848,39 @@ impl Db {
             return Err(DbError::IsDirectory);
         }
 
-        let now = now_ts();
-        let mut conn = self.write_conn();
-        let tx = conn.transaction()?;
+        self.lock_main().run_op(0, |conn| {
+            let now = now_ts();
+            let removed = conn
+                .prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
+                .execute(params![parent_ino as i64, name])?;
+            // Nothing was removed, so nothing has changed yet: the entry is not there.
+            if removed == 0 {
+                return Err(DbError::NotFound);
+            }
 
-        tx.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
-            .execute(params![parent_ino as i64, name])?;
-
-        drop_unlinked_inode(&tx, target, now, is_open)?;
-        touch_dir(&tx, parent_ino, now)?;
-        tx.commit()?;
-
-        Ok(())
+            drop_unlinked_inode(conn, target, now, is_open)?;
+            touch_dir(conn, parent_ino, now)
+        })
     }
 
     pub fn remove_dir(&self, parent_ino: u64, name: &[u8]) -> Result<(), DbError> {
         let _sql = stats::sql(SqlGroup::Metadata);
-        let target = self.lookup(parent_ino, name)?;
-        if target.kind != FileKind::Directory {
-            return Err(DbError::NotDirectory);
-        }
+        self.lock_main().run_op(0, |conn| {
+            let target = lookup_in(conn, parent_ino, name)?;
+            if target.kind != FileKind::Directory {
+                return Err(DbError::NotDirectory);
+            }
+            if directory_has_entries_in(conn, target.ino)? {
+                return Err(DbError::DirectoryNotEmpty);
+            }
 
-        let now = now_ts();
-        let mut conn = self.write_conn();
-        let tx = conn.transaction()?;
-        let child_count: i64 = tx
-            .prepare_cached("SELECT COUNT(*) FROM dirents WHERE parent_ino = ?1")?
-            .query_row(params![target.ino as i64], |row| row.get(0))?;
-        if child_count != 0 {
-            return Err(DbError::DirectoryNotEmpty);
-        }
-
-        tx.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
-            .execute(params![parent_ino as i64, name])?;
-        delete_inode_rows(&tx, target.ino)?;
-        touch_dir(&tx, parent_ino, now)?;
-        add_directory_nlink(&tx, parent_ino, -1)?;
-        tx.commit()?;
-
-        Ok(())
+            let now = now_ts();
+            conn.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
+                .execute(params![parent_ino as i64, name])?;
+            delete_inode_rows(conn, target.ino)?;
+            touch_dir(conn, parent_ino, now)?;
+            add_directory_nlink(conn, parent_ino, -1)
+        })
     }
 
     pub fn rename(
@@ -918,121 +907,124 @@ impl Db {
         is_open: impl Fn(u64) -> bool,
     ) -> Result<Option<Inode>, DbError> {
         let _sql = stats::sql(SqlGroup::Metadata);
-        check_name(new_name)?;
-        let source = self.lookup(parent_ino, name)?;
-        if self.inode_kind_of(new_parent_ino)? != FileKind::Directory {
-            return Err(DbError::NotDirectory);
-        }
-        if source.kind == FileKind::Directory && self.is_descendant(new_parent_ino, source.ino)? {
-            return Err(DbError::InvalidInput);
-        }
-
-        if parent_ino == new_parent_ino && name == new_name {
-            return Ok(None);
-        }
-
-        let existing_target = match self.lookup(new_parent_ino, new_name) {
-            Ok(target) => Some(target),
-            Err(DbError::NotFound) => None,
-            Err(error) => return Err(error),
-        };
-
-        if noreplace && existing_target.is_some() {
-            return Err(DbError::AlreadyExists);
-        }
-
-        // The target is another name for the source inode. POSIX makes this a
-        // no-op: both names stay, and nothing is removed.
-        if existing_target
-            .as_ref()
-            .is_some_and(|target| target.ino == source.ino)
-        {
-            return Ok(None);
-        }
-
-        if let Some(target) = &existing_target {
-            match (source.kind, target.kind) {
-                (FileKind::RegularFile, FileKind::Directory)
-                | (FileKind::Symlink, FileKind::Directory) => return Err(DbError::IsDirectory),
-                (FileKind::Directory, FileKind::RegularFile)
-                | (FileKind::Directory, FileKind::Symlink) => return Err(DbError::NotDirectory),
-                (FileKind::Directory, FileKind::Directory)
-                    if self.directory_has_entries(target.ino)? =>
-                {
-                    return Err(DbError::DirectoryNotEmpty);
-                }
-                _ => {}
+        self.lock_main().run_op(0, |conn| {
+            check_name(new_name)?;
+            let source = lookup_in(conn, parent_ino, name)?;
+            if inode_kind_of_in(conn, new_parent_ino)? != FileKind::Directory {
+                return Err(DbError::NotDirectory);
             }
-        }
+            if source.kind == FileKind::Directory
+                && is_descendant_in(conn, new_parent_ino, source.ino)?
+            {
+                return Err(DbError::InvalidInput);
+            }
 
-        let source_is_dir = source.kind == FileKind::Directory;
-        let target_is_dir = existing_target
-            .as_ref()
-            .is_some_and(|target| target.kind == FileKind::Directory);
+            if parent_ino == new_parent_ino && name == new_name {
+                return Ok(None);
+            }
 
-        let now = now_ts();
-        let mut conn = self.write_conn();
-        let tx = conn.transaction()?;
+            let existing_target = match lookup_in(conn, new_parent_ino, new_name) {
+                Ok(target) => Some(target),
+                Err(DbError::NotFound) => None,
+                Err(error) => return Err(error),
+            };
 
-        if let Some(target) = &existing_target {
-            tx.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
-                .execute(params![new_parent_ino as i64, new_name])?;
-            drop_unlinked_inode(&tx, target, now, is_open(target.ino))?;
-        }
+            if noreplace && existing_target.is_some() {
+                return Err(DbError::AlreadyExists);
+            }
 
-        tx.prepare_cached(
-            "UPDATE dirents SET parent_ino = ?1, name = ?2 WHERE parent_ino = ?3 AND name = ?4",
-        )?
-        .execute(params![
-            new_parent_ino as i64,
-            new_name,
-            parent_ino as i64,
-            name
-        ])?;
-        touch_dir(&tx, parent_ino, now)?;
-        if new_parent_ino != parent_ino {
-            touch_dir(&tx, new_parent_ino, now)?;
-        }
-        if source_is_dir && parent_ino != new_parent_ino {
-            add_directory_nlink(&tx, parent_ino, -1)?;
-            add_directory_nlink(&tx, new_parent_ino, 1)?;
-        }
-        if target_is_dir {
-            add_directory_nlink(&tx, new_parent_ino, -1)?;
-        }
-        tx.commit()?;
+            // The target is another name for the source inode. POSIX makes this a
+            // no-op: both names stay, and nothing is removed.
+            if existing_target
+                .as_ref()
+                .is_some_and(|target| target.ino == source.ino)
+            {
+                return Ok(None);
+            }
 
-        Ok(existing_target)
+            if let Some(target) = &existing_target {
+                match (source.kind, target.kind) {
+                    (FileKind::RegularFile, FileKind::Directory)
+                    | (FileKind::Symlink, FileKind::Directory) => {
+                        return Err(DbError::IsDirectory);
+                    }
+                    (FileKind::Directory, FileKind::RegularFile)
+                    | (FileKind::Directory, FileKind::Symlink) => {
+                        return Err(DbError::NotDirectory);
+                    }
+                    (FileKind::Directory, FileKind::Directory)
+                        if directory_has_entries_in(conn, target.ino)? =>
+                    {
+                        return Err(DbError::DirectoryNotEmpty);
+                    }
+                    _ => {}
+                }
+            }
+
+            let source_is_dir = source.kind == FileKind::Directory;
+            let target_is_dir = existing_target
+                .as_ref()
+                .is_some_and(|target| target.kind == FileKind::Directory);
+
+            let now = now_ts();
+            if let Some(target) = &existing_target {
+                conn.prepare_cached("DELETE FROM dirents WHERE parent_ino = ?1 AND name = ?2")?
+                    .execute(params![new_parent_ino as i64, new_name])?;
+                drop_unlinked_inode(conn, target, now, is_open(target.ino))?;
+            }
+
+            conn.prepare_cached(
+                "UPDATE dirents SET parent_ino = ?1, name = ?2 WHERE parent_ino = ?3 AND name = ?4",
+            )?
+            .execute(params![
+                new_parent_ino as i64,
+                new_name,
+                parent_ino as i64,
+                name
+            ])?;
+            touch_dir(conn, parent_ino, now)?;
+            if new_parent_ino != parent_ino {
+                touch_dir(conn, new_parent_ino, now)?;
+            }
+            if source_is_dir && parent_ino != new_parent_ino {
+                add_directory_nlink(conn, parent_ino, -1)?;
+                add_directory_nlink(conn, new_parent_ino, 1)?;
+            }
+            if target_is_dir {
+                add_directory_nlink(conn, new_parent_ino, -1)?;
+            }
+
+            Ok(existing_target)
+        })
     }
 
     pub fn update_metadata(&self, ino: u64, update: MetadataUpdate) -> Result<Inode, DbError> {
         let _sql = stats::sql(SqlGroup::Metadata);
-        let inode = self.get_inode(ino)?;
-        let now = now_ts();
-        let mode = update.mode.unwrap_or(inode.mode);
-        let uid = update.uid.unwrap_or(inode.uid);
-        let gid = update.gid.unwrap_or(inode.gid);
-        let atime = update.atime.unwrap_or(inode.atime);
-        let mtime = update.mtime.unwrap_or(inode.mtime);
+        self.lock_main().run_op(0, |conn| {
+            let inode = get_inode_in(conn, ino)?;
+            let now = now_ts();
+            let mode = update.mode.unwrap_or(inode.mode);
+            let uid = update.uid.unwrap_or(inode.uid);
+            let gid = update.gid.unwrap_or(inode.gid);
+            let atime = update.atime.unwrap_or(inode.atime);
+            let mtime = update.mtime.unwrap_or(inode.mtime);
 
-        let conn = self.write_conn();
-        conn.prepare_cached(
-            "UPDATE inodes
-             SET mode = ?1, uid = ?2, gid = ?3, atime_ns = ?4, mtime_ns = ?5, ctime_ns = ?6
-             WHERE ino = ?7",
-        )?
-        .execute(params![
-            mode as i64,
-            uid as i64,
-            gid as i64,
-            atime.to_ns(),
-            mtime.to_ns(),
-            now.to_ns(),
-            ino as i64
-        ])?;
-        drop(conn);
-
-        self.get_inode(ino)
+            conn.prepare_cached(
+                "UPDATE inodes
+                 SET mode = ?1, uid = ?2, gid = ?3, atime_ns = ?4, mtime_ns = ?5, ctime_ns = ?6
+                 WHERE ino = ?7",
+            )?
+            .execute(params![
+                mode as i64,
+                uid as i64,
+                gid as i64,
+                atime.to_ns(),
+                mtime.to_ns(),
+                now.to_ns(),
+                ino as i64
+            ])?;
+            get_inode_in(conn, ino)
+        })
     }
 
     fn create_node(
@@ -1045,11 +1037,7 @@ impl Db {
     ) -> Result<Inode, DbError> {
         let _sql = stats::sql(SqlGroup::Metadata);
         check_name(name)?;
-        if self.inode_kind_of(parent_ino)? != FileKind::Directory {
-            return Err(DbError::NotDirectory);
-        }
 
-        let now = now_ts();
         let (kind, mode, size) = match node {
             NewNode::Directory { mode } => (FileKind::Directory, mode, 0),
             NewNode::File { mode } => (FileKind::RegularFile, mode, 0),
@@ -1057,96 +1045,167 @@ impl Db {
         };
         let nlink: i64 = if kind == FileKind::Directory { 2 } else { 1 };
         let parent_delta: i64 = if kind == FileKind::Directory { 1 } else { 0 };
-        let mut conn = self.write_conn();
-        let tx = conn.transaction()?;
 
-        tx.prepare_cached(
-            "INSERT INTO inodes (kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, ?7)",
-        )?
-        .execute(params![
-            kind.as_i64(),
-            mode as i64,
-            uid as i64,
-            gid as i64,
-            size as i64,
-            now.to_ns(),
-            nlink
-        ])?;
-        let ino = tx.last_insert_rowid() as u64;
-        if ino > MAX_INO {
-            // Chunk keys need the inode number to fit in 39 bits.
-            return Err(DbError::NoSpace);
-        }
+        self.lock_main().run_op(0, |conn| {
+            if inode_kind_of_in(conn, parent_ino)? != FileKind::Directory {
+                return Err(DbError::NotDirectory);
+            }
+            if entry_exists_in(conn, parent_ino, name)? {
+                return Err(DbError::AlreadyExists);
+            }
+            // Chunk keys need the inode number to fit in 39 bits. Checked before the
+            // insert, so a full volume is refused without a write.
+            if next_inode_number(conn)? > MAX_INO {
+                return Err(DbError::NoSpace);
+            }
 
-        if let Err(error) = tx
-            .prepare_cached("INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)")
-            .and_then(|mut s| s.execute(params![parent_ino as i64, name, ino as i64]))
-        {
-            return Err(error.into());
-        }
+            let now = now_ts();
+            conn.prepare_cached(
+                "INSERT INTO inodes (kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, ?7)",
+            )?
+            .execute(params![
+                kind.as_i64(),
+                mode as i64,
+                uid as i64,
+                gid as i64,
+                size as i64,
+                now.to_ns(),
+                nlink
+            ])?;
+            let ino = conn.last_insert_rowid() as u64;
+            if ino > MAX_INO {
+                // The check above predicts the number, so this is a backstop.
+                return Err(DbError::NoSpace);
+            }
 
-        if let NewNode::Symlink { target } = node {
-            tx.prepare_cached("INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)")?
-                .execute(params![ino as i64, target])?;
-        }
+            conn.prepare_cached(
+                "INSERT INTO dirents (parent_ino, name, child_ino) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![parent_ino as i64, name, ino as i64])?;
 
-        touch_dir(&tx, parent_ino, now)?;
-        if parent_delta != 0 {
-            add_directory_nlink(&tx, parent_ino, parent_delta)?;
-        }
-        tx.commit()?;
+            if let NewNode::Symlink { target } = node {
+                conn.prepare_cached("INSERT INTO symlink_targets (ino, target) VALUES (?1, ?2)")?
+                    .execute(params![ino as i64, target])?;
+            }
 
-        Ok(Inode {
-            ino,
-            kind,
-            mode,
-            uid,
-            gid,
-            size,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            nlink: nlink as u32,
+            touch_dir(conn, parent_ino, now)?;
+            if parent_delta != 0 {
+                add_directory_nlink(conn, parent_ino, parent_delta)?;
+            }
+
+            Ok(Inode {
+                ino,
+                kind,
+                mode,
+                uid,
+                gid,
+                size,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                nlink: nlink as u32,
+            })
         })
     }
+}
 
-    /// Whether directory `ino` has any entry. Stops at the first row, so a large
-    /// directory is not listed just to learn that it is not empty.
-    fn directory_has_entries(&self, ino: u64) -> Result<bool, DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM dirents WHERE parent_ino = ?1)")?
-            .query_row(params![ino as i64], |row| row.get::<_, bool>(0))
-            .map_err(Into::into)
+fn get_inode_in(conn: &Connection, ino: u64) -> Result<Inode, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT ino, kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink
+         FROM inodes
+         WHERE ino = ?1",
+    )?;
+    stmt.query_row(params![ino as i64], inode_from_row)
+        .map_err(Into::into)
+}
+
+fn inode_head_in(conn: &Connection, ino: u64) -> Result<(FileKind, u64), DbError> {
+    let (kind, size) = conn
+        .prepare_cached("SELECT kind, size FROM inodes WHERE ino = ?1")?
+        .query_row(params![ino as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+    Ok((FileKind::from_i64(kind)?, size as u64))
+}
+
+fn inode_kind_of_in(conn: &Connection, ino: u64) -> Result<FileKind, DbError> {
+    let kind = conn
+        .prepare_cached("SELECT kind FROM inodes WHERE ino = ?1")?
+        .query_row(params![ino as i64], |row| row.get::<_, i64>(0))?;
+    FileKind::from_i64(kind)
+}
+
+/// The entry `name` of directory `parent_ino`, with the inode it names.
+fn lookup_in(conn: &Connection, parent_ino: u64, name: &[u8]) -> Result<Inode, DbError> {
+    check_name(name)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.ino, i.kind, i.mode, i.uid, i.gid, i.size,
+                i.atime_ns, i.mtime_ns, i.ctime_ns, i.nlink
+         FROM dirents d
+         JOIN inodes i ON i.ino = d.child_ino
+         WHERE d.parent_ino = ?1 AND d.name = ?2",
+    )?;
+    stmt.query_row(params![parent_ino as i64, name], inode_from_row)
+        .map_err(Into::into)
+}
+
+fn entry_exists_in(conn: &Connection, parent_ino: u64, name: &[u8]) -> Result<bool, DbError> {
+    conn.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM dirents WHERE parent_ino = ?1 AND name = ?2)",
+    )?
+    .query_row(params![parent_ino as i64, name], |row| {
+        row.get::<_, bool>(0)
+    })
+    .map_err(Into::into)
+}
+
+/// Whether directory `ino` has any entry. Stops at the first row, so a large
+/// directory is not listed just to learn that it is not empty.
+fn directory_has_entries_in(conn: &Connection, ino: u64) -> Result<bool, DbError> {
+    conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM dirents WHERE parent_ino = ?1)")?
+        .query_row(params![ino as i64], |row| row.get::<_, bool>(0))
+        .map_err(Into::into)
+}
+
+fn is_descendant_in(conn: &Connection, ino: u64, possible_ancestor: u64) -> Result<bool, DbError> {
+    if ino == possible_ancestor {
+        return Ok(true);
     }
 
-    fn is_descendant(&self, ino: u64, possible_ancestor: u64) -> Result<bool, DbError> {
-        if ino == possible_ancestor {
+    let mut stmt = conn.prepare_cached("SELECT parent_ino FROM dirents WHERE child_ino = ?1")?;
+    let mut current = ino;
+    while current != 1 {
+        let parent = stmt
+            .query_row(params![current as i64], |row| row.get::<_, i64>(0))
+            .optional()?;
+
+        let Some(parent) = parent else {
+            return Ok(false);
+        };
+
+        let parent = parent as u64;
+        if parent == possible_ancestor {
             return Ok(true);
         }
-
-        let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare_cached("SELECT parent_ino FROM dirents WHERE child_ino = ?1")?;
-        let mut current = ino;
-        while current != 1 {
-            let parent = stmt
-                .query_row(params![current as i64], |row| row.get::<_, i64>(0))
-                .optional()?;
-
-            let Some(parent) = parent else {
-                return Ok(false);
-            };
-
-            let parent = parent as u64;
-            if parent == possible_ancestor {
-                return Ok(true);
-            }
-            current = parent;
-        }
-
-        Ok(false)
+        current = parent;
     }
+
+    Ok(false)
+}
+
+/// The inode number the next insert will get: one past the largest number ever
+/// used. AUTOINCREMENT keeps that high-water mark in `sqlite_sequence`.
+fn next_inode_number(conn: &Connection) -> Result<u64, DbError> {
+    let next: i64 = conn.query_row(
+        "SELECT MAX(
+           COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'inodes'), 0),
+           COALESCE((SELECT MAX(ino) FROM inodes), 0)
+         ) + 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(next as u64)
 }
 
 /// The chunks covered by the byte range `offset..offset + len` (`len > 0`).
@@ -1294,23 +1353,23 @@ fn is_missing_row(error: &SqlError) -> bool {
 /// whose last name went away, unless `is_open`, which keeps them with
 /// `nlink = 0`; otherwise drops one link.
 fn drop_unlinked_inode(
-    tx: &rusqlite::Transaction<'_>,
+    conn: &Connection,
     target: &Inode,
     now: Timestamp,
     is_open: bool,
 ) -> Result<(), DbError> {
     if target.kind == FileKind::Directory {
-        return delete_inode_rows(tx, target.ino);
+        return delete_inode_rows(conn, target.ino);
     }
 
     if target.nlink > 1 || is_open {
         let nlink = target.nlink.saturating_sub(1);
-        tx.prepare_cached("UPDATE inodes SET nlink = ?1, ctime_ns = ?2 WHERE ino = ?3")?
+        conn.prepare_cached("UPDATE inodes SET nlink = ?1, ctime_ns = ?2 WHERE ino = ?3")?
             .execute(params![nlink as i64, now.to_ns(), target.ino as i64])?;
         return Ok(());
     }
 
-    delete_inode_rows(tx, target.ino)
+    delete_inode_rows(conn, target.ino)
 }
 
 const UPSERT_CHUNK: &str = "INSERT INTO file_chunks (id, data) VALUES (?1, ?2)
@@ -1460,12 +1519,8 @@ fn recompute_directory_nlink(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
-fn add_directory_nlink(
-    tx: &rusqlite::Transaction<'_>,
-    ino: u64,
-    delta: i64,
-) -> Result<(), DbError> {
-    tx.prepare_cached("UPDATE inodes SET nlink = nlink + ?1 WHERE ino = ?2")?
+fn add_directory_nlink(conn: &Connection, ino: u64, delta: i64) -> Result<(), DbError> {
+    conn.prepare_cached("UPDATE inodes SET nlink = nlink + ?1 WHERE ino = ?2")?
         .execute(params![delta, ino as i64])?;
     Ok(())
 }
@@ -1727,11 +1782,11 @@ fn now_ts() -> Timestamp {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        // The thread stops before the connection is freed, and the hook is removed
+        // The threads stop before the connection is freed, and the hook is removed
         // before the state it points to is freed.
         self.close_checkpoints();
         if let Some(checkpoints) = &self.checkpoints {
-            checkpoints.uninstall(&self.conn.lock().unwrap_or_else(PoisonError::into_inner));
+            checkpoints.uninstall(&self.lock_main());
         }
     }
 }
@@ -1739,15 +1794,9 @@ impl Drop for Db {
 #[cfg(test)]
 impl Db {
     pub(crate) fn cap_page_count_at_current(&self) -> Result<(), DbError> {
-        let pages: i64 = self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
-        self.conn
-            .lock()
-            .unwrap()
-            .pragma_update(None, "max_page_count", pages)?;
+        let main = self.lock_main();
+        let pages: i64 = main.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        main.pragma_update(None, "max_page_count", pages)?;
         Ok(())
     }
 }

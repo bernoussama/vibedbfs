@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dbfs::{
-    Db, DbError, Dbfs, FileKind, MetadataUpdate, SCHEMA_VERSION, Timestamp, file_attr_from_inode,
+    Db, DbError, Dbfs, FileKind, MetadataUpdate, OpenOptions, SCHEMA_VERSION, Timestamp,
+    file_attr_from_inode,
 };
 use rusqlite::{Connection, params};
 
@@ -1389,9 +1390,14 @@ fn timestamps_outside_the_nanosecond_range_are_clamped_not_rejected() {
 
 #[test]
 fn timestamps_just_before_the_epoch_keep_their_sign_in_the_database() {
+    // Per-operation commits: the test reads the raw columns while its Db is open.
+    let options = OpenOptions {
+        sync_metadata: true,
+        ..OpenOptions::default()
+    };
     let path = disk_db_path("timestamps-pre-epoch");
     let file = {
-        let db = Db::open(&path).expect("open database");
+        let db = Db::open_with(&path, options).expect("open database");
         db.create_file(1, b"pre-epoch", 0o644, 1000, 1000)
             .expect("create file")
     };
@@ -1404,7 +1410,7 @@ fn timestamps_just_before_the_epoch_keep_their_sign_in_the_database() {
     ];
     for (time, ns) in cases {
         {
-            let db = Db::open(&path).expect("open database");
+            let db = Db::open_with(&path, options).expect("open database");
             db.update_metadata(
                 file.ino,
                 MetadataUpdate {
@@ -1422,14 +1428,14 @@ fn timestamps_just_before_the_epoch_keep_their_sign_in_the_database() {
             ns,
             "stored nanoseconds for {time:?}"
         );
-        let db = Db::open(&path).expect("reopen database");
+        let db = Db::open_with(&path, options).expect("reopen database");
         let mtime = db.get_inode(file.ino).expect("read inode").mtime;
         assert_eq!(mtime.to_system_time(), time, "read back after reopen");
         assert_eq!(mtime.to_ns(), ns);
     }
 
     // The ends of the stored range are kept exactly, not wrapped or sign-flipped.
-    let db = Db::open(&path).expect("open database");
+    let db = Db::open_with(&path, options).expect("open database");
     for (ns, time) in [(i64::MIN, "far past"), (i64::MAX, "far future")] {
         db.update_metadata(
             file.ino,

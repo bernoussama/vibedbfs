@@ -86,6 +86,7 @@
  ├── stats.rs         Opt-in counters (--stats), printed as one JSON line at exit
  ├── db.rs            Db: SQLite storage layer, all SQL, chunk I/O, migrations
  ├── checkpoint.rs    WAL checkpoints: commit hook, background thread, reset, --wal-cap
+├── batch.rs         Metadata batch: the open transaction, commit points, fail-stop, commit timer
  └── model.rs         FileKind, Inode, DirEntry, MetadataUpdate, Timestamp, DbError
 ```
 
@@ -170,9 +171,10 @@ Each buffered chunk keeps a 16-bit mask with one bit per 4 KiB block (`blocks.rs
 
 ## Flush Data Flow (on close, fsync, setattr, or a full write buffer)
 
-Close flushes dirty bytes into SQLite. `fsync` does that flush and then calls
-`fdatasync` on the WAL file, or on the main database file when no WAL file is
-present. A file unlinked while open is not flushed on close or fsync: its data
+Close flushes dirty bytes into the open metadata batch, which does not commit them
+(see [Metadata Batches](#metadata-batches)). `fsync` does that flush, commits the
+batch, and then calls `fdatasync` on the WAL file, or on the main database file when
+no WAL file is present. A file unlinked while open is not flushed on close or fsync: its data
 dies with its last handle, which deletes the inode.
 
 ```
@@ -233,13 +235,55 @@ RSS for its buffers, even after the data is flushed, because the slots are reuse
 deletes the inode; otherwise the slot is flushed and, with no handles and no dirty
 data left, freed.
 
+## Metadata Batches
+
+Every change to the database runs inside one open SQLite transaction, the batch, held on
+the main connection (`src/batch.rs`). The first operation after a commit runs
+`BEGIN IMMEDIATE`. Later operations join the batch with no savepoint. A batch commits at
+a commit point:
+
+- `fsync` and `fsyncdir` (`Db::sync_durable`), and `statfs`;
+- unmount, shutdown, and the `Db` closing;
+- 5 ms after the batch's first operation, from the commit timer thread (`dbfs-commit`);
+- once it holds 256 operations or 64 MiB of chunk data;
+- before the checkpoint thread's reset handshake, which then runs PASSIVE.
+
+`flush` and `release` write into the batch and do not commit. Every operation commits as
+it returns in four cases: `--sync-metadata`; read-only mounts, which open the database
+without background checkpoints; in-memory databases; and while free space on the
+database's filesystem is below 256 MiB. The free-space check uses `statvfs` and runs at
+most once a second.
+
+**Validation before writes.** An operation checks every failure it can before its first
+write: missing or existing names, non-empty directories, wrong kinds, the file size
+limit, and the name length. A failed check therefore changes nothing, and the batch goes
+on. A failure that SQLite reports after a write is different. The operation then rolls
+the transaction back, detected by `total_changes()` moving or `is_autocommit()` turning
+true. SQLite rolls back the whole transaction by itself on `SQLITE_FULL` (checked with a
+probe), so a full disk loses every operation in the batch, not only the failing one.
+
+**Fail-stop.** A failed COMMIT, or a rollback that discards acknowledged operations, sets
+a sticky failed state in `Main`. dbfs logs the reason once to stderr, counts it in
+`batch_failures`, and then refuses later mutating operations and `fsync`/`fsyncdir` with
+`EIO`. Reads continue, and unmount still works. The state lasts until the filesystem is
+remounted. When operations commit one by one, a failed COMMIT fails only the operation
+that caused it, as `ENOSPC` did before batching.
+
+**Kill and power loss.** A kill -9 can lose the changes since the last commit point, which
+is up to 5 ms or 256 operations of acknowledged, unsynced changes. `--sync-metadata` removes
+that window for metadata operations. Power loss is unchanged, since each commit is atomic
+and synced only by `fsync` and `fsyncdir`.
+
+**Locks.** The FUSE thread takes the table lock and then the `Main` mutex. The commit timer
+and the checkpoint thread take only the `Main` mutex, so they never wait for the table.
+
 ## WAL Checkpoints
 
 Commits never checkpoint (`wal_autocheckpoint = 0`), so a write waits for a checkpoint only when the WAL is over its cap. The code is in `src/checkpoint.rs`.
 
 - **Frame count.** A commit hook on the main connection stores how many frames the WAL holds. The hook runs no SQL and takes no lock, so a commit pays for a few atomic stores.
 - **Background thread.** A thread with its own connection runs `PRAGMA wal_checkpoint(PASSIVE)` when the WAL is over 64 MiB, or half of `--wal-cap` if that is smaller, so a small cap still gets background work. It also runs one after a second without a commit, when the WAL holds frames it has not reset.
-- **Reset handshake.** SQLite restarts a WAL only when every frame is backfilled and no reader is in the way. Under sustained writes a PASSIVE pass seldom ends exactly at the last frame. The thread therefore catches up without the database lock until at most 1 MiB is left. Then it takes the main connection's mutex, which means no write transaction is open, runs PASSIVE once more, and releases the mutex. The next writer restarts the WAL at offset 0. SQLite can also restart the WAL on its own when it happens to be fully backfilled; the handshake makes the reset happen when the thread has caught up.
+- **Reset handshake.** SQLite restarts a WAL only when every frame is backfilled and no reader is in the way. Under sustained writes a PASSIVE pass seldom ends exactly at the last frame. The thread therefore catches up without the database lock until at most 1 MiB is left. Then it takes the main connection's mutex, commits the open batch so that no write transaction is open, runs PASSIVE once more, and releases the mutex. The next writer restarts the WAL at offset 0. SQLite can also restart the WAL on its own when it happens to be fully backfilled; the handshake makes the reset happen when the thread has caught up.
 - **Size bound (`--wal-cap SIZE`).** The default is 1 GiB and the minimum 64 KiB. A writer that leaves the WAL larger than the cap runs `PRAGMA wal_checkpoint(RESTART)` on its own connection before it returns, so that one write waits. A busy RESTART, which happens while the thread is in a long PASSIVE pass, is retried for up to 60 s. Read-only mounts never checkpoint.
 - **File size.** When the next writer restarts the WAL after a reset, SQLite truncates the `-wal` file to `journal_size_limit`, which is 64 MiB. Measured on SQLite 3.46.1 with an 8 MiB limit: a 22 MB WAL, fully backfilled, shrank to 8 MiB at the next write. So an idle database keeps at most 64 MiB of WAL on disk, and unmount truncates it to zero (see [Shutdown](#shutdown)).
 - **Sticky errors.** A checkpoint that fails, other than by being busy, is logged to stderr and recorded. The next `fsync` or `fsyncdir` on the mount returns `EIO`, once. The error therefore reaches an application that syncs, even though the failure happened in the background.
@@ -525,7 +569,7 @@ When the mount ends (unmount, `fusermount3 -u`, or SIGTERM, SIGINT or SIGHUP), d
 writes one line to stderr:
 
 ```text
-{"dbfs_stats":{"ops":{"lookup":{"count":0,"total_ns":0},...,"other":{...}},"sql":{"read":{...},"write":{...},"metadata":{...},"sync":{...}},"flush_transactions":{"count":0,"total_ns":0},"chunks":{"flushed":0,"bytes_flushed":0,"reads_before_write":0},"write_buffer":{"slots_high_water":0,"evictions":0,"evicted_chunks":0},"wal":{"high_water_bytes":0},"checkpoints":{"count":0,"total_ns":0,"errors":0},"batch_commits":{"count":0,"total_ns":0,"ops":0}}}
+{"dbfs_stats":{"ops":{"lookup":{"count":0,"total_ns":0},...,"other":{...}},"sql":{"read":{...},"write":{...},"metadata":{...},"sync":{...}},"flush_transactions":{"count":0,"total_ns":0},"chunks":{"flushed":0,"bytes_flushed":0,"reads_before_write":0},"write_buffer":{"slots_high_water":0,"evictions":0,"evicted_chunks":0},"wal":{"high_water_bytes":0},"checkpoints":{"count":0,"total_ns":0,"errors":0},"batch_commits":{"count":0,"total_ns":0,"ops":0},"batch_failures":0}}
 ```
 
 - `ops`: calls and total time for each FUSE operation. `other` covers symlink, readlink,
@@ -545,7 +589,9 @@ writes one line to stderr:
 - `wal.high_water_bytes`: largest `-wal` file size, sampled after each flush and at exit.
 - `checkpoints`: every `wal_checkpoint` call (background PASSIVE passes, writer RESTARTs at
   the WAL cap, and the TRUNCATE at unmount), with time and failures.
-- `batch_commits` is a hook for later work (`stats::batch_commit`); nothing calls it yet.
+- `batch_commits`: commits of the metadata batch, with the time they took (`count`, `total_ns`), and
+  the operations they committed (`ops`). `batch_failures` counts batches that failed and put the
+  mount into fail-stop.
 
 While stats are off, each hook is one relaxed atomic load: no clock is read and nothing
 is counted.

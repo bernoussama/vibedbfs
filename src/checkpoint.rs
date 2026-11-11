@@ -11,9 +11,10 @@
 //! - Backfilling alone does not reset the WAL under sustained writes. A writer
 //!   restarts the WAL only when every frame is backfilled and nothing is in its way.
 //!   So after a PASSIVE that backfilled everything, the thread catches up without
-//!   the database lock, takes the main connection's mutex (no write transaction can
-//!   be open while it is held), runs PASSIVE once more, and releases it. The next
-//!   writer then restarts the WAL at its beginning. This is the reset handshake.
+//!   the database lock, takes the main connection's mutex, commits the open batch
+//!   (see `batch`) so no write transaction is open, runs PASSIVE once more, and
+//!   releases it. The next writer then restarts the WAL at its beginning. This is
+//!   the reset handshake.
 //! - Hard cap: a writer that leaves the WAL over `wal_cap` runs
 //!   `wal_checkpoint(RESTART)` on the main connection before it returns. That blocks,
 //!   but it bounds the WAL when the thread falls behind.
@@ -28,13 +29,14 @@ use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode, ffi};
 
 use crate::DbError;
+use crate::batch::Main;
 
 /// The background thread checkpoints (PASSIVE) once the WAL is this large.
 const PASSIVE_THRESHOLD: u64 = 64 << 20;
@@ -202,7 +204,7 @@ impl Checkpoints {
     /// of the main connection, which the reset handshake takes. The thread inherits
     /// the calling thread's signal mask, so the caller must block any signals it
     /// wants handled elsewhere first (`run` does this for the shutdown signals).
-    pub(crate) fn start(&self, main: Arc<Mutex<Connection>>) -> Result<(), DbError> {
+    pub(crate) fn start(&self, main: Arc<Mutex<Main>>) -> Result<(), DbError> {
         if !self.background {
             return Ok(());
         }
@@ -311,7 +313,7 @@ unsafe extern "C" fn on_commit(
 
 /// The checkpoint thread. Wakes on a kick, on a stop, or every `IDLE`, and
 /// checkpoints when the WAL is over the threshold or has been quiet with work left.
-fn run(state: Arc<WalState>, main: Arc<Mutex<Connection>>, conn: Connection) {
+fn run(state: Arc<WalState>, main: Arc<Mutex<Main>>, conn: Connection) {
     let mut seen = state.commits.load(Ordering::Acquire);
     // Commits as of the last reset. Commits after it are work the thread has left.
     let mut reset_at = seen;
@@ -332,7 +334,7 @@ fn run(state: Arc<WalState>, main: Arc<Mutex<Connection>>, conn: Connection) {
 }
 
 /// One checkpoint attempt. Returns true if the WAL is reset, or was empty, afterwards.
-fn round(state: &WalState, conn: &Connection, main: &Mutex<Connection>) -> bool {
+fn round(state: &WalState, conn: &Connection, main: &Mutex<Main>) -> bool {
     match try_round(state, conn, main) {
         Ok(reset) => reset,
         Err(error) => {
@@ -342,11 +344,7 @@ fn round(state: &WalState, conn: &Connection, main: &Mutex<Connection>) -> bool 
     }
 }
 
-fn try_round(
-    state: &WalState,
-    conn: &Connection,
-    main: &Mutex<Connection>,
-) -> rusqlite::Result<bool> {
+fn try_round(state: &WalState, conn: &Connection, main: &Mutex<Main>) -> rusqlite::Result<bool> {
     let (busy, log, mut backfilled) = checkpoint(conn, "PASSIVE")?;
     if busy || backfilled < log {
         return Ok(false);
@@ -364,10 +362,11 @@ fn try_round(
         }
         backfilled = checkpoint(conn, "PASSIVE")?.2;
     }
-    // No write transaction is open while the lock is held, so the WAL can finish
-    // backfilling and then restart.
-    let guard = main.lock().unwrap();
-    let (busy, log, backfilled) = checkpoint(conn, "PASSIVE")?;
+    // Commit the open batch first, so no write transaction is open while the lock
+    // is held. Then the WAL can finish backfilling and restart.
+    let mut guard = main.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.commit_for_reset();
+    let (busy, log, backfilled) = checkpoint(&guard, "PASSIVE")?;
     let reset = !busy && backfilled == log;
     if reset {
         state.frames.store(0, Ordering::Release);

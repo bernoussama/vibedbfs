@@ -1,4 +1,5 @@
 mod arena;
+mod batch;
 mod blocks;
 mod checkpoint;
 mod cli;

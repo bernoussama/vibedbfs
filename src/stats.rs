@@ -176,6 +176,7 @@ struct Stats {
     checkpoint_errors: AtomicU64,
     batch_commits: Timed,
     batch_ops: AtomicU64,
+    batch_failures: AtomicU64,
     chunks_flushed: AtomicU64,
     bytes_flushed: AtomicU64,
     reads_before_write: AtomicU64,
@@ -195,6 +196,7 @@ impl Stats {
             checkpoint_errors: AtomicU64::new(0),
             batch_commits: Timed::new(),
             batch_ops: AtomicU64::new(0),
+            batch_failures: AtomicU64::new(0),
             chunks_flushed: AtomicU64::new(0),
             bytes_flushed: AtomicU64::new(0),
             reads_before_write: AtomicU64::new(0),
@@ -215,6 +217,10 @@ impl Stats {
     fn record_batch_commit(&self, ops: u64, duration: Duration) {
         self.batch_commits.add(duration);
         self.batch_ops.fetch_add(ops, Relaxed);
+    }
+
+    fn record_batch_failure(&self) {
+        self.batch_failures.fetch_add(1, Relaxed);
     }
 
     fn record_eviction(&self, chunks: usize) {
@@ -262,6 +268,7 @@ impl Stats {
             ),
             ("checkpoints", checkpoints),
             ("batch_commits", batch_commits),
+            ("batch_failures", load(&self.batch_failures)),
         ]);
         format!("{{\"dbfs_stats\":{body}}}")
     }
@@ -418,12 +425,16 @@ pub(crate) fn checkpoint_done(duration: Duration, ok: bool) {
 }
 
 /// A group commit of `ops` operations took `duration`.
-///
-/// Hook for group commit (not built yet): call it once per commit.
-#[allow(dead_code)]
 pub(crate) fn batch_commit(ops: u64, duration: Duration) {
     if let Some(stats) = enabled() {
         stats.record_batch_commit(ops, duration);
+    }
+}
+
+/// A batch failed and writes are now refused.
+pub(crate) fn batch_failed() {
+    if let Some(stats) = enabled() {
+        stats.record_batch_failure();
     }
 }
 

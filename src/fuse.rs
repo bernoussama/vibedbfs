@@ -265,6 +265,11 @@ impl Shared {
             // acknowledge a write that nothing will persist.
             return Err(libc::EIO);
         }
+        if self.db.writes_refused() {
+            // A failed batch lost writes already acknowledged, so the filesystem takes
+            // no more: this write would never reach the database either.
+            return Err(libc::EIO);
+        }
         if data.is_empty() {
             return Ok(0);
         }
