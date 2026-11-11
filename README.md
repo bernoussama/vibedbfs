@@ -43,7 +43,7 @@ Stopping dbfs with Ctrl-C, or sending it SIGTERM or SIGHUP, also unmounts cleanl
 ## Mount options
 
 ```bash
-dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [--mmap-size SIZE] [--kernel-cache | --no-keep-cache] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
+dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [--mmap-size SIZE] [--kernel-cache | --no-keep-cache] [--stats] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
 ```
 
 By default only the user who mounted dbfs can access the filesystem. `dbfs mount --help` lists every option.
@@ -57,6 +57,7 @@ By default only the user who mounted dbfs can access the filesystem. `dbfs mount
 | `--mmap-size SIZE` | Largest part of the database file that SQLite may map into memory (`PRAGMA mmap_size`). Default `2G` on 64-bit systems and `0` on 32-bit. `0` turns the map off. Accepts the same suffixes as `--write-buffer`. Random reads are faster with the map. Applies to read-only mounts too. |
 | `--kernel-cache` | Let the kernel cache more: writeback cache, parallel directory operations, 1 MiB requests, cached symlinks and async direct I/O. Off by default. With the writeback cache, written data can sit in the kernel until the file is closed or synced, so a crash or `docker stop` with files still open can lose data that dbfs never saw. Conflicts with `--no-keep-cache`. Each item is explained in [Kernel caching](docs/architecture.md#kernel-caching). |
 | `--no-keep-cache` | Restore the caching of earlier releases: the kernel drops a file's cached data on every open, and attributes and names expire after one second, so repeated reads go through FUSE and SQLite again. Conflicts with `--kernel-cache`. See [Kernel caching](docs/architecture.md#kernel-caching). |
+| `--stats` | Counts FUSE operations, SQLite time and buffer activity, and prints them to stderr as one JSON line, `{"dbfs_stats": {...}}`, when the mount ends (unmount, or SIGTERM, SIGINT or SIGHUP). `DBFS_STATS=1` also turns it on. Off by default. See [Statistics](docs/architecture.md#statistics). |
 | `-o OPT[,OPT...]` | Extra options. Repeatable, and each value may be a comma-separated list. Known names map to typed FUSE options: `ro`, `rw`, `atime`, `noatime`, `suid`, `nosuid`, `dev`, `nodev`, `exec`, `noexec`, `dirsync`, `sync`, `async`, `fsname=NAME`, `subtype=NAME`. Any other option is passed to `fusermount3`, which accepts only the options it knows, such as `max_read=N`. An unknown option, such as `context=...`, makes the mount fail with `unknown option`. |
 
 By default the kernel keeps a file's page cache across opens and caches attributes and names for a day. That is safe because dbfs is the only writer of its database and every change goes through the kernel. The same rule covers the database file itself: see [Storage](#storage) before editing it with `sqlite3`.

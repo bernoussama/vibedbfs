@@ -10,6 +10,7 @@ use fuser::{MountOption, Session, SessionUnmounter};
 
 use crate::fuse::DEFAULT_WRITE_BUFFER;
 use crate::fuse::ShutdownHandle;
+use crate::stats;
 use crate::{Cli, Command, Db, DbError, Dbfs, MountConfig};
 
 const ALLOW_OTHER_HINT: &str = "hint: allow_other requires 'user_allow_other' in /etc/fuse.conf";
@@ -39,6 +40,7 @@ pub fn run_with_mounter(
         } => {
             // Validate options before the database is opened or created.
             let options = mount_options_for(&config)?;
+            stats::enable_if_requested(config.stats);
             let db = open_database(database, &config)?;
             let write_buffer = config.write_buffer.unwrap_or(DEFAULT_WRITE_BUFFER);
             mounter(
@@ -89,6 +91,7 @@ fn mount_dbfs(fs: Dbfs, mountpoint: &Path, options: &[MountOption]) -> Result<()
         Ok(Event::Shutdown) => shut_down(&shutdown, &mut unmounter, &events),
         Err(_) => Err(io::Error::other("event channel closed")),
     };
+    stats::report();
     session_result.map_err(RunError::Session)?;
 
     match shutdown.flush_failure() {

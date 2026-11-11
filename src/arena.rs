@@ -8,6 +8,7 @@
 use std::ops::Range;
 
 use crate::db::CHUNK_SIZE;
+use crate::stats;
 
 /// Index of a `CHUNK_SIZE` slot in a [`ChunkArena`].
 pub(crate) type ArenaSlot = u32;
@@ -45,6 +46,7 @@ impl ChunkArena {
             None => return None,
         };
         self.len[slot as usize] = 0;
+        stats::arena_slots_in_use(self.len.len() - self.free.len());
         Some(slot)
     }
 

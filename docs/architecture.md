@@ -82,6 +82,7 @@
  ├── fuse.rs          Dbfs: impl Filesystem, FUSE↔Db glue, flush and eviction
  ├── open_table.rs    OpenTable: handle table and struct-of-arrays open-inode table
  ├── arena.rs         ChunkArena (dirty chunk bytes) and DirtyIdx (per-inode index)
+ ├── stats.rs         Opt-in counters (--stats), printed as one JSON line at exit
  ├── db.rs            Db: SQLite storage layer, all SQL, chunk I/O, migrations
  └── model.rs         FileKind, Inode, DirEntry, MetadataUpdate, Timestamp, DbError
 ```
@@ -491,6 +492,37 @@ Each item is gated because it changes how the kernel buffers data or how many re
 ### Editing the database
 
 Do not edit the database file with `sqlite3` while dbfs has it mounted. The lock stops a second dbfs, not sqlite3. dbfs does not invalidate its caches for changes made behind its back, so the mount can show stale data, and a later dbfs write to the same chunk overwrites the edit.
+
+## Statistics
+
+`dbfs mount --stats` or `DBFS_STATS=1` turns on process-wide counters (`src/stats.rs`).
+When the mount ends (unmount, `fusermount3 -u`, or SIGTERM, SIGINT or SIGHUP), dbfs
+writes one line to stderr:
+
+```text
+{"dbfs_stats":{"ops":{"lookup":{"count":0,"total_ns":0},...,"other":{...}},"sql":{"read":{...},"write":{...},"metadata":{...},"sync":{...}},"flush_transactions":{"count":0,"total_ns":0},"chunks":{"flushed":0,"bytes_flushed":0,"reads_before_write":0},"write_buffer":{"slots_high_water":0,"evictions":0,"evicted_chunks":0},"wal":{"high_water_bytes":0},"checkpoints":{"count":0,"total_ns":0,"errors":0},"batch_commits":{"count":0,"total_ns":0,"ops":0}}}
+```
+
+- `ops`: calls and total time for each FUSE operation. `other` covers symlink, readlink,
+  listxattr, setxattr, removexattr and fallocate. Operations dbfs does not implement
+  (access, locking, ioctl, opendir) are not counted.
+- `sql`: time in each group of `Db` calls: `read` (file data), `write` (chunk writes,
+  flushes, truncate, inode deletion), `metadata` (lookups and directory and inode
+  changes) and `sync` (the WAL `fdatasync`). Only the outermost call on a thread is
+  counted. These totals sit inside the FUSE operations, so they overlap with `ops`.
+- `flush_transactions`: transactions that wrote dirty chunks (on close, fsync, setattr,
+  a full write buffer, or shutdown).
+- `chunks`: chunk rows and bytes written by flushes, and chunks read from SQLite before
+  a partial write could be buffered.
+- `write_buffer.slots_high_water`: most chunk buffers in use at once.
+  `evictions` counts the times a full buffer forced a flush, and `evicted_chunks` the
+  chunks those flushes wrote.
+- `wal.high_water_bytes`: largest `-wal` file size, sampled after each flush and at exit.
+- `checkpoints` and `batch_commits` are hooks for later work (`stats::checkpoint_done`
+  and `stats::batch_commit`). Nothing calls them yet, so they stay at zero.
+
+While stats are off, each hook is one relaxed atomic load: no clock is read and nothing
+is counted.
 
 ## Optimization Points
 

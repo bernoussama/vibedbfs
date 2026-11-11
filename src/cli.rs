@@ -92,6 +92,13 @@ pub struct MountConfig {
     /// avoids that.
     #[arg(long, value_name = "SIZE", value_parser = parse_bytes)]
     pub mmap_size: Option<usize>,
+
+    /// Print counters to stderr as one JSON line when the mount ends.
+    ///
+    /// The line is `{"dbfs_stats": {...}}`. `DBFS_STATS=1` also turns this on.
+    /// Off by default.
+    #[arg(long)]
+    pub stats: bool,
 }
 
 /// Parses `N`, `NK`, `NM` or `NG` (powers of 1024), at least 64 KiB.

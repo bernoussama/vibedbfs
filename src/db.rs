@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
 
+use crate::stats::{self, SqlGroup};
 use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
 
 pub(crate) const CHUNK_SIZE: usize = 65_536;
@@ -81,6 +82,7 @@ enum NewNode<'a> {
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let path = path.as_ref();
+        stats::database_opened(path);
         // Before the database file is opened, so a refused process never touches it.
         let lock = lock_database(path)?;
         let conn = Connection::open(path)?;
@@ -118,6 +120,7 @@ impl Db {
     }
 
     pub(crate) fn sync_durable(&self) -> Result<(), DbError> {
+        let _sql = stats::sql(SqlGroup::Sync);
         let path = {
             let conn = self.conn.lock().unwrap();
             match conn.path() {
@@ -138,6 +141,7 @@ impl Db {
     }
 
     pub(crate) fn volume_usage(&self) -> Result<VolumeUsage, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         let conn = self.conn.lock().unwrap();
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
         let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
@@ -251,6 +255,7 @@ impl Db {
     }
 
     pub fn get_inode(&self, ino: u64) -> Result<Inode, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT ino, kind, mode, uid, gid, size, atime_ns, mtime_ns, ctime_ns, nlink
@@ -264,6 +269,7 @@ impl Db {
     /// Kind and size of `ino`: the two columns the data paths need, without
     /// decoding the rest of the row.
     pub fn inode_head(&self, ino: u64) -> Result<(FileKind, u64), DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         let conn = self.conn.lock().unwrap();
         let (kind, size) = conn
             .prepare_cached("SELECT kind, size FROM inodes WHERE ino = ?1")?
@@ -275,6 +281,7 @@ impl Db {
 
     /// Kind of `ino` only, for "is this a directory?" checks.
     pub fn inode_kind_of(&self, ino: u64) -> Result<FileKind, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         let conn = self.conn.lock().unwrap();
         let kind = conn
             .prepare_cached("SELECT kind FROM inodes WHERE ino = ?1")?
@@ -283,6 +290,7 @@ impl Db {
     }
 
     pub fn lookup(&self, parent_ino: u64, name: &[u8]) -> Result<Inode, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         check_name(name)?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
@@ -297,6 +305,7 @@ impl Db {
     }
 
     pub fn list_dir(&self, ino: u64) -> Result<Vec<DirEntry>, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         if self.inode_kind_of(ino)? != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
@@ -344,6 +353,7 @@ impl Db {
         after_id: i64,
         mut emit: impl FnMut(i64, &[u8], u64, FileKind) -> bool,
     ) -> Result<(), DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         if self.inode_kind_of(ino)? != FileKind::Directory {
             return Err(DbError::NotDirectory);
         }
@@ -371,6 +381,7 @@ impl Db {
 
     /// Returns the parent directory of directory `ino` (the root is its own parent).
     pub fn parent_of_dir(&self, ino: u64) -> Result<u64, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         if ino == 1 {
             return Ok(1);
         }
@@ -415,6 +426,7 @@ impl Db {
     }
 
     pub fn read_symlink(&self, ino: u64) -> Result<Vec<u8>, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         if self.inode_kind_of(ino)? != FileKind::Symlink {
             return Err(DbError::InvalidInput);
         }
@@ -429,6 +441,7 @@ impl Db {
     /// symlink target and any remaining entries. Used when the last handle of an
     /// inode unlinked while open is released.
     pub(crate) fn delete_inode(&self, ino: u64) -> Result<(), DbError> {
+        let _sql = stats::sql(SqlGroup::Write);
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         delete_inode_rows(&tx, ino)?;
@@ -437,6 +450,7 @@ impl Db {
     }
 
     pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &[u8]) -> Result<Inode, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         check_name(new_name)?;
         let inode = self.get_inode(ino)?;
         if inode.kind == FileKind::Directory {
@@ -472,6 +486,7 @@ impl Db {
     }
 
     pub fn read_file(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, DbError> {
+        let _sql = stats::sql(SqlGroup::Read);
         let (kind, file_size) = self.inode_head(ino)?;
         if let Some(error) = kind.regular_file_error() {
             return Err(error);
@@ -494,6 +509,7 @@ impl Db {
     /// chunk's blob (see [`read_chunk_part`]). Other reads use one range query;
     /// blobs are borrowed from SQLite, not copied into a `Vec` first.
     pub(crate) fn read_into(&self, ino: u64, offset: u64, out: &mut [u8]) -> Result<(), DbError> {
+        let _sql = stats::sql(SqlGroup::Read);
         let Some(span) = ChunkSpan::new(offset, out.len()) else {
             return Ok(());
         };
@@ -531,6 +547,7 @@ impl Db {
         writes: &[(u64, &[u8])],
         modified: Timestamp,
     ) -> Result<u32, DbError> {
+        let _sql = stats::sql(SqlGroup::Write);
         let (kind, mut new_size) = self.inode_head(ino)?;
         if let Some(error) = kind.regular_file_error() {
             return Err(error);
@@ -605,6 +622,8 @@ impl Db {
         chunk_index: u64,
         dst: &mut [u8],
     ) -> Result<usize, DbError> {
+        let _sql = stats::sql(SqlGroup::Read);
+        stats::read_before_write();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached("SELECT data FROM file_chunks WHERE id = ?1")?;
         let mut rows = stmt.query(params![chunk_key(ino, chunk_index)])?;
@@ -626,23 +645,28 @@ impl Db {
         chunks: impl IntoIterator<Item = (u64, &'a [u8])>,
         now: Timestamp,
     ) -> Result<(), DbError> {
+        let _sql = stats::sql(SqlGroup::Write);
+        let _flush = stats::flush_transaction();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         {
             let mut write_stmt = tx.prepare_cached(UPSERT_CHUNK)?;
             for (chunk_index, data) in chunks {
+                stats::chunk_flushed(data.len());
                 write_stmt.execute(params![chunk_key(ino, chunk_index), data])?;
             }
         }
 
         set_size(&tx, ino, size, now)?;
         tx.commit()?;
+        stats::sample_wal();
 
         Ok(())
     }
 
     pub fn truncate_file(&self, ino: u64, size: u64) -> Result<(), DbError> {
+        let _sql = stats::sql(SqlGroup::Write);
         if let Some(error) = self.inode_kind_of(ino)?.regular_file_error() {
             return Err(error);
         }
@@ -696,6 +720,7 @@ impl Db {
         target: &Inode,
         is_open: bool,
     ) -> Result<(), DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         if target.kind == FileKind::Directory {
             return Err(DbError::IsDirectory);
         }
@@ -715,6 +740,7 @@ impl Db {
     }
 
     pub fn remove_dir(&self, parent_ino: u64, name: &[u8]) -> Result<(), DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         let target = self.lookup(parent_ino, name)?;
         if target.kind != FileKind::Directory {
             return Err(DbError::NotDirectory);
@@ -763,6 +789,7 @@ impl Db {
         noreplace: bool,
         is_open: impl Fn(u64) -> bool,
     ) -> Result<Option<Inode>, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         check_name(new_name)?;
         let source = self.lookup(parent_ino, name)?;
         if self.inode_kind_of(new_parent_ino)? != FileKind::Directory {
@@ -851,6 +878,7 @@ impl Db {
     }
 
     pub fn update_metadata(&self, ino: u64, update: MetadataUpdate) -> Result<Inode, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         let inode = self.get_inode(ino)?;
         let now = now_ts();
         let mode = update.mode.unwrap_or(inode.mode);
@@ -887,6 +915,7 @@ impl Db {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, DbError> {
+        let _sql = stats::sql(SqlGroup::Metadata);
         check_name(name)?;
         if self.inode_kind_of(parent_ino)? != FileKind::Directory {
             return Err(DbError::NotDirectory);
