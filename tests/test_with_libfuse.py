@@ -835,13 +835,17 @@ class TestXattrAndFallocate:
         assert os.listxattr(path) == []
         assert os.listxattr(dbfs_bench_mount) == []
 
-    def test_getxattr_reports_enodata(self, dbfs_bench_mount):
+    def test_getxattr_reports_eopnotsupp(self, dbfs_bench_mount):
         path = os.path.join(dbfs_bench_mount, "f.txt")
         with open(path, "wb"):
             pass
         with pytest.raises(OSError) as exc_info:
             os.getxattr(path, "user.x")
-        assert exc_info.value.errno == errno.ENODATA
+        assert exc_info.value.errno == errno.EOPNOTSUPP
+        # Later calls are answered by the kernel after its no_getxattr latch.
+        with pytest.raises(OSError) as exc_info:
+            os.getxattr(path, "security.capability")
+        assert exc_info.value.errno == errno.EOPNOTSUPP
 
     def test_setxattr_reports_eopnotsupp(self, dbfs_bench_mount):
         path = os.path.join(dbfs_bench_mount, "f.txt")

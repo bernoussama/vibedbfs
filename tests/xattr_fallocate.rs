@@ -28,7 +28,7 @@ fn pattern(len: usize) -> Vec<u8> {
 }
 
 #[test]
-fn getxattr_reports_enodata_for_any_name_on_an_existing_inode() {
+fn getxattr_reports_enosys_for_any_name_on_an_existing_inode() {
     let (fs, file) = file_fs(b"notes.txt");
     let dir = fs
         .mkdir(1, b"docs", 0o755, 0, 1000, 1000)
@@ -43,7 +43,7 @@ fn getxattr_reports_enodata_for_any_name_on_an_existing_inode() {
         ] {
             assert_eq!(
                 fs.getxattr(ino, name).expect_err("getxattr"),
-                libc::ENODATA,
+                libc::ENOSYS,
                 "inode {ino} name {}",
                 String::from_utf8_lossy(name)
             );
