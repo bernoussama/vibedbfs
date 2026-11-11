@@ -11,7 +11,8 @@ use fuser::{
     Request, TimeOrNow,
 };
 
-use crate::db::{CHUNK_SIZE, ChunkPiece, ChunkSpan, MAX_FILE_SIZE};
+use crate::blocks::{self, BlockMask, block_range};
+use crate::db::{CHUNK_SIZE, ChunkPiece, ChunkSpan, ChunkUpdate, MAX_FILE_SIZE};
 use crate::open_table::{OpenTable, Slot};
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
@@ -122,9 +123,11 @@ impl Shared {
             return Ok(0);
         }
         let entries = &inodes.dirty[i].entries()[..limit.min(inodes.dirty[i].len())];
-        let chunks = entries
-            .iter()
-            .map(|&(chunk_index, a)| (chunk_index, arena.chunk(a)));
+        let chunks = entries.iter().map(|&(chunk_index, a)| ChunkUpdate {
+            chunk_index,
+            buffer: arena.buffer(a),
+            dirty: arena.dirty(a),
+        });
         self.db
             .replace_chunks(inodes.ino[i], inodes.size[i], chunks, inodes.mtime[i])
             .map_err(errno_from_db_error)?;
@@ -210,7 +213,12 @@ impl Shared {
             .map_err(errno_from_db_error)?;
         let span = ChunkSpan::new(offset, output.len()).expect("non-empty read");
         for &(chunk_index, a) in inodes.dirty[i].range(span.first, span.last) {
-            span.copy_out(chunk_index, t.arena.chunk(a), &mut output);
+            span.copy_dirty_blocks(
+                chunk_index,
+                t.arena.dirty(a),
+                t.arena.buffer(a),
+                &mut output,
+            );
         }
         Ok(output)
     }
@@ -288,7 +296,9 @@ impl Shared {
     }
 
     /// Copies `bytes` into the part of chunk `chunk_index` that `piece` covers,
-    /// buffering the chunk first if it has none. On error nothing has changed.
+    /// giving the chunk a slot first if it has none. The blocks that `piece` covers
+    /// only in part are read from the database, unless already dirty. Blocks it
+    /// covers completely are not read. On error nothing visible has changed.
     fn write_piece(
         &self,
         t: &mut OpenTable,
@@ -298,28 +308,47 @@ impl Shared {
         bytes: &[u8],
     ) -> Result<(), i32> {
         let i = slot as usize;
-        let a = match t.inodes.dirty[i].find(chunk_index) {
-            Ok(position) => t.inodes.dirty[i].slot_at(position),
-            Err(_) => {
-                // May flush this inode too, so look the position up again after.
-                let a = self.alloc_chunk(t, slot)?;
-                if !piece.is_full_chunk() {
-                    let ino = t.inodes.ino[i];
-                    let buffer = t.arena.buffer_mut(a);
-                    match self.db.read_chunk_into(ino, chunk_index, buffer) {
-                        Ok(len) => t.arena.set_len(a, len),
-                        Err(error) => {
-                            t.arena.release(a);
-                            return Err(errno_from_db_error(error));
-                        }
-                    }
-                }
-                let position = t.inodes.dirty[i].find(chunk_index).unwrap_err();
-                t.inodes.dirty[i].insert(position, chunk_index, a);
-                a
-            }
+        let (a, is_new) = match t.inodes.dirty[i].find(chunk_index) {
+            Ok(position) => (t.inodes.dirty[i].slot_at(position), false),
+            // May flush this inode too, so the index is searched again below.
+            Err(_) => (self.alloc_chunk(t, slot)?, true),
         };
+        let unknown = blocks::partly_covered(piece.chunk.clone()) & !t.arena.dirty(a);
+        let ino = t.inodes.ino[i];
+        if let Err(errno) = self.load_blocks(t, ino, chunk_index, a, unknown) {
+            if is_new {
+                t.arena.release(a);
+            }
+            return Err(errno);
+        }
+        if is_new {
+            let position = t.inodes.dirty[i].find(chunk_index).unwrap_err();
+            t.inodes.dirty[i].insert(position, chunk_index, a);
+        }
         t.arena.write(a, piece.chunk.clone(), bytes);
+        Ok(())
+    }
+
+    /// Reads the blocks in `mask` of chunk `chunk_index` from the database into slot
+    /// `a`. A hole reads as zeros. The blocks stay unknown until a write marks them
+    /// dirty, so the caller must not read them as data before then.
+    fn load_blocks(
+        &self,
+        t: &mut OpenTable,
+        ino: u64,
+        chunk_index: u64,
+        a: u32,
+        mask: BlockMask,
+    ) -> Result<(), i32> {
+        let chunk_start = chunk_index * CHUNK_SIZE as u64;
+        let buffer = t.arena.buffer_mut(a);
+        for block in blocks::iter(mask) {
+            let range = block_range(block);
+            buffer[range.clone()].fill(0);
+            self.db
+                .read_into(ino, chunk_start + range.start as u64, &mut buffer[range])
+                .map_err(errno_from_db_error)?;
+        }
         Ok(())
     }
 
@@ -1868,5 +1897,115 @@ mod tests {
         let fs = Dbfs::new(db).with_kernel_cache(true).with_keep_cache(false);
         assert_eq!(fs.ttl(), KERNEL_CACHE_TTL);
         assert_eq!(fs.open_flags(), fuser::consts::FOPEN_KEEP_CACHE);
+    }
+
+    /// The dirty blocks of chunk `chunk` of `ino`, or `None` if it has no slot.
+    fn chunk_dirty(fs: &Dbfs, ino: u64, chunk: u64) -> Option<BlockMask> {
+        let t = fs.table();
+        let idx = &t.inodes.dirty[t.inodes.find(ino)? as usize];
+        let position = idx.find(chunk).ok()?;
+        Some(t.arena.dirty(idx.slot_at(position)))
+    }
+
+    #[test]
+    fn partial_writes_mark_only_the_blocks_they_touch() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"sparse.bin", 0o644, 1, 1)
+            .expect("create file");
+        let fs = Dbfs::new(db);
+        let fh = fs.open(file.ino).expect("open");
+
+        // Block 1 is covered whole, so it needs no read. Block 0 is covered in part.
+        fs.write_fh(fh, CHUNK_SIZE as u64 + 4096, &[1; 4096])
+            .expect("whole block");
+        assert_eq!(chunk_dirty(&fs, file.ino, 1), Some(0b10));
+        fs.write_fh(fh, CHUNK_SIZE as u64 + 100, &[2; 10])
+            .expect("part of block 0");
+        assert_eq!(chunk_dirty(&fs, file.ino, 1), Some(0b11));
+
+        // Blocks 0 and 2 are covered in part, block 1 whole.
+        fs.write_fh(fh, 2 * CHUNK_SIZE as u64 + 4000, &[3; 6000])
+            .expect("crosses three blocks");
+        assert_eq!(chunk_dirty(&fs, file.ino, 2), Some(0b111));
+        assert_eq!(
+            chunk_dirty(&fs, file.ino, 0),
+            None,
+            "chunk 0 is not buffered"
+        );
+
+        let mut want = vec![0u8; 4096];
+        want[100..110].fill(2);
+        assert_eq!(
+            fs.read_fh(fh, CHUNK_SIZE as u64 + 4096, 4096)
+                .expect("read"),
+            vec![1u8; 4096]
+        );
+        assert_eq!(
+            fs.read_fh(fh, CHUNK_SIZE as u64, 4096).expect("read"),
+            want,
+            "block 0 keeps the zeros around the bytes written"
+        );
+    }
+
+    #[test]
+    fn a_reused_slot_never_shows_the_stale_bytes_of_an_unknown_block() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"reuse.bin", 0o644, 1, 1)
+            .expect("create file");
+        // One slot. Chunk 0 fills it with 0x77, and the flush releases it with
+        // those bytes still in the buffer.
+        let fs = Dbfs::with_write_buffer(db, CHUNK_SIZE);
+        let fh = fs.open(file.ino).expect("open");
+        fs.write_fh(fh, 0, &vec![0x77; CHUNK_SIZE])
+            .expect("chunk 0");
+        fs.flush_file(file.ino).expect("flush");
+
+        // Chunk 1 is a hole that takes the same slot. Only its block 0 is loaded,
+        // and only its bytes 5 and 9000 are written. Block 1 is unknown.
+        let chunk1 = CHUNK_SIZE as u64;
+        fs.write_fh(fh, chunk1 + 5, &[0x42]).expect("first byte");
+        fs.write_fh(fh, chunk1 + 9000, &[0x43])
+            .expect("second byte");
+        assert_eq!(chunk_dirty(&fs, file.ino, 1), Some(0b101));
+
+        let mut want = vec![0u8; 9001];
+        want[5] = 0x42;
+        want[9000] = 0x43;
+        assert_eq!(
+            fs.read_fh(fh, chunk1, 9001).expect("read while buffered"),
+            want,
+            "the unknown block 1 reads as a hole, not as stale 0x77"
+        );
+        fs.release_file(fh).expect("release");
+        fs.flush_all().expect("flush");
+        assert_eq!(
+            fs.db
+                .read_file(file.ino, chunk1, 9001)
+                .expect("read stored"),
+            want
+        );
+    }
+
+    #[test]
+    fn a_partial_flush_patches_the_stored_chunk_and_keeps_its_length() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let file = db
+            .create_file(1, b"patch.bin", 0o644, 1, 1)
+            .expect("create file");
+        let fs = Dbfs::new(db);
+        let fh = fs.open(file.ino).expect("open");
+        let original: Vec<u8> = (0..CHUNK_SIZE).map(|i| (i % 253) as u8 + 1).collect();
+        fs.write_fh(fh, 0, &original).expect("whole chunk");
+        fs.flush_file(file.ino).expect("store it");
+
+        // One byte in block 3. The flush stores the chunk, patched in place.
+        fs.write_fh(fh, 3 * 4096 + 7, &[0xEE]).expect("patch");
+        fs.flush_file(file.ino).expect("flush the patch");
+        let mut want = original;
+        want[3 * 4096 + 7] = 0xEE;
+        assert_eq!(fs.db.read_file(file.ino, 0, u32::MAX).expect("read"), want);
+        fs.release_file(fh).expect("release");
     }
 }

@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
 
+use crate::blocks::{self, ALL_BLOCKS, BlockMask, block_range};
 use crate::{DbError, DirEntry, FileKind, Inode, MetadataUpdate, Timestamp};
 
 pub(crate) const CHUNK_SIZE: usize = 65_536;
@@ -592,42 +593,42 @@ impl Db {
         Ok(written as u32)
     }
 
-    /// Copies the stored bytes of chunk `chunk_index` into the start of `dst`
-    /// and returns how many there were (0 for a hole).
-    pub(crate) fn read_chunk_into(
-        &self,
-        ino: u64,
-        chunk_index: u64,
-        dst: &mut [u8],
-    ) -> Result<usize, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT data FROM file_chunks WHERE id = ?1")?;
-        let mut rows = stmt.query(params![chunk_key(ino, chunk_index)])?;
-        let Some(row) = rows.next()? else {
-            return Ok(0);
-        };
-        let data = row.get_ref(0)?.as_blob().map_err(SqlError::from)?;
-        let len = data.len().min(dst.len());
-        dst[..len].copy_from_slice(&data[..len]);
-        Ok(len)
-    }
-
-    /// Upserts `chunks` (`(chunk_index, bytes)`) and sets size and mtime, in one
-    /// transaction.
+    /// Stores `chunks` and sets size and mtime, in one transaction. A chunk whose
+    /// blocks are all dirty is stored whole. Any other chunk is patched: its stored
+    /// bytes are read, the dirty blocks are copied over them and the result is
+    /// stored. Only the blocks that were dirty change, and the row keeps its length
+    /// when it already covers them (see `blocks::merge`).
     pub(crate) fn replace_chunks<'a>(
         &self,
         ino: u64,
         size: u64,
-        chunks: impl IntoIterator<Item = (u64, &'a [u8])>,
+        chunks: impl IntoIterator<Item = ChunkUpdate<'a>>,
         now: Timestamp,
     ) -> Result<(), DbError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         {
+            let mut read_stmt = tx.prepare_cached("SELECT data FROM file_chunks WHERE id = ?1")?;
             let mut write_stmt = tx.prepare_cached(UPSERT_CHUNK)?;
-            for (chunk_index, data) in chunks {
-                write_stmt.execute(params![chunk_key(ino, chunk_index), data])?;
+            let mut merged = Vec::new();
+            for update in chunks {
+                let key = chunk_key(ino, update.chunk_index);
+                let limit = chunk_limit(size, update.chunk_index);
+                debug_assert!(limit > 0, "a dirty chunk lies inside its file");
+                if update.dirty == ALL_BLOCKS {
+                    write_stmt.execute(params![key, &update.buffer[..limit]])?;
+                    continue;
+                }
+                {
+                    let mut rows = read_stmt.query(params![key])?;
+                    let stored: &[u8] = match rows.next()? {
+                        Some(row) => row.get_ref(0)?.as_blob().map_err(SqlError::from)?,
+                        None => &[],
+                    };
+                    blocks::merge(stored, update.dirty, update.buffer, limit, &mut merged);
+                }
+                write_stmt.execute(params![key, &merged[..]])?;
             }
         }
 
@@ -1051,6 +1052,42 @@ impl ChunkSpan {
         out[piece.buf.start..piece.buf.start + len]
             .copy_from_slice(&data[piece.chunk.start..avail]);
     }
+
+    /// Copies the dirty blocks of chunk `chunk_index` that this span covers from
+    /// `buffer` (the chunk's bytes in the write buffer) into `out` (the span's
+    /// buffer). Other blocks are left alone.
+    pub fn copy_dirty_blocks(
+        &self,
+        chunk_index: u64,
+        dirty: BlockMask,
+        buffer: &[u8],
+        out: &mut [u8],
+    ) {
+        let piece = self.piece(chunk_index);
+        for block in blocks::iter(dirty) {
+            let bytes = block_range(block);
+            let from = bytes.start.max(piece.chunk.start);
+            let to = bytes.end.min(piece.chunk.end);
+            if from < to {
+                let at = piece.buf.start + (from - piece.chunk.start);
+                out[at..at + (to - from)].copy_from_slice(&buffer[from..to]);
+            }
+        }
+    }
+}
+
+/// One chunk to store: its write-buffer bytes and which blocks of them are dirty.
+pub(crate) struct ChunkUpdate<'a> {
+    pub chunk_index: u64,
+    /// The whole chunk buffer. Only the blocks in `dirty` are meaningful.
+    pub buffer: &'a [u8],
+    pub dirty: BlockMask,
+}
+
+/// How many bytes of chunk `chunk_index` lie inside a file of `size` bytes.
+fn chunk_limit(size: u64, chunk_index: u64) -> usize {
+    size.saturating_sub(chunk_index * CHUNK_SIZE as u64)
+        .min(CHUNK_SIZE as u64) as usize
 }
 
 /// Copies the bytes that `span` asks for from one chunk into `out`, reading

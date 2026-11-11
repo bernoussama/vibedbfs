@@ -82,6 +82,7 @@
  ├── fuse.rs          Dbfs: impl Filesystem, FUSE↔Db glue, flush and eviction
  ├── open_table.rs    OpenTable: handle table and struct-of-arrays open-inode table
  ├── arena.rs         ChunkArena (dirty chunk bytes) and DirtyIdx (per-inode index)
+ ├── blocks.rs        4 KiB block masks of buffered chunks, merge of dirty blocks into a row
  ├── db.rs            Db: SQLite storage layer, all SQL, chunk I/O, migrations
  └── model.rs         FileKind, Inode, DirEntry, MetadataUpdate, Timestamp, DbError
 ```
@@ -150,18 +151,20 @@ inode row; entries and the symlink target follow through their cascades.
  │  2. For each chunk the write covers (ChunkSpan):         │
  │     dirty[slot].find(chunk)       last entry, then       │
  │                                   binary search          │
- │     ├── found: write into its arena slot                 │
+ │     ├── found: write, mark the touched blocks dirty      │
  │     └── new:   arena.alloc()                             │
  │                ├── full? write up to 256 of the inode's  │
  │                │   lowest dirty chunks (16 MiB), retry   │
- │                ├── partial chunk: copy the stored chunk  │
- │                │   into the arena slot (one SELECT)      │
+ │                ├── partly covered blocks: blob read      │
+ │                │   into the arena slot (holes: zeros)    │
  │                └── insert (chunk, arena slot), sorted    │
  │                                                          │
  │  3. size[slot] grows chunk by chunk; mtime[slot] = now   │
  │  4. Return Ok(5)          ── no SQLite write, no alloc ──│
  └──────────────────────────────────────────────────────────┘
 ```
+
+Each buffered chunk keeps a 16-bit mask with one bit per 4 KiB block (`blocks.rs`). A write sets the bits of the blocks it touches. A block that the write covers only in part is first read from SQLite, one blob read of that block (zeros for a hole), so a dirty block always holds its complete contents. A block the write covers whole needs no read. The blocks that are not dirty are unknown: their bytes in the slot may be stale or zero. Reads take them from SQLite, and a flush keeps their stored bytes.
 
 ## Flush Data Flow (on close, fsync, setattr, or a full write buffer)
 
@@ -178,7 +181,7 @@ dies with its last handle, which deletes the inode.
  │  Shared::flush_slot(slot)                               │
  │                                                         │
  │  Db::replace_chunks(ino, size[slot],                    │
- │      dirty[slot] as (chunk, &arena[slot]) pairs, mtime) │
+ │      dirty[slot] as (chunk, bytes, mask), mtime)        │
  │  On success: arena slots back to the free list,         │
  │  dirty[slot] cleared (capacity kept).                   │
  │  On failure: everything stays buffered for a retry.     │
@@ -188,12 +191,18 @@ dies with its last handle, which deletes the inode.
  │  Db::replace_chunks                                     │
  │                                                         │
  │  1. BEGIN TRANSACTION                                   │
- │  2. For each buffered chunk: upsert by key              │
- │     (ino << 24 | chunk), borrowed bytes, no SELECT      │
+ │  2. For each buffered chunk:                            │
+ │     all 16 blocks dirty: upsert the slot's bytes        │
+ │     else: SELECT the stored row, merge the dirty blocks │
+ │     (blocks::merge), then upsert the result             │
  │  3. UPDATE inodes SET size, mtime_ns, ctime_ns          │
  │  4. COMMIT  ──► SQLite appends WAL frames               │
  └─────────────────────────────────────────────────────────┘
 ```
+
+A chunk with all 16 blocks dirty is stored straight from its slot. Any other chunk gets its stored row with the dirty blocks merged in. The row keeps its length when that already reaches the dirty data. A shorter row is extended with zeros only as far as the end of its highest dirty block, and never past the end of the file. It is not extended to the end of the chunk, because a sparse one-byte write would then store a full 64 KiB row. The model tests check that no row runs past the end of its file.
+
+Patching the blob in place, without rewriting the row, is a possible follow-up. It applies only when the row already reaches the dirty data. On the development VM it took about 51 µs per partly dirty chunk, against 65–77 µs for read, patch and upsert, with about the same WAL size (14–15 KiB). Before this change, a partly dirty chunk was upserted whole: about 200 µs and 65 KiB of WAL.
 
 ### Eviction slices
 
@@ -216,7 +225,7 @@ make it durable.
 Memory: the arena reserves a 64 KiB slot when the write path needs one, up to
 `--write-buffer`, and never gives it back until unmount. A mount that has
 buffered little uses little RAM. One that has filled the budget keeps that much
-RSS for its buffers, even after the data is flushed, because the slots are reused.
+RSS for its buffers, even after the data is flushed, because the slots are reused. Each slot also keeps a 2-byte dirty-block mask.
 
 `release` drops one handle. The last handle of an inode unlinked while open
 deletes the inode; otherwise the slot is flushed and, with no handles and no dirty
@@ -250,7 +259,7 @@ The kernel answers a repeated read from its page cache when the file has not cha
  │  2. output = vec![0; len]       one allocation          │
  │  3. Db::read_into(ino, 0, &mut output)                  │
  │  4. For each dirty chunk in range (DirtyIdx::range):    │
- │     overlay its arena bytes onto output                 │
+ │     overlay its dirty blocks onto output (mask)         │
  └────────────────────┬────────────────────────────────────┘
                       ▼
  ┌──────────────────────────────────────────────────────────┐
@@ -269,6 +278,8 @@ The kernel answers a repeated read from its page cache when the file has not cha
  │  into out; holes and short chunks stay zero.            │
  └──────────────────────────────────────────────────────────┘
 ```
+
+The overlay copies only the dirty 4 KiB blocks of each buffered chunk. Every other block comes from SQLite, so stale bytes left in a reused slot are never returned.
 
 ## Lookup / Path Resolution
 
@@ -499,7 +510,7 @@ Do not edit the database file with `sqlite3` while dbfs has it mounted. The lock
 | `read`, `write`, `flush`, `release` | `fh` indexes the handle table; per-inode state is a struct of arrays indexed by slot. No hashing, no SQL for the inode kind or size. |
 | Buffered writes | One `ChunkArena` for all inodes, grown lazily to `--write-buffer` (default 256 MiB), never shrunk, and reused, so steady-state writes do not allocate. A full arena writes up to 16 MiB of the inode with the most dirty chunks (see [Eviction slices](#eviction-slices)). |
 | Dirty chunk lookup | `DirtyIdx` is sorted by chunk index; sequential writes hit the last entry before any binary search. |
-| Flush | `replace_chunks` upserts borrowed arena bytes by integer key in one transaction, with no SELECT. |
+| Flush | `replace_chunks` upserts borrowed arena bytes by integer key in one transaction. A chunk with every block dirty needs no SELECT; a partly dirty one reads its stored row and patches only its dirty blocks. |
 | Read | A read inside one chunk reads only its bytes, through the chunk's blob. Other reads use one range statement over the chunk keys; each blob is borrowed and copied straight into the reply buffer. |
 | Chunk table | `file_chunks` is a rowid table keyed `(ino << 24) \| chunk_index`: one B-tree, no separate index, and a file is one contiguous key range. |
 | Unlink | The resolved inode is passed to `unlink_entry` (no second lookup); an unlinked closed file's dirty data is dropped, not flushed. |
