@@ -484,6 +484,9 @@ fn large_write_keeps_daemon_memory_bounded_when_enabled() {
 
     const MIB: u64 = 1 << 20;
     const WRITTEN_MIB: u64 = 512;
+    // The default write buffer (256 MiB) may be full, plus room for SQLite and the
+    // process. Without a bound on the buffer, the daemon would hold all of it.
+    const RSS_LIMIT_MIB: u64 = 256 + 64;
 
     let mount = Mount::start(temp_path("large-write").with_extension("sqlite"));
     let mut file = File::create(mount.mountpoint.join("large.bin")).expect("create large.bin");
@@ -496,7 +499,7 @@ fn large_write_keeps_daemon_memory_bounded_when_enabled() {
     let rss = daemon_rss_bytes(mount.child.id());
     drop(file);
     assert!(
-        rss < WRITTEN_MIB * MIB / 4,
+        rss < RSS_LIMIT_MIB * MIB,
         "daemon RSS was {} MiB after writing {WRITTEN_MIB} MiB",
         rss / MIB
     );

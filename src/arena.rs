@@ -146,6 +146,15 @@ impl DirtyIdx {
         }
         self.0.clear();
     }
+
+    /// Returns the slots of the first `n` entries (the lowest chunk indexes) to
+    /// `arena` and removes those entries. Asking for more than there are empties
+    /// the index. The rest stay sorted.
+    pub fn release_front(&mut self, n: usize, arena: &mut ChunkArena) {
+        for (_, slot) in self.0.drain(..n.min(self.0.len())) {
+            arena.release(slot);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +204,40 @@ mod tests {
         let range: Vec<u64> = idx.range(2, 5).iter().map(|&(c, _)| c).collect();
         assert_eq!(range, [3, 5]);
         assert!(idx.range(10, 20).is_empty());
+    }
+
+    #[test]
+    fn release_front_frees_the_lowest_entries_and_keeps_the_rest_sorted() {
+        let mut arena = ChunkArena::new(8 * CHUNK_SIZE);
+        let mut idx = DirtyIdx::default();
+        for chunk in [7u64, 2, 9, 4, 1] {
+            let slot = arena.alloc().expect("slot");
+            arena.write(slot, 0..1, &[chunk as u8]);
+            let position = idx.find(chunk).expect_err("new chunk");
+            idx.insert(position, chunk, slot);
+        }
+        assert_eq!(arena.slots_in_use(), 5);
+
+        idx.release_front(2, &mut arena);
+
+        assert_eq!(arena.slots_in_use(), 3, "two slots went back to the arena");
+        let chunks: Vec<u64> = idx.entries().iter().map(|&(c, _)| c).collect();
+        assert_eq!(chunks, [4, 7, 9], "the two lowest chunks left the index");
+        assert_eq!(idx.find(7), Ok(1));
+        assert_eq!(idx.find(2), Err(0));
+        let reused = arena.alloc().expect("a released slot");
+        assert_eq!(arena.chunk(reused), b"", "a released slot starts empty");
+        assert_eq!(arena.capacity_bytes(), 5 * CHUNK_SIZE, "no growth on reuse");
+    }
+
+    #[test]
+    fn release_front_with_more_than_the_length_empties_the_index() {
+        let mut arena = ChunkArena::new(2 * CHUNK_SIZE);
+        let mut idx = DirtyIdx::default();
+        let slot = arena.alloc().expect("slot");
+        idx.insert(0, 3, slot);
+        idx.release_front(5, &mut arena);
+        assert!(idx.is_empty());
+        assert_eq!(arena.slots_in_use(), 0);
     }
 }

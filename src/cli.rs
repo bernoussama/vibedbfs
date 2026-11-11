@@ -53,12 +53,13 @@ pub struct MountConfig {
     #[arg(short = 'o', long = "option", value_name = "OPT[,OPT...]")]
     pub extra: Vec<String>,
 
-    /// Memory for buffered writes, shared by all open files (default 64M).
+    /// Memory for buffered writes, shared by all open files (default 256M).
     ///
     /// Takes a byte count with an optional K, M or G suffix (powers of 1024),
     /// for example `8M` in a small container. The memory is reserved as it is
-    /// used, never up front. When it is full, the file with the most buffered
-    /// data is written to the database. Minimum 64K.
+    /// used, never up front, and is kept until unmount. When it is full, up to
+    /// 16 MiB of the file with the most buffered data is written to the database,
+    /// and the rest of that file stays buffered. Minimum 64K.
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub write_buffer: Option<usize>,
 

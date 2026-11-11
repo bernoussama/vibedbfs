@@ -39,7 +39,7 @@
  │  │           ino, kind, size, mtime, refs, unlinked, dirty    │ │
  │  │           by_ino: HashMap  (open/unlink/getattr only)      │ │
  │  │  arena:   ChunkArena, 64 KiB slots, global budget          │ │
- │  │           (--write-buffer, default 64 MiB, grown lazily)   │ │
+ │  │           (--write-buffer, default 256 MiB, grown lazily)  │ │
  │  └────────────────────────────────────────────────────────────┘ │
  └────────────────────────┬─────────────────────────────────────────┘
                           │ Db method calls
@@ -152,8 +152,8 @@ inode row; entries and the symlink target follow through their cascades.
  │                                   binary search          │
  │     ├── found: write into its arena slot                 │
  │     └── new:   arena.alloc()                             │
- │                ├── full? flush the inode with the most   │
- │                │   dirty chunks, then retry              │
+ │                ├── full? write up to 256 of the inode's  │
+ │                │   lowest dirty chunks (16 MiB), retry   │
  │                ├── partial chunk: copy the stored chunk  │
  │                │   into the arena slot (one SELECT)      │
  │                └── insert (chunk, arena slot), sorted    │
@@ -194,6 +194,29 @@ dies with its last handle, which deletes the inode.
  │  4. COMMIT  ──► SQLite appends WAL frames               │
  └─────────────────────────────────────────────────────────┘
 ```
+
+### Eviction slices
+
+When the arena has no free slot, a write does not flush a whole file. The inode
+with the most dirty chunks gives up its lowest-indexed dirty chunks, at most 256
+(16 MiB), in one transaction (`Shared::flush_chunks` with `EVICTION_SLICE_CHUNKS`),
+and their slots return to the arena. The rest of that file stays buffered and
+reads still overlay it. A large file is therefore written out over many bounded
+evictions, and no request waits for a whole large file. The eviction policy is
+otherwise unchanged. `fsync`, `flush`, `release`, truncate and shutdown still write
+all of a file's buffered chunks, in one transaction.
+
+A failed slice leaves every chunk buffered and fails the write that needed the
+slot with the database's errno (for example `ENOSPC`). Each slice also stores the
+file's current size. After a crash, a file can therefore show a size whose
+unflushed chunks read as zeros, and some evicted slices can be kept while others
+are lost. That is the same status as any unsynced data: only `fsync` or unmount
+make it durable.
+
+Memory: the arena reserves a 64 KiB slot when the write path needs one, up to
+`--write-buffer`, and never gives it back until unmount. A mount that has
+buffered little uses little RAM. One that has filled the budget keeps that much
+RSS for its buffers, even after the data is flushed, because the slots are reused.
 
 `release` drops one handle. The last handle of an inode unlinked while open
 deletes the inode; otherwise the slot is flushed and, with no handles and no dirty
@@ -434,7 +457,7 @@ call reaches FUSE, so user space should not normally see it.
 | Path | What keeps it cheap |
 |---|---|
 | `read`, `write`, `flush`, `release` | `fh` indexes the handle table; per-inode state is a struct of arrays indexed by slot. No hashing, no SQL for the inode kind or size. |
-| Buffered writes | One `ChunkArena` for all inodes, grown lazily to `--write-buffer` and reused, so steady-state writes do not allocate. A full arena flushes the inode with the most dirty chunks. |
+| Buffered writes | One `ChunkArena` for all inodes, grown lazily to `--write-buffer` (default 256 MiB), never shrunk, and reused, so steady-state writes do not allocate. A full arena writes up to 16 MiB of the inode with the most dirty chunks (see [Eviction slices](#eviction-slices)). |
 | Dirty chunk lookup | `DirtyIdx` is sorted by chunk index; sequential writes hit the last entry before any binary search. |
 | Flush | `replace_chunks` upserts borrowed arena bytes by integer key in one transaction, with no SELECT. |
 | Read | A read inside one chunk reads only its bytes, through the chunk's blob. Other reads use one range statement over the chunk keys; each blob is borrowed and copied straight into the reply buffer. |
