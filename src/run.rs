@@ -42,7 +42,9 @@ pub fn run_with_mounter(
             let db = open_database(database, &config)?;
             let write_buffer = config.write_buffer.unwrap_or(DEFAULT_WRITE_BUFFER);
             mounter(
-                Dbfs::with_write_buffer(db, write_buffer).with_kernel_cache(config.kernel_cache),
+                Dbfs::with_write_buffer(db, write_buffer)
+                    .with_kernel_cache(config.kernel_cache)
+                    .with_keep_cache(!config.no_keep_cache),
                 &mountpoint,
                 &options,
             )
@@ -69,8 +71,10 @@ fn open_database(path: impl AsRef<Path>, config: &MountConfig) -> Result<Db, Run
 /// `Filesystem::destroy` runs. A flush failure at any point makes this return an error.
 fn mount_dbfs(fs: Dbfs, mountpoint: &Path, options: &[MountOption]) -> Result<(), RunError> {
     let shutdown = fs.shutdown_handle();
+    let notify = fs.notify_handle();
     let mut session = Session::new(fs, mountpoint, options)
         .map_err(|error| mount_failure(error, options, euid()))?;
+    notify.attach(session.notifier());
     let mut unmounter = session.unmount_callable();
     let (events_tx, events) = mpsc::channel();
 

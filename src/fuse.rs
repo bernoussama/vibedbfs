@@ -2,11 +2,11 @@ use std::ffi::OsStr;
 use std::ops::Deref;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
+    FileAttr, FileType, Filesystem, KernelConfig, Notifier, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, TimeOrNow,
 };
@@ -15,10 +15,14 @@ use crate::db::{CHUNK_SIZE, ChunkPiece, ChunkSpan, MAX_FILE_SIZE};
 use crate::open_table::{OpenTable, Slot};
 use crate::{Db, DbError, FileKind, Inode, MetadataUpdate, Timestamp};
 
-const ATTR_TTL: Duration = Duration::from_secs(1);
-/// Attribute and entry TTL with `--kernel-cache`. dbfs is the only writer of its
-/// database, so the kernel's cached attributes cannot go stale behind its back.
+/// Attribute and entry TTL used by the default mode and by `--kernel-cache`, where
+/// the kernel keeps attributes and names for a day. This is safe because dbfs is the
+/// only writer of its database and every change goes through the kernel. A change
+/// that no reply carries (a rename over a file with other links or open handles, an
+/// extending `fallocate`) is handled by `Shared::invalidate_attr`.
 const KERNEL_CACHE_TTL: Duration = Duration::from_secs(86_400);
+/// Attribute and entry TTL with `--no-keep-cache`: the kernel asks again after one second.
+const ATTR_TTL: Duration = Duration::from_secs(1);
 /// Largest read or write request without `--kernel-cache`: the kernel default
 /// before FUSE_MAX_PAGES, kept so the default mount behaves as it always has.
 const DEFAULT_MAX_REQUEST: u32 = 128 * 1024;
@@ -65,8 +69,14 @@ pub struct Shared {
     table: Mutex<OpenTable>,
     /// Outcome of the latest flush on a shutdown path (`destroy` or a signal).
     last_flush: Mutex<Result<(), i32>>,
-    /// `--kernel-cache`: kernel writeback cache, long TTLs, kept page cache.
+    /// `--kernel-cache`: kernel writeback cache, 1 MiB requests and the other
+    /// options in `Filesystem::init`. Implies `keep_cache`.
     kernel_cache: bool,
+    /// Keep the kernel's page cache across opens and cache attributes and names for
+    /// a day. On by default; `--no-keep-cache` turns it off.
+    keep_cache: bool,
+    /// Sends kernel notifications. Set by `run.rs` once the session exists.
+    notifier: OnceLock<Notifier>,
 }
 
 impl Deref for Dbfs {
@@ -353,6 +363,17 @@ impl Shared {
             .is_some_and(|slot| t.inodes.is_open(slot))
     }
 
+    /// Makes the kernel forget its cached attributes of `ino`, for a change that the
+    /// request's reply does not carry, so the next access asks dbfs again. Only
+    /// attributes are dropped (offset -1). A notification that also drops pages can
+    /// wait for page locks, and a write in flight holds them until this thread
+    /// replies, which would deadlock. If the send fails, the mount is going away.
+    fn invalidate_attr(&self, ino: u64) {
+        if let Some(notifier) = self.notifier.get() {
+            let _ = notifier.inval_inode(ino, -1, 0);
+        }
+    }
+
     /// Size and mtime overlay for an inode with buffered writes.
     fn overlay_attr(&self, attr: &mut FileAttr) {
         let t = self.table();
@@ -393,6 +414,20 @@ impl ShutdownHandle {
     }
 }
 
+/// Hands the session's notifier to the filesystem. The session takes the
+/// filesystem by value, so the notifier can only be attached after it exists.
+pub(crate) struct NotifyHandle {
+    shared: Arc<Shared>,
+}
+
+impl NotifyHandle {
+    /// Attaches the notifier. Call it before the session runs. A second call keeps
+    /// the first notifier.
+    pub(crate) fn attach(&self, notifier: Notifier) {
+        let _ = self.shared.notifier.set(notifier);
+    }
+}
+
 impl Dbfs {
     pub fn new(db: Db) -> Self {
         Self::with_write_buffer(db, DEFAULT_WRITE_BUFFER)
@@ -407,30 +442,52 @@ impl Dbfs {
                 table: Mutex::new(OpenTable::new(write_buffer)),
                 last_flush: Mutex::new(Ok(())),
                 kernel_cache: false,
+                keep_cache: true,
+                notifier: OnceLock::new(),
             }),
         }
     }
 
     /// Turns on the kernel-side caches (`--kernel-cache`). Must be called before
-    /// the filesystem is mounted.
+    /// the filesystem is mounted. It implies `with_keep_cache(true)`.
     pub fn with_kernel_cache(mut self, enabled: bool) -> Self {
-        Arc::get_mut(&mut self.shared)
-            .expect("kernel cache is set before the filesystem is shared")
-            .kernel_cache = enabled;
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("kernel cache is set before the filesystem is shared");
+        shared.kernel_cache = enabled;
+        shared.keep_cache |= enabled;
         self
     }
 
+    /// Whether the kernel keeps file data across opens and caches attributes and
+    /// names for a day (the default). `false` (`--no-keep-cache`) drops the page
+    /// cache on every open and expires attributes and names after one second.
+    /// Must be called before the filesystem is mounted.
+    pub fn with_keep_cache(mut self, enabled: bool) -> Self {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("keep cache is set before the filesystem is shared");
+        shared.keep_cache = enabled || shared.kernel_cache;
+        self
+    }
+
+    /// The handle `run.rs` uses to attach the session's notifier.
+    pub(crate) fn notify_handle(&self) -> NotifyHandle {
+        NotifyHandle {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     fn ttl(&self) -> Duration {
-        if self.kernel_cache {
+        if self.keep_cache {
             KERNEL_CACHE_TTL
         } else {
             ATTR_TTL
         }
     }
 
-    /// FOPEN flags for `open` and `create` replies.
+    /// FOPEN flags for `open` and `create` replies. `FOPEN_KEEP_CACHE` keeps the
+    /// page cache across opens. Without it, every open drops the cached data.
     fn open_flags(&self) -> u32 {
-        if self.kernel_cache {
+        if self.keep_cache {
             fuser::consts::FOPEN_KEEP_CACHE
         } else {
             0
@@ -752,7 +809,11 @@ impl Dbfs {
         if end <= size {
             return Ok(());
         }
-        self.truncate_locked(&mut t, ino, end)
+        self.truncate_locked(&mut t, ino, end)?;
+        // The reply carries no attributes, and the extension also set the mtime and
+        // ctime in the database, so the kernel must ask again.
+        self.invalidate_attr(ino);
+        Ok(())
     }
 
     fn truncate_locked(&self, t: &mut OpenTable, ino: u64, size: u64) -> Result<(), i32> {
@@ -844,6 +905,10 @@ impl Dbfs {
             .map_err(errno_from_db_error)?;
         if let Some(target) = replaced {
             Shared::entry_removed(&mut t, &target);
+            // The reply carries no attributes. The target's link count dropped (and
+            // its ctime moved, if it lives on under another name or an open handle),
+            // and the kernel cannot see that from this request.
+            self.invalidate_attr(target.ino);
         }
         Ok(())
     }
@@ -1783,5 +1848,25 @@ mod tests {
         let after = fs.getattr(file.ino).expect("attr after");
         assert_eq!(after.size, before.size);
         assert_eq!(after.mtime, before.mtime, "a failed write keeps the mtime");
+    }
+
+    #[test]
+    fn keep_cache_is_the_default_and_no_keep_cache_restores_one_second_timeouts() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let fs = Dbfs::new(db);
+        assert_eq!(fs.ttl(), KERNEL_CACHE_TTL);
+        assert_eq!(fs.open_flags(), fuser::consts::FOPEN_KEEP_CACHE);
+
+        let fs = fs.with_keep_cache(false);
+        assert_eq!(fs.ttl(), ATTR_TTL);
+        assert_eq!(fs.open_flags(), 0);
+    }
+
+    #[test]
+    fn kernel_cache_implies_keep_cache() {
+        let db = Db::open_in_memory().expect("open in-memory database");
+        let fs = Dbfs::new(db).with_kernel_cache(true).with_keep_cache(false);
+        assert_eq!(fs.ttl(), KERNEL_CACHE_TTL);
+        assert_eq!(fs.open_flags(), fuser::consts::FOPEN_KEEP_CACHE);
     }
 }
