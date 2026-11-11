@@ -64,15 +64,24 @@ pub struct MountConfig {
     pub write_buffer: Option<usize>,
 
     /// Let the kernel cache more: writeback cache, parallel directory
-    /// operations, 1 MiB requests, cached symlinks, attributes and entries
-    /// cached for a day, and page cache kept across opens.
+    /// operations, 1 MiB requests, cached symlinks and async direct I/O.
     ///
-    /// Faster for small writes and repeated reads. With the writeback cache,
-    /// written data can sit in the kernel's page cache until the file is closed
-    /// or synced, so a crash or `docker stop` with files still open can lose
-    /// data that dbfs never saw. Off by default.
-    #[arg(long)]
+    /// With the writeback cache, written data can sit in the kernel's page cache
+    /// until the file is closed or synced, so a crash or `docker stop` with files
+    /// still open can lose data that dbfs never saw. Off by default. Conflicts with
+    /// `--no-keep-cache`.
+    #[arg(long, conflicts_with = "no_keep_cache")]
     pub kernel_cache: bool,
+
+    /// Restore the caching of earlier releases: the kernel drops a file's cached
+    /// data on every open, and attributes and names expire after one second.
+    ///
+    /// Repeated reads then go through FUSE and SQLite again. By default the
+    /// kernel keeps the page cache across opens and caches attributes and names
+    /// for a day, which is safe because dbfs is the only writer of its database.
+    /// Conflicts with `--kernel-cache`.
+    #[arg(long, conflicts_with = "kernel_cache")]
+    pub no_keep_cache: bool,
 
     /// Largest part of the database file that SQLite may map into memory
     /// (`PRAGMA mmap_size`). Takes the same sizes as `--write-buffer`, but `0` is

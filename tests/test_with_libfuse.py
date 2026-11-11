@@ -48,6 +48,9 @@ import pytest
 
 DBFS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DBFS_BIN = os.path.join(DBFS_ROOT, "target", "release", "dbfs")
+# Extra dbfs mount arguments, separated by spaces. They run the suite in another
+# cache mode, for example DBFS_TEST_MOUNT_ARGS="--no-keep-cache".
+MOUNT_ARGS = os.environ.get("DBFS_TEST_MOUNT_ARGS", "").split()
 # Disk-backed scratch space for mounts that copy real data (never /tmp: tmpfs).
 BENCH_ROOT = os.path.join(DBFS_ROOT, ".bench")
 LIBFUSE_ROOT = os.path.abspath(
@@ -306,7 +309,7 @@ def dbfs_mount(tmp_path, output_checker):
 
     logger.debug(f"Mounting dbfs: {DBFS_BIN} mount {db_path} {mnt_dir}")
     mount_process = subprocess.Popen(
-        [DBFS_BIN, "mount", db_path, mnt_dir],
+        [DBFS_BIN, "mount", *MOUNT_ARGS, db_path, mnt_dir],
         stdout=output_checker.fd,
         stderr=output_checker.fd,
     )
@@ -336,7 +339,7 @@ def dbfs_bench_mount(output_checker):
     os.makedirs(mnt_dir)
 
     mount_process = subprocess.Popen(
-        [DBFS_BIN, "mount", db_path, mnt_dir],
+        [DBFS_BIN, "mount", *MOUNT_ARGS, db_path, mnt_dir],
         stdout=output_checker.fd,
         stderr=output_checker.fd,
     )

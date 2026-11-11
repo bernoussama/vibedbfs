@@ -15,6 +15,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod common;
+
 fn supports_fuse() -> bool {
     Path::new("/dev/fuse").exists() && command_exists("fusermount3") && command_exists("mountpoint")
 }
@@ -68,6 +70,7 @@ impl Mounted {
         fs::create_dir_all(mountpoint).expect("create mountpoint");
         let mut child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
             .arg("mount")
+            .args(common::mount_args(&[]))
             .arg(db)
             .arg(mountpoint)
             .stdout(Stdio::null())

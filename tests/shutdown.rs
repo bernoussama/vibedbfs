@@ -13,6 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+mod common;
+
 const EXIT_DEADLINE: Duration = Duration::from_secs(5);
 
 /// 200 KiB + 17 bytes: spans several 64 KiB chunks and ends part-way through one.
@@ -99,6 +101,7 @@ fn failed_flush_on_shutdown_exits_one_with_a_message() {
     let mut dbfs = Dbfs::start(&db, &mnt);
     let mut file = File::create(mnt.join("held.bin")).expect("create file on mount");
     file.write_all(&payload).expect("write through mount");
+    push_dirty_pages(&file);
 
     // Hold SQLite's write lock, so dbfs's flush cannot commit. It waits out its 5 s
     // busy timeout and then fails. The test must report that, not exit 0.
@@ -127,13 +130,14 @@ fn failed_flush_on_shutdown_exits_one_with_a_message() {
 
 /// Writes a file through the mount and leaves the fd open, then sends `signal` to dbfs.
 ///
-/// The fd stays open on purpose. Writes reach dbfs synchronously (no writeback
-/// cache), so the bytes sit in dbfs's dirty buffers when the signal arrives. dbfs
+/// The fd stays open on purpose. The bytes reach dbfs before the signal, so they sit
+/// in dbfs's dirty buffers when it arrives. In the default mode each `write` has
+/// already reached dbfs. With `--kernel-cache` the writeback cache may still hold
+/// them, so `push_dirty_pages` sends them first. dbfs
 /// unmounts lazily, which is what `fusermount -u -z` does. A process that still has
 /// the file open keeps the FUSE session alive, so a shutdown that waited for
 /// `Filesystem::destroy` would never flush these bytes. The test therefore checks
-/// that dbfs flushes while the mount is still up. The payload is written before the
-/// signal and `write` has returned, so the test does not race with the kernel.
+/// that dbfs flushes while the mount is still up.
 fn assert_open_file_survives_signal(signal: libc::c_int) {
     let _serial = require_fuse();
     let work = work_dir("shutdown-open");
@@ -143,6 +147,7 @@ fn assert_open_file_survives_signal(signal: libc::c_int) {
     let mut dbfs = Dbfs::start(&db, &mnt);
     let mut file = File::create(mnt.join("held.bin")).expect("create file on mount");
     file.write_all(&payload).expect("write through mount");
+    push_dirty_pages(&file);
 
     send_signal(dbfs.pid(), signal);
     let (status, stderr) = dbfs.wait_for_exit();
@@ -170,6 +175,7 @@ impl Dbfs {
         fs::create_dir_all(mountpoint).expect("create mountpoint");
         let child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
             .arg("mount")
+            .args(common::mount_args(&[]))
             .arg(db)
             .arg(mountpoint)
             .stdout(Stdio::null())
@@ -239,6 +245,25 @@ impl Drop for Dbfs {
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// Makes the kernel send this file's dirty pages to dbfs and waits until dbfs has
+/// replied. dbfs only buffers them; nothing is committed. It does nothing when the
+/// writes have already reached dbfs, as in the default mode.
+fn push_dirty_pages(file: &File) {
+    use std::os::unix::io::AsRawFd;
+
+    let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
+        | libc::SYNC_FILE_RANGE_WRITE
+        | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+    // SAFETY: the fd is valid for the life of `file`, and sync_file_range takes no pointers.
+    let rc = unsafe { libc::sync_file_range(file.as_raw_fd(), 0, 0, flags) };
+    assert_eq!(
+        rc,
+        0,
+        "sync_file_range: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 fn send_signal(pid: libc::pid_t, signal: libc::c_int) {

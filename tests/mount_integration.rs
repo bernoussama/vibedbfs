@@ -16,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dbfs::Db;
 use rusqlite::Connection;
 
+mod common;
+
 #[test]
 #[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
 fn mounted_filesystem_supports_basic_file_lifecycle_when_enabled() {
@@ -28,6 +30,7 @@ fn mounted_filesystem_supports_basic_file_lifecycle_when_enabled() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
         .arg("mount")
+        .args(common::mount_args(&[]))
         .arg(&db_path)
         .arg(&mountpoint)
         .spawn()
@@ -538,6 +541,7 @@ impl Mount {
         fs::create_dir(&mountpoint).expect("create mountpoint");
         let child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
             .arg("mount")
+            .args(common::mount_args(&[]))
             .arg(&db_path)
             .arg(&mountpoint)
             .spawn()
@@ -614,6 +618,7 @@ impl FuseMount {
     fn start(db_path: &Path, mountpoint: &Path) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
             .arg("mount")
+            .args(common::mount_args(&[]))
             .arg(db_path)
             .arg(mountpoint)
             .spawn()
@@ -805,6 +810,7 @@ impl Mounted {
         fs::create_dir(&mountpoint).expect("create mountpoint");
         let child = Command::new(env!("CARGO_BIN_EXE_dbfs"))
             .arg("mount")
+            .args(common::mount_args(&[]))
             .arg(&db_path)
             .arg(&mountpoint)
             .spawn()
@@ -827,4 +833,237 @@ impl Drop for Mounted {
         let _ = fs::remove_file(self.db_path.with_extension("sqlite-wal"));
         let _ = fs::remove_file(self.db_path.with_extension("sqlite-shm"));
     }
+}
+
+/// The system's page size, in bytes.
+fn page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+}
+
+/// Counts the pages of `file` that the kernel holds in its page cache. It uses
+/// `mincore(2)` over a read-only mapping of the first `len` bytes. Mapping does not
+/// fault pages in, so the count is what the kernel held before any read.
+fn cached_pages(file: &File, len: usize) -> usize {
+    use std::os::unix::io::AsRawFd;
+
+    let mut residency = vec![0u8; len.div_ceil(page_size())];
+    // SAFETY: the mapping, the residency vector and the length given to mincore
+    // all describe the same `len` bytes, and the mapping is removed before returning.
+    unsafe {
+        let map = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
+        assert_ne!(
+            map,
+            libc::MAP_FAILED,
+            "mmap: {}",
+            std::io::Error::last_os_error()
+        );
+        let rc = libc::mincore(map, len, residency.as_mut_ptr());
+        assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+        libc::munmap(map, len);
+    }
+    residency.iter().filter(|byte| **byte & 1 != 0).count()
+}
+
+/// The modification time as (seconds, nanoseconds), which orders like time.
+fn mtime_of(meta: &fs::Metadata) -> (i64, i64) {
+    (meta.mtime(), meta.mtime_nsec())
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn warm_reread_after_reopen_keeps_the_page_cache_unless_no_keep_cache() {
+    const LEN: usize = 1 << 20;
+    let mounted = Mounted::start("warm-reread");
+    let path = mounted.mountpoint.join("warm.bin");
+    let data: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    fs::write(&path, &data).expect("write file through mount");
+    assert_eq!(fs::read(&path).expect("first read"), data);
+
+    // Nothing is read between the open and the check, so the pages counted here
+    // are the ones the open left in the page cache.
+    let file = File::open(&path).expect("reopen file");
+    let cached = cached_pages(&file, LEN);
+    if common::keeps_page_cache() {
+        assert_eq!(
+            cached,
+            LEN / page_size(),
+            "the default mode keeps cached pages on open"
+        );
+    } else {
+        assert_eq!(cached, 0, "--no-keep-cache drops cached pages on open");
+    }
+    assert_eq!(fs::read(&path).expect("warm re-read"), data);
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn size_and_mtime_seen_by_one_fd_follow_writes_through_another() {
+    let mounted = Mounted::start("size-mtime");
+    let path = mounted.mountpoint.join("shared.txt");
+    let writer = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("create file");
+    let other = OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open second fd");
+
+    writer.write_all_at(b"hello", 0).expect("first write");
+    assert_eq!(writer.metadata().expect("fstat").len(), 5);
+
+    std::thread::sleep(Duration::from_millis(20));
+    let before = mtime_of(&fs::metadata(&path).expect("stat"));
+    other
+        .write_all_at(b"world!", 100)
+        .expect("write through the second fd");
+    let by_path = fs::metadata(&path).expect("stat by path");
+    let by_fd = writer.metadata().expect("fstat through the first fd");
+    assert_eq!(by_path.len(), 106, "size seen by path");
+    assert_eq!(by_fd.len(), 106, "size seen through the first fd");
+    assert!(
+        mtime_of(&by_path) > before,
+        "mtime moves forward after a write through another fd"
+    );
+    assert_eq!(
+        mtime_of(&by_fd),
+        mtime_of(&by_path),
+        "both fds see the same mtime"
+    );
+
+    std::thread::sleep(Duration::from_millis(20));
+    let before = mtime_of(&by_path);
+    other.set_len(3).expect("truncate through the second fd");
+    let by_path = fs::metadata(&path).expect("stat after truncate");
+    assert_eq!(by_path.len(), 3, "size after truncate, seen by path");
+    assert_eq!(
+        writer.metadata().expect("fstat after truncate").len(),
+        3,
+        "size after truncate, seen through the first fd"
+    );
+    assert!(
+        mtime_of(&by_path) > before,
+        "mtime moves forward after truncate through another fd"
+    );
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn rename_over_a_hard_link_updates_nlink_of_the_surviving_name() {
+    let mounted = Mounted::start("rename-hard-link-nlink");
+    let root = &mounted.mountpoint;
+    fs::write(root.join("target"), b"keep").expect("create target");
+    fs::hard_link(root.join("target"), root.join("alias")).expect("hard link");
+    assert_eq!(
+        fs::metadata(root.join("alias"))
+            .expect("stat alias")
+            .nlink(),
+        2
+    );
+
+    fs::write(root.join("replacement"), b"new").expect("create replacement");
+    fs::rename(root.join("replacement"), root.join("target")).expect("rename over target");
+
+    assert_eq!(
+        fs::metadata(root.join("alias"))
+            .expect("stat alias")
+            .nlink(),
+        1,
+        "the replaced inode lost one name"
+    );
+    assert_eq!(fs::read(root.join("alias")).expect("read alias"), b"keep");
+    assert_eq!(fs::read(root.join("target")).expect("read target"), b"new");
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn rename_over_an_open_file_reports_nlink_zero_through_the_open_fd() {
+    let mounted = Mounted::start("rename-open-nlink");
+    let root = &mounted.mountpoint;
+    fs::write(root.join("victim"), b"old").expect("create victim");
+    let open = File::open(root.join("victim")).expect("open victim");
+    assert_eq!(open.metadata().expect("fstat victim").nlink(), 1);
+
+    fs::write(root.join("new"), b"new").expect("create replacement");
+    fs::rename(root.join("new"), root.join("victim")).expect("rename over open file");
+
+    assert_eq!(
+        open.metadata().expect("fstat after rename").nlink(),
+        0,
+        "the replaced inode has no names left"
+    );
+    let mut buf = [0u8; 3];
+    open.read_exact_at(&mut buf, 0)
+        .expect("read through the open fd");
+    assert_eq!(&buf, b"old", "the open file keeps its data");
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn directory_nlink_follows_mkdir_rmdir_and_cross_directory_rename() {
+    let mounted = Mounted::start("dir-nlink");
+    let root = &mounted.mountpoint;
+    let nlink = |path: &Path| fs::metadata(path).expect("stat directory").nlink();
+    let root_before = nlink(root);
+
+    fs::create_dir(root.join("a")).expect("mkdir a");
+    fs::create_dir(root.join("b")).expect("mkdir b");
+    assert_eq!(
+        nlink(root),
+        root_before + 2,
+        "mkdir adds a link to the parent"
+    );
+
+    fs::create_dir(root.join("a/x")).expect("mkdir a/x");
+    assert_eq!(nlink(&root.join("a")), 3, "a subdirectory adds a link to a");
+
+    fs::rename(root.join("a/x"), root.join("b/x")).expect("cross-directory rename");
+    assert_eq!(nlink(&root.join("a")), 2, "the old parent loses the link");
+    assert_eq!(nlink(&root.join("b")), 3, "the new parent gains the link");
+
+    fs::remove_dir(root.join("b/x")).expect("rmdir b/x");
+    assert_eq!(nlink(&root.join("b")), 2, "rmdir removes the link");
+}
+
+#[test]
+#[ignore = "requires DBFS_RUN_FUSE_TESTS=1 and fusermount3"]
+fn fallocate_extension_updates_size_and_mtime_seen_by_path_stat() {
+    let mounted = Mounted::start("fallocate-attrs");
+    let path = mounted.mountpoint.join("grow.bin");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("create file");
+    file.write_all_at(b"abcd", 0).expect("write");
+    let before = fs::metadata(&path).expect("stat before fallocate");
+    assert_eq!(before.len(), 4);
+
+    std::thread::sleep(Duration::from_millis(20));
+    fallocate_fd(&file, 0, 0, 1 << 20).expect("fallocate extends the file");
+
+    let after = fs::metadata(&path).expect("stat after fallocate");
+    assert_eq!(after.len(), 1 << 20, "size seen by path");
+    assert_eq!(
+        file.metadata().expect("fstat after fallocate").len(),
+        1 << 20,
+        "size seen through the open fd"
+    );
+    assert!(
+        mtime_of(&after) > mtime_of(&before),
+        "mtime moves forward after fallocate"
+    );
 }

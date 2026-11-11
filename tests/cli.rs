@@ -378,6 +378,39 @@ fn kernel_cache_is_off_unless_requested() {
 }
 
 #[test]
+fn keep_cache_is_on_unless_no_keep_cache_is_requested() {
+    assert!(!parse_mount(&[]).no_keep_cache);
+    assert!(parse_mount(&["--no-keep-cache"]).no_keep_cache);
+}
+
+#[test]
+fn no_keep_cache_conflicts_with_kernel_cache() {
+    for argv in [
+        [
+            "dbfs",
+            "mount",
+            "--no-keep-cache",
+            "--kernel-cache",
+            "dbfs.sqlite",
+            "mnt",
+        ],
+        [
+            "dbfs",
+            "mount",
+            "--kernel-cache",
+            "--no-keep-cache",
+            "dbfs.sqlite",
+            "mnt",
+        ],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "{argv:?} should conflict"
+        );
+    }
+}
+
+#[test]
 fn mmap_size_accepts_zero_and_the_write_buffer_suffixes() {
     assert_eq!(parse_mount(&[]).mmap_size, None);
     assert_eq!(parse_mount(&["--mmap-size", "0"]).mmap_size, Some(0));

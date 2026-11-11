@@ -81,7 +81,7 @@ Still pending:
 The `mount` syntax:
 
 ```text
-dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [--kernel-cache] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
+dbfs mount [--allow-other | --allow-root] [--auto-unmount] [--write-buffer SIZE] [--kernel-cache | --no-keep-cache] [-o OPT[,OPT...]]... <DATABASE> <MOUNTPOINT>
 ```
 
 ## S2: host mount shared into a container

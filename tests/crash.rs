@@ -18,6 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+mod common;
+
 const MIB: usize = 1 << 20;
 
 fn require_fuse() {
@@ -75,7 +77,7 @@ impl Mounted {
             .arg("mount")
             .arg(db)
             .arg(mountpoint)
-            .args(extra)
+            .args(common::mount_args(extra))
             .stdout(Stdio::null())
             .stderr(Stdio::from(log_file))
             .spawn()

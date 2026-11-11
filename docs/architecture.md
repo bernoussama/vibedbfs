@@ -236,6 +236,8 @@ Step 2 runs on the signal path, not only in `destroy`, because a process that st
 
 ## Read Data Flow
 
+The kernel answers a repeated read from its page cache when the file has not changed, so this flow runs only for reads the cache misses. See [Kernel caching](#kernel-caching).
+
 ```
  User: read(fd, buf, 4096) at offset 0
                 │
@@ -447,10 +449,48 @@ fallocate(ino, offset, length, mode)
 | `FALLOC_FL_KEEP_SIZE` alone | Succeeds without changing anything. |
 | Any other bit (`PUNCH_HOLE`, `ZERO_RANGE`, `COLLAPSE_RANGE`, `INSERT_RANGE`, `UNSHARE_RANGE`) | `EOPNOTSUPP` |
 
+When the call extends the file, the reply carries no attributes, although dbfs has already set the size, mtime and ctime. dbfs therefore tells the kernel to drop its cached attributes for the inode, so the next `stat` asks dbfs again (see [Kernel caching](#kernel-caching)).
+
 Space is not reserved. SQLite allocates pages when chunks are written, so a
 `fallocate` that succeeds can still be followed by `ENOSPC` on write. The `ENODEV`
 check mirrors Linux's `vfs_fallocate`, which refuses non-regular files before the
 call reaches FUSE, so user space should not normally see it.
+
+## Kernel Caching
+
+A dbfs mount has two kernel caches: the page cache for file data, and the cached attributes and names (the attribute and entry timeouts). The mount mode sets both.
+
+| Mode | Page cache across opens | Attribute and name timeout | Request and capability options |
+|---|---|---|---|
+| Default | Kept (`FOPEN_KEEP_CACHE`) | 1 day | 128 KiB requests |
+| `--no-keep-cache` | Dropped on every open | 1 second | 128 KiB requests |
+| `--kernel-cache` | Kept | 1 day | Writeback cache, parallel directory operations, 1 MiB requests, cached symlinks, async direct I/O |
+
+`--kernel-cache` always keeps the page cache. It conflicts with `--no-keep-cache`, and the command line rejects the two together.
+
+### Why a day is safe
+
+dbfs is the only writer of its database (the `<db>.lock` file keeps out a second dbfs), and every change to the filesystem goes through the kernel. The kernel therefore learns of each change from its own request or from the reply to it. Three rules keep the caches correct:
+
+- Every operation that changes attributes (size, mtime, ctime, mode, owner or link count) or the entries of a directory replies with the fresh attributes or entry. The kernel updates its own size and mtime for its writes, and it drops a directory's cached attributes when it changes the directory's entries.
+- Two changes come with no attributes in the reply, so dbfs invalidates the inode with `Notifier::inval_inode` (`Shared::invalidate_attr`): a rename over a name whose target has other links or an open handle (the target's link count and ctime change), and an `fallocate` that extends the file (size, mtime and ctime change). The notification drops attributes only (offset -1). A notification that also drops pages can wait for page locks, and a write in flight holds those locks until this thread replies. That would deadlock the single session thread.
+- Inode numbers are never reused: `inodes.ino` is `AUTOINCREMENT` (schema version 5). A cached attribute or name cannot later describe a different file.
+
+The mount tests in `tests/mount_integration.rs` check these cases in every mode: the warm re-read after a reopen, size and mtime seen through another fd, rename over a hard link and over an open file, directory link counts, and fallocate.
+
+### What `--kernel-cache` turns on
+
+Each item is gated because it changes how the kernel buffers data or how many requests are in flight.
+
+- **Writeback cache** (`FUSE_WRITEBACK_CACHE`). The kernel holds written data and sends it to dbfs later. A write that has returned can exist only in kernel memory until the file is flushed, synced or closed, so a crash, SIGKILL or `docker stop` can lose it, and dbfs never saw those bytes. This is the main reason the flag is off by default.
+- **Parallel directory operations** (`FUSE_PARALLEL_DIROPS`). Lookups and readdir calls on one directory can run at the same time. Without it, the kernel sends them one at a time per directory.
+- **1 MiB requests** (`max_write`, `max_readahead`, `FUSE_MAX_PAGES`). Large transfers take fewer requests, and each request can hold up to 1 MiB of buffers. The default stays at 128 KiB.
+- **Cached symlinks** (`FUSE_CACHE_SYMLINKS`). The kernel keeps `readlink` targets. dbfs never changes a symlink's target after creation, and inode numbers are never reused, so a cached target cannot go stale.
+- **Async direct I/O** (`FUSE_ASYNC_DIO`). The kernel can have several direct I/O requests to one file in flight. Without it, the kernel waits for each request before it sends the next.
+
+### Editing the database
+
+Do not edit the database file with `sqlite3` while dbfs has it mounted. The lock stops a second dbfs, not sqlite3. dbfs does not invalidate its caches for changes made behind its back, so the mount can show stale data, and a later dbfs write to the same chunk overwrites the edit.
 
 ## Optimization Points
 
