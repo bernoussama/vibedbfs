@@ -105,6 +105,29 @@ WAL peak per round (MiB), for the workloads that write:
 
 **Decision.** The rule was: if 16 KiB wins, new databases get 16 KiB, and an existing database keeps its page size. 16 KiB wins clearly on the 3 GiB sequential write, and on random writes by 11%. It probably wins on the 512 MiB sequential write, where the ranges overlap. It does not lose on the other workloads beyond three-round noise. The cost is space: the metadata and small-file databases are 18–22% larger, and the fsync workload is 17% larger. Commit f3375f8 makes the change for new databases. Commit d9685bd adds `dbfs migrate --page-size` for existing ones.
 
+## Part D: before and after, Docker comparison
+
+`scripts/bench-docker/compare.sh --configs "ext4 pt-ext4-user dbfs-ext4 dbfs-ext4-kc" --rounds 3 --fio-rounds 2` on 2026-11-11, git c8ec73c, kernel 7.0.0-38. Results in `.bench/fscmp2/final-2026-11-11/`. Medians of 3 bench_io rounds (fio: mean of 2). "Before" is the same harness on the branch before this work (dbfs default options, 4 KiB pages). `pt-ext4-user` is libfuse `passthrough_hp --nopassthrough`, the cost of FUSE itself with no storage engine.
+
+| Workload | dbfs before | dbfs now | passthrough_hp | ext4 |
+| --- | --- | --- | --- | --- |
+| Sequential write, 512 MiB (MiB/s) | 200 | 379 | 763 | 4,021 |
+| Random 4 KiB write, 256 MiB (MiB/s) | 25.4 | 189 | 199 | 976 |
+| Random 4 KiB write, fio (MiB/s) | – | 218 | 180 | 1,034 |
+| Random 4 KiB write + fsync, fio (IOPS) | 212 | 217 | 176 | 207 |
+| Sequential read, warm (MiB/s) | 1,456 | 7,160 | 7,534 | 10,656 |
+| Random 4 KiB read, warm (MiB/s) | 105 | 2,635 | 2,888 | 3,009 |
+| Create 5,000 files (s) | 1.24 | 0.62 | 0.80 | 0.10 |
+| Unlink 5,000 files (s) | 0.95 | 0.29 | 0.30 | 0.06 |
+| `rm -rf` 20,000 entries (s) | 2.66 | 0.98 | 1.28 | 0.23 |
+| 20,000 small files (s) | – | 3.30 | 3.27 | 0.52 |
+| Cold tree stat / rm, 20,000 (s) | – | 0.59 / 1.79 | 0.36 / 1.21 | 0.15 / 0.25 |
+
+- dbfs now matches or beats the FUSE passthrough on random writes, fsync, warm reads and metadata. Sequential writes are about half of passthrough: every byte is written twice (WAL, then checkpoint).
+- `seqwrite-long` (3 GiB) is bimodal: 355–375 MiB/s in one run, 100–225 MiB/s in a later one. It writes about 6 GiB to a disk that sustains about 256 MB/s with `fdatasync` on a 7 GiB machine, so it depends on how much the host page cache absorbs.
+- Cold reads (`randread-cold`, fio `randread-cold`) show dbfs ahead of ext4. That is an artifact: the native target is read from the device after the drop, while the dbfs database file stays partly in the host page cache. Do not read it as dbfs being faster.
+- `--kernel-cache` random writes were 21.6 MiB/s in this run: timestamp-only `setattr` calls from the kernel's writeback flushed the whole file each time. Fixed in bf096c2 (`setattr` flushes only on a size change). After the fix (`.bench/fscmp2/kcfix/`): randwrite 291 MiB/s with `--kernel-cache` vs 199 without; fio random write 434 vs 212.
+
 ## Caveats
 
 - **Few rounds.** Three rounds for Part B, and three or five for Part A. Overlapping ranges mean the differences under about 10% are not established.
