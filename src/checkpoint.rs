@@ -15,7 +15,7 @@
 //!   (see `batch`) so no write transaction is open, runs PASSIVE once more, and
 //!   releases it. The next writer then restarts the WAL at its beginning. This is
 //!   the reset handshake.
-//! - The catch-up also stops once the WAL reaches `forced_at`: three times
+//! - The catch-up also stops once the WAL reaches `forced_at`: four times
 //!   `passive_at`, and at most three quarters of the cap. The WAL cannot grow while
 //!   the lock is held, so the handshake runs at once, and the lock is held only for
 //!   the frames still unbackfilled.
@@ -45,7 +45,7 @@ use crate::batch::Main;
 /// The background thread checkpoints (PASSIVE) once the WAL is this large.
 const PASSIVE_THRESHOLD: u64 = 64 << 20;
 /// The handshake is forced at this many `PASSIVE_THRESHOLD`s (see `WalState::forced_at`).
-const FORCED_MULTIPLE: u64 = 3;
+const FORCED_MULTIPLE: u64 = 4;
 /// A WAL with unreset work, and no commit for this long, is checkpointed.
 const IDLE: Duration = Duration::from_secs(1);
 /// The reset handshake catches up without the database lock until at most this
@@ -517,10 +517,10 @@ mod tests {
 
     #[test]
     fn the_handshake_is_forced_well_below_the_cap() {
-        // Three passive thresholds with the default cap.
+        // Four passive thresholds with the default cap.
         let default = WalState::new(4096, DEFAULT_WAL_CAP);
-        assert_eq!(default.forced_at, 192 << 20);
-        // A small cap cannot fit three thresholds, so it takes three quarters of it.
+        assert_eq!(default.forced_at, 256 << 20);
+        // A small cap cannot fit four thresholds, so it takes three quarters of it.
         let small = WalState::new(4096, 1 << 20);
         assert_eq!(small.forced_at, 768 << 10);
         assert!(small.passive_at < small.forced_at && small.forced_at < small.wal_cap);
